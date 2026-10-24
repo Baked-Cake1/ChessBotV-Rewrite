@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 
 import chess
 import pygame
@@ -72,8 +73,11 @@ def set_always_on_top():
 set_always_on_top()
 
 
+# --- Constants ---
+RESTART_EXIT_CODE = 42
+
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25}
 
 
 def load_config():
@@ -104,6 +108,7 @@ def save_config():
             f.write(f"hash={config['hash']}\n")
             f.write(f"threads={config['threads']}\n")
             f.write(f"skill={config['skill']}\n")
+            f.write(f"depth={config.get('depth', 25)}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
 
@@ -219,6 +224,7 @@ menu_transition_direction = "none"
 images = load_images(current_theme)
 config = load_config()
 openings = load_openings()
+ANALYSIS_DEPTH = config.get("depth", 25)
 
 # Live engine handle (assigned in main()); used by the Engine Settings page.
 engine_thread = None
@@ -240,7 +246,8 @@ new_game_button_rect = pygame.Rect(
 menu_anim_progress = 0.0
 menu_anim_opening = False
 menu_anim_closing = False
-menu_anim_speed = 0.05
+menu_anim_speed = 0.07
+restart_requested = False
 
 # --- Opening Tracking ---
 current_opening_name = ""
@@ -260,6 +267,7 @@ class AnimationManager:
         self.move_anim = None
         self.rook_anim = None
         self.capture_anims = []
+        self.board_reset_anims = []
 
         self.current_eval = 0.0
         self.target_eval = 0.0
@@ -290,6 +298,11 @@ class AnimationManager:
             anim["progress"] += anim["speed"]
             if anim["progress"] >= 1.0:
                 self.capture_anims.remove(anim)
+
+        for anim in self.board_reset_anims[:]:
+            anim["progress"] += anim["speed"]
+            if anim["progress"] >= 1.0:
+                self.board_reset_anims.remove(anim)
 
         if abs(self.current_eval - self.target_eval) > 0.01:
             self.current_eval += (
@@ -391,6 +404,61 @@ class AnimationManager:
         self.capture_anims.append(
             {"piece": piece, "pos": (x, y), "progress": 0.0, "speed": 0.03}
         )
+
+    def add_board_reset(self, old_board, new_board):
+        self.move_anim = None
+        self.rook_anim = None
+        self.board_reset_anims.clear()
+        from collections import defaultdict
+        old_groups = defaultdict(list)
+        new_groups = defaultdict(list)
+        for sq in chess.SQUARES:
+            p = old_board.piece_at(sq)
+            if p:
+                old_groups[(p.piece_type, p.color)].append(sq)
+            p2 = new_board.piece_at(sq)
+            if p2:
+                new_groups[(p2.piece_type, p2.color)].append(sq)
+        for key in set(list(old_groups.keys()) + list(new_groups.keys())):
+            olds = old_groups.get(key, [])
+            news = new_groups.get(key, [])
+            used_old = set()
+            pairs = []
+            for n_sq in news:
+                best = None
+                best_dist = None
+                nx, ny = chess.square_file(n_sq), chess.square_rank(n_sq)
+                for o_sq in olds:
+                    if o_sq in used_old:
+                        continue
+                    ox, oy = chess.square_file(o_sq), chess.square_rank(o_sq)
+                    dist = abs(nx - ox) + abs(ny - oy)
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best = o_sq
+                if best is not None:
+                    used_old.add(best)
+                    pairs.append((best, n_sq))
+            for o_sq, n_sq in pairs:
+                if o_sq == n_sq:
+                    continue
+                sx = (chess.square_file(o_sq) * SQUARE_SIZE) + BOARD_OX
+                sy = ((7 - chess.square_rank(o_sq)) * SQUARE_SIZE) + BOARD_OY
+                ex = (chess.square_file(n_sq) * SQUARE_SIZE) + BOARD_OX
+                ey = ((7 - chess.square_rank(n_sq)) * SQUARE_SIZE) + BOARD_OY
+                piece = old_board.piece_at(o_sq)
+                self.board_reset_anims.append({
+                    "piece": piece,
+                    "start": (sx, sy),
+                    "end": (ex, ey),
+                    "progress": 0.0,
+                    "speed": 0.045,
+                    "start_sq": o_sq,
+                    "target_sq": n_sq,
+                })
+
+    def is_board_resetting(self):
+        return len(self.board_reset_anims) > 0
 
     def set_target_eval(self, eval_score):
         self.target_eval = eval_score
@@ -648,13 +716,13 @@ def update_menu_animation():
     global theme_scroll_offset
 
     if menu_anim_opening:
-        menu_anim_progress += menu_anim_speed
+        menu_anim_progress += 0.12
         if menu_anim_progress >= 1.0:
             menu_anim_progress = 1.0
             menu_anim_opening = False
             settings_menu_open = True
     elif menu_anim_closing:
-        menu_anim_progress -= menu_anim_speed
+        menu_anim_progress -= 0.12
         if menu_anim_progress <= 0.0:
             menu_anim_progress = 0.0
             menu_anim_closing = False
@@ -666,7 +734,7 @@ def update_menu_animation():
 
 
 # --- Stockfish Threading ---
-ANALYSIS_DEPTH = 25
+ANALYSIS_DEPTH = 25  # overwritten from config after load
 
 
 class EngineThread:
@@ -1041,6 +1109,73 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
     return True
 
 
+# --- Promotion ---
+PROMOTION_CHOICES = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+promotion_pending = None  # {"from_sq":..., "to_sq":..., "color":...}
+
+
+def is_promotion_move(board, from_sq, to_sq):
+    piece = board.piece_at(from_sq)
+    if not piece or piece.piece_type != chess.PAWN:
+        return False
+    rank = chess.square_rank(to_sq)
+    return rank == 0 or rank == 7
+
+
+def get_promotion_rects():
+    total_w = 4 * SQUARE_SIZE + 3 * 10
+    start_x = WIDTH // 2 - total_w // 2
+    y = BOARD_OY + BOARD_WIDTH // 2 - SQUARE_SIZE // 2
+    rects = []
+    for i in range(4):
+        x = start_x + i * (SQUARE_SIZE + 10)
+        rects.append(pygame.Rect(x, y, SQUARE_SIZE, SQUARE_SIZE))
+    return rects
+
+
+def draw_promotion_menu(screen, color):
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 160))
+    screen.blit(overlay, (0, 0))
+    title = font_large.render("Choose promotion", True, TEXT_COLOR)
+    screen.blit(title, (WIDTH // 2 - title.get_width() // 2, BOARD_OY + BOARD_WIDTH // 2 - 90))
+    hint = font_tiny.render("Queen, Rook, Bishop, Knight (no pawn/king)", True, TEXT_MUTED)
+    screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2, BOARD_OY + BOARD_WIDTH // 2 - 60))
+    rects = get_promotion_rects()
+    mx, my = pygame.mouse.get_pos()
+    for i, piece_type in enumerate(PROMOTION_CHOICES):
+        rect = rects[i]
+        col = "w" if color == chess.WHITE else "b"
+        sym = {chess.QUEEN: "q", chess.ROOK: "r", chess.BISHOP: "b", chess.KNIGHT: "n"}[piece_type]
+        pkey = f"{col}{sym}"
+        is_hovered = rect.collidepoint(mx, my)
+        bg = (90, 90, 120) if is_hovered else (60, 60, 60)
+        pygame.draw.rect(screen, bg, rect, border_radius=8)
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, rect, 2, border_radius=8)
+        if pkey in images:
+            # Center piece slightly smaller for padding
+            img = images[pkey]
+            # images are 80x80 already
+            screen.blit(img, rect.topleft)
+        if is_hovered:
+            pygame.draw.rect(screen, (120, 180, 255), rect, 3, border_radius=8)
+
+
+def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_piece, animate=True):
+    move = chess.Move(from_sq, to_sq, promotion=promo_piece)
+    if move not in board.legal_moves:
+        return False
+    is_castling, rook_start_sq, rook_target_sq, rook_piece = get_castling_info(board, from_sq, to_sq)
+    captured_piece = board.piece_at(to_sq)
+    if captured_piece:
+        anim_mgr.add_capture(captured_piece, to_sq)
+    if animate:
+        anim_mgr.add_move(board.piece_at(from_sq), from_sq, to_sq, is_castling, rook_start_sq, rook_target_sq, rook_piece)
+    board.push(move)
+    engine_thread.update_position(board)
+    return True
+
+
 def format_nps(nps):
     if nps >= 1000000000000:
         return f"{nps / 1000000000000:.1f}T"
@@ -1268,59 +1403,50 @@ def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
 
 
 def draw_gear_icon(surface, cx, cy, size, color, thickness=2, rotation=0.0):
-    """Draw a proper cog/gear icon with teeth and a center hole.
-
-    Args:
-        surface:   pygame surface to draw on (supports alpha)
-        cx, cy:    center position in pixels
-        size:      outer radius in pixels
-        color:     RGB or RGBA outline color
-        thickness: line width in pixels
-        rotation:  optional rotation offset in radians
-    """
-    n_teeth = 8
+    """Draw a detailed cog/gear icon with teeth, hub and spokes."""
+    # Outer gear body with teeth — 10 teeth for smoother look
+    n_teeth = 10
     r_outer = size
-    r_inner = size * 0.70
-    tooth_frac = 0.55        # fraction of the sector that is a tooth
-    transition_frac = 0.30   # fraction of the tooth used for the sloped sides
-
+    r_inner = size * 0.72
     pts = []
     for i in range(n_teeth):
         base = (2 * math.pi * i) / n_teeth - math.pi / 2 + rotation
-        tooth = (2 * math.pi / n_teeth) * tooth_frac
-        transition = tooth * transition_frac
-
-        # 4 points per tooth: root-left, top-left, top-right, root-right
-        pts.append(
-            (
-                cx + r_inner * math.cos(base),
-                cy + r_inner * math.sin(base),
-            )
-        )
-        pts.append(
-            (
-                cx + r_outer * math.cos(base + transition),
-                cy + r_outer * math.sin(base + transition),
-            )
-        )
-        pts.append(
-            (
-                cx + r_outer * math.cos(base + tooth - transition),
-                cy + r_outer * math.sin(base + tooth - transition),
-            )
-        )
-        pts.append(
-            (
-                cx + r_inner * math.cos(base + tooth),
-                cy + r_inner * math.sin(base + tooth),
-            )
-        )
-
-    pygame.draw.polygon(surface, color, pts, thickness)
-
-    # Center hub hole
-    hole_r = max(2, int(size * 0.34))
-    pygame.draw.circle(surface, color, (cx, cy), hole_r, thickness)
+        tooth_w = (2 * math.pi / n_teeth) * 0.48
+        # Alternate outer/inner points for zigzag teeth
+        ang_outer = base + tooth_w / 2
+        ang_inner = base + (2 * math.pi / n_teeth) - tooth_w / 2
+        # Root then tip then root
+        pts.append((cx + r_inner * math.cos(base), cy + r_inner * math.sin(base)))
+        pts.append((cx + r_outer * math.cos(ang_outer - 0.06), cy + r_outer * math.sin(ang_outer - 0.06)))
+        pts.append((cx + r_outer * math.cos(ang_outer + 0.06), cy + r_outer * math.sin(ang_outer + 0.06)))
+    # Close shape by adding final root
+    # Draw filled gear then outline for crisp look
+    # Handle alpha color
+    if len(color) == 4 and color[3] < 255:
+        # Use polygon with alpha
+        pygame.draw.polygon(surface, color, pts, 0)
+        pygame.draw.polygon(surface, color, pts, max(1, thickness))
+    else:
+        # Draw gear body filled with muted metallic, outline with color
+        base_fill = (color[0], color[1], color[2]) if len(color) == 3 else (color[0], color[1], color[2])
+        # Subtle inner fill darker
+        pygame.draw.polygon(surface, base_fill, pts, 0)
+        pygame.draw.polygon(surface, base_fill, pts, max(1, thickness))
+        # Highlight ring
+        pygame.draw.circle(surface, base_fill, (cx, cy), int(size * 0.55), max(1, thickness-1) if thickness>1 else 1)
+    # Center hub
+    hub_r = int(size * 0.30)
+    hub_color = (color[0], color[1], color[2]) if len(color) == 3 else (color[0], color[1], color[2])
+    pygame.draw.circle(surface, hub_color, (cx, cy), hub_r, max(1, thickness))
+    pygame.draw.circle(surface, (30, 30, 30), (cx, cy), max(2, hub_r-2), 0)
+    # Spokes — 3 small circles around hub
+    for k in range(3):
+        ang = (2 * math.pi * k) / 3 + rotation
+        sx = cx + int(math.cos(ang) * size * 0.45)
+        sy = cy + int(math.sin(ang) * size * 0.45)
+        pygame.draw.circle(surface, hub_color, (sx, sy), max(1, int(size * 0.12)), 1)
+    # Center dot
+    pygame.draw.circle(surface, hub_color, (cx, cy), max(2, int(size*0.14)), 0)
 
 
 def draw_new_game_button(screen, mouse_pos):
@@ -1497,31 +1623,25 @@ def scroll_theme_list(delta):
     theme_scroll_offset = max(0.0, min(theme_scroll_offset + delta, max_scroll))
 
 
-# --- Engine Settings Page ---
-ENGINE_ROW_KEYS = ["threads", "skill", "hash"]
-ENGINE_ROW_LABELS = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash"}
-ENGINE_ROW_LIMITS = {"threads": (1, 1024), "skill": (0, 20), "hash": (16, 32768)}
+# --- Engine Settings Page (Sliders) ---
+ENGINE_ROW_KEYS = ["threads", "skill", "hash", "depth"]
+ENGINE_ROW_LABELS = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash", "depth": "Depth Limit"}
+ENGINE_ROW_LIMITS = {"threads": (1, 1024), "skill": (0, 20), "hash": (16, 32768), "depth": (5, 40)}
 ENGINE_PARAM_NAMES = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash"}
 HASH_STEPS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
-ENGINE_ROW_TOP = 130
+ENGINE_ROW_TOP = 120
 ENGINE_ROW_HEIGHT = 64
-ENGINE_ROW_GAP = 18
-ENGINE_ROW_WIDTH = 460
-ENGINE_BTN_W = 44
-ENGINE_BTN_H = 38
-ENGINE_VALUE_W = 110
+ENGINE_ROW_GAP = 14
+ENGINE_ROW_WIDTH = 480
+ENGINE_SLIDER_TRACK_W = 180
+ENGINE_SLIDER_TRACK_H = 6
+ENGINE_SLIDER_THUMB_R = 10
+
+engine_slider_dragging = None
 
 
-def step_hash_value(current, direction):
-    """Move through the HASH_STEPS ladder, keeping custom config values."""
-    steps = sorted(set(HASH_STEPS) | {current})
-    idx = steps.index(current)
-    return steps[max(0, min(idx + direction, len(steps) - 1))]
-
-
-def get_engine_row_rects(i, offset_x=0):
-    """Rects (row, minus, value, plus) for engine setting row i."""
+def get_engine_slider_rects(i, offset_x=0):
     y = ENGINE_ROW_TOP + i * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP)
     row_rect = pygame.Rect(
         WIDTH // 2 - ENGINE_ROW_WIDTH // 2 + offset_x,
@@ -1529,54 +1649,46 @@ def get_engine_row_rects(i, offset_x=0):
         ENGINE_ROW_WIDTH,
         ENGINE_ROW_HEIGHT,
     )
-    plus_rect = pygame.Rect(
-        row_rect.right - 18 - ENGINE_BTN_W,
-        row_rect.centery - ENGINE_BTN_H // 2,
-        ENGINE_BTN_W,
-        ENGINE_BTN_H,
-    )
-    value_rect = pygame.Rect(
-        plus_rect.x - 8 - ENGINE_VALUE_W,
-        row_rect.y,
-        ENGINE_VALUE_W,
-        ENGINE_ROW_HEIGHT,
-    )
-    minus_rect = pygame.Rect(
-        value_rect.x - 8 - ENGINE_BTN_W,
-        row_rect.centery - ENGINE_BTN_H // 2,
-        ENGINE_BTN_W,
-        ENGINE_BTN_H,
-    )
-    return row_rect, minus_rect, value_rect, plus_rect
+    track_w = ENGINE_SLIDER_TRACK_W
+    track_h = ENGINE_SLIDER_TRACK_H
+    track_x = row_rect.x + 150
+    track_y = row_rect.centery - track_h // 2
+    track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
+    value_rect = pygame.Rect(track_rect.right + 12, row_rect.y, 70, ENGINE_ROW_HEIGHT)
+    return row_rect, track_rect, value_rect
 
 
 def get_engine_reset_rect(offset_x=0):
     reset_w, reset_h = 220, 40
-    reset_y = ENGINE_ROW_TOP + 3 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 14
+    reset_y = ENGINE_ROW_TOP + 4 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12
     return pygame.Rect(
         WIDTH // 2 - reset_w // 2 + offset_x, reset_y, reset_w, reset_h
     )
 
 
-def adjust_engine_setting(key, direction):
-    """Change one engine setting, persist it, and queue it on the engine."""
+def set_engine_slider_value(key, mouse_x, track_rect):
+    global ANALYSIS_DEPTH
     low, high = ENGINE_ROW_LIMITS[key]
+    t = (mouse_x - track_rect.x) / max(1, track_rect.width)
+    t = max(0.0, min(1.0, t))
     if key == "hash":
-        new_value = step_hash_value(config[key], direction)
+        idx = int(round(t * (len(HASH_STEPS) - 1)))
+        new_value = HASH_STEPS[idx]
     else:
-        new_value = max(low, min(high, config[key] + direction))
-
-    if new_value == config[key]:
-        return
-
-    config[key] = new_value
-    save_config()
-    if engine_thread is not None:
-        engine_thread.set_pending_parameters({ENGINE_PARAM_NAMES[key]: new_value})
+        new_value = int(round(low + t * (high - low)))
+    if new_value != config[key]:
+        config[key] = new_value
+        if key == "depth":
+            ANALYSIS_DEPTH = new_value
+        save_config()
+        if engine_thread is not None and key in ENGINE_PARAM_NAMES:
+            engine_thread.set_pending_parameters({ENGINE_PARAM_NAMES[key]: new_value})
 
 
 def reset_engine_settings():
+    global ANALYSIS_DEPTH
     config.update(ENGINE_DEFAULTS)
+    ANALYSIS_DEPTH = config["depth"]
     save_config()
     if engine_thread is not None:
         engine_thread.set_pending_parameters(
@@ -1592,77 +1704,90 @@ def draw_engine_settings_content(screen, offset_x=0):
     mx, my = pygame.mouse.get_pos()
 
     for i, key in enumerate(ENGINE_ROW_KEYS):
-        row_rect, minus_rect, value_rect, plus_rect = get_engine_row_rects(
-            i, offset_x
-        )
+        row_rect, track_rect, value_rect = get_engine_slider_rects(i, offset_x)
 
-        pygame.draw.rect(screen, (55, 55, 55), row_rect, border_radius=4)
-        pygame.draw.rect(screen, MENU_BORDER_COLOR, row_rect, 2, border_radius=4)
+        pygame.draw.rect(screen, (55, 55, 55), row_rect, border_radius=6)
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, row_rect, 2, border_radius=6)
 
-        label = font_large.render(ENGINE_ROW_LABELS[key], True, TEXT_COLOR)
-        screen.blit(
-            label,
-            (row_rect.x + 18, row_rect.centery - label.get_height() // 2),
-        )
+        label = font_small.render(ENGINE_ROW_LABELS[key], True, TEXT_COLOR)
+        screen.blit(label, (row_rect.x + 14, row_rect.centery - label.get_height() // 2))
 
+        # Slider track background
+        pygame.draw.rect(screen, (45, 45, 45), track_rect, border_radius=3)
+        # Fill portion
         low, high = ENGINE_ROW_LIMITS[key]
-        value_text = f"{config[key]} MB" if key == "hash" else str(config[key])
-        value_surf = font_small.render(value_text, True, TEXT_COLOR)
-        screen.blit(
-            value_surf,
-            (
-                value_rect.centerx - value_surf.get_width() // 2,
-                value_rect.centery - value_surf.get_height() // 2,
-            ),
-        )
+        if key == "hash":
+            idx = HASH_STEPS.index(config[key]) if config[key] in HASH_STEPS else 0
+            t = idx / max(1, len(HASH_STEPS) - 1)
+        else:
+            t = (config[key] - low) / max(1, high - low)
+        fill_w = int(track_rect.width * t)
+        fill_rect = pygame.Rect(track_rect.x, track_rect.y, max(4, fill_w), track_rect.height)
+        fill_color = (100, 200, 120) if key == "depth" else (80, 140, 255)
+        pygame.draw.rect(screen, fill_color, fill_rect, border_radius=3)
+        # Thumb
+        thumb_x = track_rect.x + int(t * track_rect.width)
+        thumb_y = track_rect.centery
+        is_dragging = engine_slider_dragging == key
+        thumb_hover = is_dragging or (abs(mx - thumb_x) < 14 and abs(my - thumb_y) < 14) or track_rect.collidepoint(mx, my)
+        thumb_color = (130, 180, 255) if is_dragging else (200, 200, 200) if thumb_hover else (180, 180, 180)
+        pygame.draw.circle(screen, thumb_color, (thumb_x, thumb_y), ENGINE_SLIDER_THUMB_R)
+        pygame.draw.circle(screen, (30, 30, 30), (thumb_x, thumb_y), ENGINE_SLIDER_THUMB_R, 2)
 
-        for rect, symbol, enabled in (
-            (minus_rect, "-", config[key] > low),
-            (plus_rect, "+", config[key] < high),
-        ):
-            if enabled:
-                btn_bg = (
-                    (95, 95, 95) if rect.collidepoint(mx, my) else (75, 75, 75)
-                )
-            else:
-                btn_bg = (48, 48, 48)
-            pygame.draw.rect(screen, btn_bg, rect, border_radius=4)
-            pygame.draw.rect(screen, MENU_BORDER_COLOR, rect, 2, border_radius=4)
-            sym_color = TEXT_COLOR if enabled else (110, 110, 110)
-            sym = font_small.render(symbol, True, sym_color)
-            screen.blit(sym, sym.get_rect(center=rect.center))
+        # Value text
+        if key == "hash":
+            value_text = f"{config[key]} MB"
+        else:
+            value_text = str(config[key])
+        value_surf = font_small.render(value_text, True, TEXT_ACCENT if thumb_hover or is_dragging else TEXT_COLOR)
+        screen.blit(value_surf, (value_rect.centerx - value_surf.get_width() // 2, value_rect.centery - value_surf.get_height() // 2))
 
     reset_rect = get_engine_reset_rect(offset_x)
     reset_hovered = reset_rect.collidepoint(mx, my)
-    pygame.draw.rect(
-        screen,
-        (95, 95, 95) if reset_hovered else (75, 75, 75),
-        reset_rect,
-        border_radius=4,
-    )
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, reset_rect, 2, border_radius=4)
+    pygame.draw.rect(screen, (95, 95, 95) if reset_hovered else (75, 75, 75), reset_rect, border_radius=6)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, reset_rect, 2, border_radius=6)
     reset_text = font_small.render("Reset to Defaults", True, TEXT_COLOR)
     screen.blit(reset_text, reset_text.get_rect(center=reset_rect.center))
 
-    note = font_tiny.render(
-        "Changes apply to the engine instantly and are saved", True, TEXT_MUTED
-    )
-    screen.blit(
-        note, (WIDTH // 2 - note.get_width() // 2, reset_rect.bottom + 12)
-    )
+    note = font_tiny.render("Sliders update instantly and are saved", True, TEXT_MUTED)
+    screen.blit(note, (WIDTH // 2 - note.get_width() // 2, reset_rect.bottom + 10))
+
+
+def get_github_button_rect(offset_x=0, about_y=0):
+    w, h = 220, 36
+    x = WIDTH // 2 - w // 2 + offset_x
+    y = about_y + 64
+    return pygame.Rect(x, y, w, h)
+
+
+def get_restart_button_rect(offset_x=0, about_y=0):
+    w, h = 220, 36
+    x = WIDTH // 2 - w // 2 + offset_x
+    y = about_y + 108
+    return pygame.Rect(x, y, w, h)
 
 
 def draw_settings_menu(screen):
     global menu_anim_progress, settings_menu_state, menu_transition_progress
     global menu_transition_direction
 
-    if menu_anim_progress < 1.0:
+    if menu_anim_progress <= 0.01:
         return
 
     update_menu_transition()
 
     mx, my = pygame.mouse.get_pos()
-    transition_idle = menu_transition_direction == "none"
+    transition_idle = menu_transition_direction == "none" and menu_anim_progress >= 0.99
+
+    # Eased open/close animation — backdrop fade + content slide/scale
+    eased = cubic_ease_in_out(max(0.0, min(1.0, menu_anim_progress)))
+    # Backdrop
+    backdrop_alpha = int(eased * 190)
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, backdrop_alpha))
+    screen.blit(overlay, (0, 0))
+    # Content entrance offset (slight slide up and scale)
+    open_slide = int((1 - eased) * 24)  # slides up as it opens
 
     offset_x = 0
     if menu_transition_direction == "left_out":
@@ -1766,12 +1891,28 @@ def draw_settings_menu(screen):
         screen.blit(about_title, about_title_rect)
 
         version_text = font_small.render(
-            "ChessBotV Rewrite Version 1.5-beta", True, TEXT_COLOR
+            "ChessBotV Rewrite Version 1.5-beta2", True, TEXT_COLOR
         )
         version_rect = version_text.get_rect(
             center=(WIDTH // 2 + offset_x, about_y + 40)
         )
         screen.blit(version_text, version_rect)
+
+        # Github button
+        github_rect = get_github_button_rect(offset_x, about_y)
+        github_hovered = transition_idle and github_rect.collidepoint(mx, my)
+        pygame.draw.rect(screen, (45, 85, 155) if github_hovered else (55, 75, 145), github_rect, border_radius=6)
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, github_rect, 2, border_radius=6)
+        github_text = font_small.render("Github", True, TEXT_COLOR)
+        screen.blit(github_text, github_text.get_rect(center=github_rect.center))
+
+        # Restart button
+        restart_rect = get_restart_button_rect(offset_x, about_y)
+        restart_hovered = transition_idle and restart_rect.collidepoint(mx, my)
+        pygame.draw.rect(screen, (140, 50, 50) if restart_hovered else (100, 50, 50), restart_rect, border_radius=6)
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, restart_rect, 2, border_radius=6)
+        restart_text = font_small.render("Restart", True, TEXT_COLOR)
+        screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
 
     elif settings_menu_state == "board_theme":
         draw_board_theme_content(screen, offset_x)
@@ -1783,6 +1924,7 @@ def draw_settings_menu(screen):
 def handle_menu_click(mx, my):
     global menu_anim_closing, settings_menu_state, menu_transition_direction
     global current_theme, images, theme_scroll_offset, settings_menu_target
+    global engine_slider_dragging, restart_requested
 
     if menu_anim_progress < 1.0 or menu_transition_direction != "none":
         return True
@@ -1824,12 +1966,11 @@ def handle_menu_click(mx, my):
 
     elif settings_menu_state == "engine_settings":
         for i, key in enumerate(ENGINE_ROW_KEYS):
-            _row_rect, minus_rect, _value_rect, plus_rect = get_engine_row_rects(i)
-            if minus_rect.collidepoint(mx, my):
-                adjust_engine_setting(key, -1)
-                return True
-            if plus_rect.collidepoint(mx, my):
-                adjust_engine_setting(key, 1)
+            _row_rect, track_rect, _value_rect = get_engine_slider_rects(i)
+            hit_rect = track_rect.inflate(20, 24)
+            if hit_rect.collidepoint(mx, my):
+                engine_slider_dragging = key
+                set_engine_slider_value(key, mx, track_rect)
                 return True
 
         if get_engine_reset_rect().collidepoint(mx, my):
@@ -1865,6 +2006,19 @@ def handle_menu_click(mx, my):
                     menu_transition_direction = "left_out"
                 return True
 
+        # About section buttons — compute same about_y as draw
+        about_y = start_y + len(menu_items) * (item_height + 20) + 40
+        if get_github_button_rect(0, about_y).collidepoint(mx, my):
+            try:
+                webbrowser.open("https://github.com/Baked-Cake1/ChessBotV-Rewrite")
+            except Exception:
+                pass
+            return True
+        if get_restart_button_rect(0, about_y).collidepoint(mx, my):
+            restart_requested = True
+            menu_anim_closing = True
+            return True
+
     return True
 
 
@@ -1897,6 +2051,10 @@ def draw_gui(
         depth = engine_thread.info["depth"]
         nps = engine_thread.info["nps"]
         pv = engine_thread.info["pv"]
+
+    # NPS goes to 0 once depth limit is reached (engine idle at full depth)
+    if depth >= ANALYSIS_DEPTH:
+        nps = 0
 
     anim_mgr.set_target_eval(score)
     draw_eval_bar(
@@ -1947,7 +2105,7 @@ def draw_gui(
         pygame.draw.circle(screen, CAPTURE_MOVE_COLOR, (x, y), 15)
         pygame.draw.circle(screen, (255, 255, 255, 200), (x, y), 15, 2)
 
-    # Engine arrow — hidden once the game is over
+    # Engine arrow — hidden once the game is over (target update, drawing is over pieces)
     arrow_visible = False
     arrow_is_knight = False
     if not game_over and pv and len(pv) > 0:
@@ -1985,30 +2143,6 @@ def draw_gui(
     if not arrow_visible or game_over:
         anim_mgr.set_arrow_target(None, None, False)
 
-    if (
-        anim_mgr.arrow_alpha > 1
-        and anim_mgr.arrow_start is not None
-        and anim_mgr.arrow_end is not None
-    ):
-        if arrow_is_knight:
-            draw_knight_arrow(
-                screen,
-                anim_mgr.arrow_start,
-                anim_mgr.arrow_end,
-                ENGINE_ARROW_COLOR,
-                8,
-                anim_mgr.arrow_alpha,
-            )
-        else:
-            draw_arrow(
-                screen,
-                anim_mgr.arrow_start,
-                anim_mgr.arrow_end,
-                ENGINE_ARROW_COLOR,
-                8,
-                anim_mgr.arrow_alpha,
-            )
-
     # Check/Checkmate glow, UNDER the pieces
     draw_check_effect_under(screen, check_effect, BOARD_OX, BOARD_OY)
 
@@ -2019,6 +2153,9 @@ def draw_gui(
         anim_mgr.move_anim["rook_target_sq"] if anim_mgr.move_anim else None
     )
     rook_start_sq = anim_mgr.rook_anim["target_sq"] if anim_mgr.rook_anim else None
+
+    # Collect board-reset target squares to hide during reset animation
+    reset_targets = {a["target_sq"] for a in anim_mgr.board_reset_anims} if anim_mgr.board_reset_anims else set()
 
     for r in range(8):
         for f in range(8):
@@ -2038,6 +2175,10 @@ def draw_gui(
 
             # Hide the piece being dragged so it doesn't appear doubled
             if dragging and sq == drag_sq:
+                continue
+
+            # During board reset, hide destination squares so animating pieces don't double
+            if sq in reset_targets:
                 continue
 
             if piece:
@@ -2101,6 +2242,43 @@ def draw_gui(
             curr_y = sy + (ey - sy) * t
             screen.blit(images[pkey], (curr_x, curr_y))
 
+    # Board reset animations — multiple pieces sliding to start squares
+    for anim in anim_mgr.board_reset_anims:
+        pkey = get_piece_key(anim["piece"])
+        if pkey in images:
+            t = cubic_ease_in_out(anim["progress"])
+            sx, sy = anim["start"]
+            ex, ey = anim["end"]
+            curr_x = sx + (ex - sx) * t
+            curr_y = sy + (ey - sy) * t
+            screen.blit(images[pkey], (curr_x, curr_y))
+
+    # Suggestion arrows — render OVER pieces (fixes knight L first-leg layering)
+    if (
+        arrow_visible
+        and anim_mgr.arrow_alpha > 1
+        and anim_mgr.arrow_start is not None
+        and anim_mgr.arrow_end is not None
+    ):
+        if arrow_is_knight:
+            draw_knight_arrow(
+                screen,
+                anim_mgr.arrow_start,
+                anim_mgr.arrow_end,
+                ENGINE_ARROW_COLOR,
+                8,
+                anim_mgr.arrow_alpha,
+            )
+        else:
+            draw_arrow(
+                screen,
+                anim_mgr.arrow_start,
+                anim_mgr.arrow_end,
+                ENGINE_ARROW_COLOR,
+                8,
+                anim_mgr.arrow_alpha,
+            )
+
     # Check/Checkmate brackets, rings, and mate border, OVER the pieces
     draw_check_effect_over(screen, check_effect, BOARD_OX, BOARD_OY)
 
@@ -2115,6 +2293,10 @@ def draw_gui(
                 draw_x = mx - ox
                 draw_y = my - oy
                 screen.blit(images[pkey], (draw_x, draw_y))
+
+    # Promotion choice overlay (must be over board but under menu)
+    if promotion_pending is not None:
+        draw_promotion_menu(screen, promotion_pending["color"])
 
     # 6. Info panel
     info_top = BOARD_OY + BOARD_WIDTH
@@ -2192,7 +2374,7 @@ def draw_gui(
     draw_new_game_button(screen, mouse_pos)
     draw_settings_button(screen, mouse_pos)
 
-    if menu_anim_progress >= 1.0:
+    if menu_anim_progress > 0.01:
         draw_settings_menu(screen)
 
     pygame.display.flip()
@@ -2200,7 +2382,7 @@ def draw_gui(
 
 def main():
     global menu_anim_progress, menu_anim_opening, menu_anim_closing
-    global menu_transition_direction, engine_thread
+    global menu_transition_direction, engine_thread, promotion_pending, restart_requested, engine_slider_dragging
 
     clock = pygame.time.Clock()
     board = chess.Board()
@@ -2227,6 +2409,12 @@ def main():
         check_effect.update(is_check, is_mate, king_sq)
 
         update_menu_animation()
+        # Handle restart after menu close animation finishes
+        if restart_requested:
+            if menu_anim_progress == 0 and not menu_anim_opening and not menu_anim_closing:
+                running = False
+            elif menu_anim_progress > 0 and not menu_anim_closing and not menu_anim_opening:
+                menu_anim_closing = True
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
@@ -2243,25 +2431,55 @@ def main():
                 )
 
                 if not menu_active:
+                    if promotion_pending is not None:
+                        rects = get_promotion_rects()
+                        handled = False
+                        for idx, rect in enumerate(rects):
+                            if rect.collidepoint(mx, my):
+                                promo_piece = PROMOTION_CHOICES[idx]
+                                try_execute_promotion(board, anim_mgr, engine_thread, promotion_pending["from_sq"], promotion_pending["to_sq"], promo_piece, animate=True)
+                                selected_sq = None
+                                dragging = False
+                                drag_sq = None
+                                drag_offset = None
+                                promotion_pending = None
+                                handled = True
+                                break
+                        if handled:
+                            continue
+                        # Click outside menu cancels promotion
+                        # Check if clicked outside all rects — dismiss
+                        outside = True
+                        for rect in rects:
+                            if rect.collidepoint(mx, my):
+                                outside = False
+                                break
+                        # If outside, keep menu open (don't process board clicks)
+                        continue
+
                     if new_game_button_rect.collidepoint(mx, my):
+                        # Smooth transition back to start position
+                        old_board = board.copy()
+                        new_board = chess.Board()
+                        anim_mgr.add_board_reset(old_board, new_board)
                         board.reset()
                         selected_sq = None
                         dragging = False
                         drag_sq = None
                         drag_offset = None
-                        anim_mgr.move_anim = None
-                        anim_mgr.rook_anim = None
                         anim_mgr.capture_anims = []
                         anim_mgr.current_eval = 0.0
                         anim_mgr.target_eval = 0.0
                         anim_mgr.arrow_target_alpha = 0.0
                         check_effect.reset()
                         engine_thread.update_position(board)
+                        # Clear promotion if any
+                        promotion_pending = None
 
                     elif settings_button_rect.collidepoint(mx, my):
                         menu_anim_opening = True
 
-                    elif not (anim_mgr.move_anim or anim_mgr.rook_anim):
+                    elif not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
                         if not board.is_game_over(claim_draw=True):
                             sq = get_square_from_pos(event.pos)
                             if sq is not None:
@@ -2278,6 +2496,15 @@ def main():
                                 else:
                                     # Click on empty/enemy — try click-to-move from selected_sq
                                     if selected_sq is not None:
+                                        # Promotion check — show menu instead of auto-queen
+                                        if is_promotion_move(board, selected_sq, sq):
+                                            test_move = chess.Move(selected_sq, sq, promotion=chess.QUEEN)
+                                            if test_move in board.legal_moves:
+                                                promotion_pending = {"from_sq": selected_sq, "to_sq": sq, "color": board.turn}
+                                                dragging = False
+                                                drag_sq = None
+                                                drag_offset = None
+                                                continue
                                         if try_execute_move(board, anim_mgr, engine_thread, selected_sq, sq, animate=True):
                                             selected_sq = None
                                         else:
@@ -2292,15 +2519,25 @@ def main():
                     handle_menu_click(mx, my)
 
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if engine_slider_dragging is not None:
+                    engine_slider_dragging = None
                 mx, my = event.pos
                 menu_active = (
                     menu_anim_progress > 0
                     or menu_anim_opening
                     or menu_anim_closing
                 )
-                if dragging and not menu_active and not (anim_mgr.move_anim or anim_mgr.rook_anim):
+                if dragging and not menu_active and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
                     drop_sq = get_square_from_pos(event.pos)
                     if drop_sq is not None and drag_sq is not None and drop_sq != drag_sq:
+                        if is_promotion_move(board, drag_sq, drop_sq):
+                            test_move = chess.Move(drag_sq, drop_sq, promotion=chess.QUEEN)
+                            if test_move in board.legal_moves:
+                                promotion_pending = {"from_sq": drag_sq, "to_sq": drop_sq, "color": board.turn}
+                                dragging = False
+                                drag_sq = None
+                                drag_offset = None
+                                continue
                         if try_execute_move(board, anim_mgr, engine_thread, drag_sq, drop_sq, animate=False):
                             selected_sq = None
                         else:
@@ -2315,6 +2552,15 @@ def main():
                     drag_sq = None
                     drag_offset = None
 
+            elif event.type == pygame.MOUSEMOTION:
+                if engine_slider_dragging is not None:
+                    try:
+                        idx = ENGINE_ROW_KEYS.index(engine_slider_dragging)
+                        _, track_rect, _ = get_engine_slider_rects(idx)
+                        set_engine_slider_value(engine_slider_dragging, event.pos[0], track_rect)
+                    except ValueError:
+                        engine_slider_dragging = None
+
             elif event.type == pygame.MOUSEWHEEL:
                 if (
                     settings_menu_open
@@ -2325,6 +2571,9 @@ def main():
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
+                    if promotion_pending is not None:
+                        promotion_pending = None
+                        continue
                     if menu_anim_progress > 0 and not (
                         menu_anim_opening or menu_anim_closing
                     ):
@@ -2334,6 +2583,9 @@ def main():
                             menu_transition_direction = "right_out"
                         else:
                             menu_anim_closing = True
+                    else:
+                        # Cancel selection if any
+                        selected_sq = None
 
                 elif event.key == pygame.K_SPACE and menu_anim_progress == 0:
                     if (
@@ -2430,7 +2682,9 @@ def main():
 
     engine_thread.quit()
     pygame.quit()
-    sys.exit()
+    if restart_requested:
+        sys.exit(RESTART_EXIT_CODE)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
