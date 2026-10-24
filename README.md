@@ -1,25 +1,30 @@
-# ChessBotV — Rewrite (1.2.1-beta)
+# ChessBotV — Rewrite (v1.5-beta)
 
 A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against **Stockfish** (or any UCI engine), get live evaluation, opening names, and engine suggestions — with smooth animations, board themes, and modern UI.
 
 > Originally `ChessBotV`, completely rewritten for stability, performance, and UX. Work in progress — issues and visual bug reports welcome.
 
+## Versions
+
+- **Current stable version:** **v1.0** (Initial release)
+- **Current beta / developer release:** **v1.5-beta** (active development on this branch)
+
 ---
 
-## ✨ Features
+## Features
 
-### ♟️ Play & Input
+### Play & Input
 - **Two input modes:** Click piece → green circles, *or* **drag & drop** to any legal square
 - Handles **castling, en-passant, promotion (auto-queen), captures** and all legal chess rules via `python-chess`
 - **Space** to play the engine's top move instantly
 
-### 🧠 UCI Engine (Stockfish by default)
+### UCI Engine (Stockfish by default)
 - Background-threaded UCI (`uci`, `isready`, `go depth`, `stop`) — UI stays 60 FPS
 - **Live readout:** `Eval` (±0.00, `M#` for mate), `Depth` (capped at **25**), `NPS` (K/M/B/T formatted), `Rec. Move`
 - Single search per position with idle after full depth — no sawtooth depth reset
 - **Auto game-over** on checkmate, stalemate, insufficient material, 75-move, fivefold repetition, 50-move and threefold repetition
 
-### 📊 Visuals
+### Visuals
 - **Lichess-style eval bar** with gradient fill, tick marks (0.25/0.5/0.75), `W/B` labels and glowing marker
 - **Engine arrow:** blue, width 8, fades/morphs smoothly; **L-shaped for knight moves** (long-leg first)
 - **Check / Checkmate FX:**
@@ -28,11 +33,11 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Animations:** cubic ease move + rook slide for castling, capture pop-and-fade (scale 1.0→1.8)
 - **Always-on-top** window via `ctypes` (Windows)
 
-### 🎨 Themes & UI
+### Themes & UI
 - **Board themes:** any folder under `pieces/<theme>/` (e.g. `classic`). Auto-discovered, `classic` pinned first
 - **Chess.com styles:** any subfolder in `pieces/chesscom/<style>/` (e.g. `8_bit`, `chesskid` → “8-Bit”, “ChessKid”)
 - **Info panel:** opening name (from `openings.json`), game status (`Check!` / `Draw — …`), stats, opening/rec-move row
-- **Top bar:** `New` + gear `⚙` → animated **Settings** overlay with transitions
+- **Top bar:** `New` + gear → animated **Settings** overlay with transitions
 - **Settings pages:**
   - **Board Theme** — scrollable list with scrollbar + “Scroll for more”
   - **Engine Settings** — `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), live `setoption` + `save_config()`
@@ -47,12 +52,14 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
   ```bash
   pip install pygame python-chess
   ```
+
 - **Engine:** Stockfish (or any UCI engine) — place anywhere and set `ENGINE_PATH` in `new.py`
 
   Default:
   ```python
   ENGINE_PATH = r"C:\Users\Blake\Documents\_Engines\Chess\Stockfish\..."
   ```
+
   Point it to your `stockfish` binary, e.g. `stockfish-windows-x86-64-universal.exe` or `/usr/bin/stockfish`.
 
 - **Assets:**
@@ -62,7 +69,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Windows (recommended)
 Double-click `start.bat`:
@@ -81,7 +88,7 @@ python new.py --help
 
 ---
 
-## 🎮 Controls
+## Controls
 
 | Input | Action |
 |---|---|
@@ -100,7 +107,7 @@ python new.py --help
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 `ENGINE_DEFAULTS = { hash:2048, threads:4, skill:20 }` in `new.py`.
 
@@ -118,7 +125,7 @@ skill=20
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 ChessBotV-Rewrite/
@@ -137,7 +144,7 @@ ChessBotV-Rewrite/
 
 ---
 
-## 🧩 Engine Details
+## Engine Details
 
 - **Thread:** `subprocess.Popen([ENGINE_PATH], ...)` + `_handshake()` → `uciok` → `setoption Threads/Hash/Skill Level`
 - **Loop:** `update_position(board)` → `stop` → bump `search_token` → `_analyze_loop` → `position fen …` + `go depth 25` → parse `info depth/nps/score/mate/pv`
@@ -146,7 +153,7 @@ ChessBotV-Rewrite/
 
 ---
 
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 - `Engine not found or error` → check `ENGINE_PATH` exists and is executable
 - `engine closed its output stream` → engine crashed; try lower `Hash`/`Threads`
@@ -157,7 +164,7 @@ ChessBotV-Rewrite/
 
 ---
 
-## 📌 Roadmap
+## Roadmap
 
 - Promotion choice dialog (currently auto-queen)
 - Sound settings & audio playback (`audio/` placeholder)
@@ -171,10 +178,5 @@ ChessBotV-Rewrite/
 
 Bug reports / visual issues / ideas → open an **Issue**. Pull requests welcome — keep style close to `new.py` (PEP 8-ish, CRLF ok, 80-col board rendering).
 
-**Version:** `ChessBotV Rewrite Version 1.2.1-beta` (about page)
+**Version:** `ChessBotV Rewrite Version 1.5-beta` (about page)
 
----
-
-## License
-
-No explicit license yet — treat as source-available for personal use; ask maintainer before redistribution.
