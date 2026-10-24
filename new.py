@@ -1107,6 +1107,75 @@ def draw_arrow(screen, start_pos, end_pos, color, width=8, alpha=255):
     screen.blit(surf, (min_x, min_y))
 
 
+def _get_knight_corner(start_pos, end_pos):
+    """Return the L-corner for a knight move (long leg first)."""
+    start = pygame.Vector2(start_pos)
+    end = pygame.Vector2(end_pos)
+    dx = abs(end.x - start.x)
+    dy = abs(end.y - start.y)
+    # Go along the longer delta first, like a real knight's path
+    if dx > dy:
+        # horizontal first: corner shares end.x, start.y
+        return pygame.Vector2(end.x, start.y)
+    else:
+        # vertical first: corner shares start.x, end.y
+        return pygame.Vector2(start.x, end.y)
+
+
+def draw_knight_arrow(screen, start_pos, end_pos, color, width=8, alpha=255):
+    """L-shaped arrow for knight moves: start -> corner -> end with arrowhead."""
+    start = pygame.Vector2(start_pos)
+    end = pygame.Vector2(end_pos)
+    corner = _get_knight_corner(start, end)
+
+    v = end - corner
+    length = v.length()
+    if length == 0:
+        # Fallback to straight if degenerate
+        draw_arrow(screen, start_pos, end_pos, color, width, alpha)
+        return
+
+    v_unit = v / length
+    head_length = width * 3
+    head_width = width * 2.5
+    neck = end - v_unit * (head_length * 0.8)
+    perp = pygame.Vector2(-v_unit.y, v_unit.x) * (head_width / 2)
+    point1 = end
+    point2 = end - v_unit * head_length + perp
+    point3 = end - v_unit * head_length - perp
+
+    if alpha >= 254:
+        rgb = color[:3]
+        # Two straight segments forming the L
+        pygame.draw.line(screen, rgb, start, corner, width)
+        pygame.draw.line(screen, rgb, corner, neck, width)
+        pygame.draw.polygon(screen, rgb, [point1, point2, point3])
+        return
+
+    a = max(0, min(255, int(alpha)))
+    if a <= 1:
+        return
+
+    xs = (start.x, corner.x, end.x, point1.x, point2.x, point3.x)
+    ys = (start.y, corner.y, end.y, point1.y, point2.y, point3.y)
+    pad = width + 4
+    min_x = int(min(xs)) - pad
+    min_y = int(min(ys)) - pad
+    max_x = int(max(xs)) + pad
+    max_y = int(max(ys)) + pad
+    w = max(1, max_x - min_x)
+    h = max(1, max_y - min_y)
+
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    rgba = (color[0], color[1], color[2], a)
+    offset = pygame.Vector2(min_x, min_y)
+
+    pygame.draw.line(surf, rgba, start - offset, corner - offset, width)
+    pygame.draw.line(surf, rgba, corner - offset, neck - offset, width)
+    pygame.draw.polygon(surf, rgba, [point1 - offset, point2 - offset, point3 - offset])
+    screen.blit(surf, (min_x, min_y))
+
+
 def draw_gradient_rect(screen, rect, start_color, end_color, vertical=True):
     surface = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
 
@@ -1880,6 +1949,7 @@ def draw_gui(
 
     # Engine arrow — hidden once the game is over
     arrow_visible = False
+    arrow_is_knight = False
     if not game_over and pv and len(pv) > 0:
         best_move = pv[0]
         if best_move in board.legal_moves:
@@ -1907,6 +1977,10 @@ def draw_gui(
                 (start_x, start_y), (end_x, end_y), True
             )
             arrow_visible = True
+            # Detect knight move for L-shaped arrow
+            piece = board.piece_at(best_move.from_square)
+            if piece and piece.piece_type == chess.KNIGHT:
+                arrow_is_knight = True
 
     if not arrow_visible or game_over:
         anim_mgr.set_arrow_target(None, None, False)
@@ -1916,14 +1990,24 @@ def draw_gui(
         and anim_mgr.arrow_start is not None
         and anim_mgr.arrow_end is not None
     ):
-        draw_arrow(
-            screen,
-            anim_mgr.arrow_start,
-            anim_mgr.arrow_end,
-            ENGINE_ARROW_COLOR,
-            8,
-            anim_mgr.arrow_alpha,
-        )
+        if arrow_is_knight:
+            draw_knight_arrow(
+                screen,
+                anim_mgr.arrow_start,
+                anim_mgr.arrow_end,
+                ENGINE_ARROW_COLOR,
+                8,
+                anim_mgr.arrow_alpha,
+            )
+        else:
+            draw_arrow(
+                screen,
+                anim_mgr.arrow_start,
+                anim_mgr.arrow_end,
+                ENGINE_ARROW_COLOR,
+                8,
+                anim_mgr.arrow_alpha,
+            )
 
     # Check/Checkmate glow, UNDER the pieces
     draw_check_effect_under(screen, check_effect, BOARD_OX, BOARD_OY)
