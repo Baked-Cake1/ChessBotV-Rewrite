@@ -33,6 +33,13 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 LIGHT_SQ = (240, 217, 181)
 DARK_SQ = (181, 136, 99)
+# Board (square-colour) themes — separate from piece styles ("theme").
+BOARD_THEMES = {
+    "classic": {"display": "Classic", "light": (240, 217, 181), "dark": (181, 136, 99)},
+    "chesscom": {"display": "Chess.com", "light": (235, 236, 208), "dark": (115, 149, 82)},  # #ebecd0 / #739552
+}
+BOARD_THEME_ORDER = ["classic", "chesscom"]
+current_board_theme = "classic"
 HIGHLIGHT_COLOR = (205, 210, 106, 150)
 LEGAL_MOVE_COLOR = (0, 255, 0, 100)
 CAPTURE_MOVE_COLOR = (255, 0, 0, 120)
@@ -86,7 +93,7 @@ set_always_on_top()
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic"}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic"}
 
 
 def load_config():
@@ -104,12 +111,12 @@ def load_config():
                         k, v = line.split("=", 1)
                         k=k.strip().lower()
                         v=v.strip()
-                        if k in cfg and k != "theme":
+                        if k in cfg and k not in ("theme", "board_theme"):
                             try:
                                 cfg[k] = int(v)
                             except ValueError:
                                 pass
-                        elif k == "theme":
+                        elif k in ("theme", "board_theme"):
                             cfg[k] = v
                         elif k == "flipped":
                             cfg[k] = v.lower() in ("1","true","yes")
@@ -135,6 +142,7 @@ def save_config():
             f.write(f"depth={config.get('depth', 25)}\n")
             f.write(f"multipv={config.get('multipv', 1)}\n")
             f.write(f"theme={config.get('theme', current_theme)}\n")
+            f.write(f"board_theme={config.get('board_theme', current_board_theme)}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
 
@@ -143,6 +151,26 @@ def save_theme_config(theme_id):
     """Persist only theme change (keeps engine settings)."""
     config["theme"]=theme_id
     save_config()
+
+
+def normalise_board_theme(value):
+    v = str(value or "classic").strip().lower()
+    if v in ("chess.com", "chesscom", "chess_com"):
+        return "chesscom"
+    return v if v in BOARD_THEMES else "classic"
+
+
+def apply_board_theme(theme_id, persist=False):
+    """Switch the light/dark square colours (not the piece style)."""
+    global LIGHT_SQ, DARK_SQ, current_board_theme
+    theme_id = normalise_board_theme(theme_id)
+    current_board_theme = theme_id
+    LIGHT_SQ = BOARD_THEMES[theme_id]["light"]
+    DARK_SQ = BOARD_THEMES[theme_id]["dark"]
+    config["board_theme"] = theme_id
+    if persist:
+        save_config()
+    return theme_id
 
 
 def load_openings():
@@ -261,6 +289,8 @@ current_theme = config.get("theme", "classic")
 if available_themes and all(t[0] != current_theme for t in available_themes):
     current_theme = available_themes[0][0]
     config["theme"]=current_theme
+# Board square colours from config ("Classic" unless saved as Chess.com)
+apply_board_theme(config.get("board_theme", "classic"))
 
 # Pieces Style (board theme) menu layout & scrolling — compact 2-column + preview
 # Container was clipping second row of preview pieces (44 + 34 + 28 =106 >92); enlarge to fit
@@ -275,12 +305,36 @@ THEME_LIST_BOTTOM = HEIGHT - 40
 theme_scroll_offset = 0.0
 theme_scroll_speed = 70.0
 
-# Settings menu state
+# Settings menu state — pages form a small hierarchy:
+#   main -> engine_settings
+#   main -> board -> pieces_style / board_themes
 settings_menu_state = "main"
-settings_menu_target = "board_theme"
+settings_menu_target = "pieces_style"
+settings_menu_from = "main"
 menu_transition_progress = 0.0
-menu_transition_speed = 0.08
-menu_transition_direction = "none"
+menu_transition_speed = 0.07
+menu_transition_direction = "none"  # "none" | "forward" | "back"
+SETTINGS_PAGE_TITLES = {
+    "main": "Settings",
+    "board": "Board",
+    "pieces_style": "Pieces Styles",
+    "board_themes": "Board Themes",
+    "engine_settings": "Engine Settings",
+}
+SETTINGS_PAGE_PARENT = {
+    "main": None,
+    "engine_settings": "main",
+    "board": "main",
+    "pieces_style": "board",
+    "board_themes": "board",
+}
+SETTINGS_MAIN_ITEMS = [
+    "Engine Settings",
+    "Board",
+    "Sound Settings",
+    "Game Controls",
+    "Analysis Settings",
+]
 
 images = load_images(current_theme)
 openings = load_openings()
@@ -293,7 +347,10 @@ engine_thread = None
 BOARD_OY = TOP_BAR_HEIGHT + PADDING
 # Board X is dynamic (eval bar can be left or right); compute per frame
 BOARD_OX_LEFT = PADDING + EVAL_BAR_WIDTH + EVAL_BAR_GAP
-BOARD_OX_RIGHT = WIDTH - PADDING - BOARD_WIDTH
+# Eval bar on the right: the board sits flush left (the eval bar takes the
+# strip on the right). This was WIDTH-PADDING-BOARD_WIDTH, which equals
+# BOARD_OX_LEFT — so the board never moved and the bar overlapped it.
+BOARD_OX_RIGHT = PADDING
 EVAL_BAR_X_LEFT = PADDING
 EVAL_BAR_X_RIGHT = WIDTH - PADDING - EVAL_BAR_WIDTH
 # Runtime animated positions
@@ -312,7 +369,7 @@ engine_draft = dict(config)  # staged values, only applied on Save
 engine_slider_display = {}  # visual lerp towards draft (per key)
 engine_slider_velocity = {}
 for _k in ENGINE_DEFAULTS:
-    if _k != "theme":
+    if _k not in ("theme", "board_theme"):
         engine_slider_display[_k]=float(engine_draft.get(_k, ENGINE_DEFAULTS[_k]))
         engine_slider_velocity[_k]=0.0
 engine_has_changes = False
@@ -320,6 +377,11 @@ engine_has_changes = False
 # --- New game confirmation ---
 show_newgame_confirm = False
 confirm_anim = 0.0
+
+# --- Game-over dialog (win / draw) ---
+show_game_over = False
+game_over_anim = 0.0
+game_over_seen_key = None  # terminal position the dialog was shown/dismissed for
 
 # --- Legal move pulse ---
 legal_pulse_t = 0.0
@@ -426,13 +488,17 @@ def update_slider_display():
     engine_has_changes = any(engine_draft[k] != config.get(k) for k in ENGINE_ROW_KEYS)
 
 def update_global_anims():
-    global legal_pulse_t, eval_highlight_pulse, confirm_anim
+    global legal_pulse_t, eval_highlight_pulse, confirm_anim, game_over_anim
     legal_pulse_t += 0.08
     eval_highlight_pulse += 0.06
     if show_newgame_confirm:
         confirm_anim = min(1.0, confirm_anim + 0.12)
     else:
         confirm_anim = max(0.0, confirm_anim - 0.12)
+    if show_game_over:
+        game_over_anim = min(1.0, game_over_anim + 0.10)
+    else:
+        game_over_anim = max(0.0, game_over_anim - 0.12)
 
 # --- Math & Animations ---
 def cubic_ease_in_out(t):
@@ -959,9 +1025,32 @@ def get_game_status(board):
     return (None, None, False)
 
 
+def get_game_result(board):
+    """Return (title, subtitle, score, colour) for a finished game, else None."""
+    if board.is_checkmate():
+        # Side to move is checkmated, so the other side wins.
+        if board.turn == chess.BLACK:
+            return ("White wins!", "by checkmate", "1 – 0", (140, 230, 160))
+        return ("Black wins!", "by checkmate", "0 – 1", (140, 230, 160))
+    if board.is_stalemate():
+        return ("Draw", "by stalemate", "½ – ½", DRAW_COLOR)
+    if board.is_insufficient_material():
+        return ("Draw", "insufficient material", "½ – ½", DRAW_COLOR)
+    if board.is_seventyfive_moves():
+        return ("Draw", "by the 75-move rule", "½ – ½", DRAW_COLOR)
+    if board.is_fivefold_repetition():
+        return ("Draw", "by fivefold repetition", "½ – ½", DRAW_COLOR)
+    if board.is_fifty_moves():
+        return ("Draw", "by the 50-move rule", "½ – ½", DRAW_COLOR)
+    if board.is_repetition(3):
+        return ("Draw", "by threefold repetition", "½ – ½", DRAW_COLOR)
+    return None
+
+
 def update_menu_animation():
     global menu_anim_progress, menu_anim_opening, menu_anim_closing, settings_menu_open
-    global settings_menu_state, menu_transition_progress, menu_transition_direction
+    global settings_menu_state, settings_menu_target, settings_menu_from
+    global menu_transition_progress, menu_transition_direction
     global theme_scroll_offset
 
     if menu_anim_opening:
@@ -977,6 +1066,8 @@ def update_menu_animation():
             menu_anim_closing = False
             settings_menu_open = False
             settings_menu_state = "main"
+            settings_menu_target = "main"
+            settings_menu_from = "main"
             menu_transition_progress = 0.0
             menu_transition_direction = "none"
             theme_scroll_offset = 0.0
@@ -1513,11 +1604,10 @@ def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_mate=Fa
 
     v = end - start
     length = v.length()
-    if length == 0:
+    if length < 1:
         return
 
     # Subtle pulse for mate arrows (red) — not too noticeable
-    pulse = 0.0
     if is_mate:
         pulse = math.sin(pygame.time.get_ticks() * 0.005) * 0.07  # ~7% pulse
         width = width * (1 + pulse * 0.5)
@@ -1526,25 +1616,36 @@ def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_mate=Fa
 
     head_length = width * 3
     head_width = width * 2.5
-
-    neck = end - v_unit * (head_length * 0.8)
-
-    perp = pygame.Vector2(-v_unit.y, v_unit.x) * (head_width / 2)
-
-    point1 = end
-    point2 = end - v_unit * head_length + perp
-    point3 = end - v_unit * head_length - perp
+    shaft_half = width / 2.0
+    perp_unit = pygame.Vector2(-v_unit.y, v_unit.x)
+    head_base = end - v_unit * head_length
+    # Point well inside the head triangle: the gradient shaft runs to here,
+    # so it is always buried in (and welded to) the filled head below.
+    joint = end - v_unit * (head_length * 0.45)
 
     a = max(0, min(255, int(alpha)))
     if a <= 1:
         return
 
-    # Choose gradient based on mate state
     grad_start = ARROW_MATE_START if is_mate else ARROW_GRAD_START
     grad_end = ARROW_MATE_END if is_mate else ARROW_GRAD_END
-    xs = (start.x, end.x, point1.x, point2.x, point3.x)
-    ys = (start.y, end.y, point1.y, point2.y, point3.y)
-    pad = width + 6
+
+    # Shaft and head as ONE silhouette. The previous version stopped the
+    # shaft 80% into a separately-drawn triangle; integer truncation of the
+    # two shapes could leave a hairline seam where they met. A single
+    # polygon cannot have a gap between "body" and "head".
+    silhouette = [
+        start + perp_unit * shaft_half,
+        head_base + perp_unit * shaft_half,
+        head_base + perp_unit * (head_width / 2),
+        end,
+        head_base - perp_unit * (head_width / 2),
+        head_base - perp_unit * shaft_half,
+        start - perp_unit * shaft_half,
+    ]
+    xs = [p.x for p in silhouette] + [start.x, end.x]
+    ys = [p.y for p in silhouette] + [start.y, end.y]
+    pad = int(width) + 6
     min_x = int(min(xs)) - pad
     min_y = int(min(ys)) - pad
     max_x = int(max(xs)) + pad
@@ -1552,32 +1653,40 @@ def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_mate=Fa
     w = max(1, max_x - min_x)
     h = max(1, max_y - min_y)
 
+    # Draw everything fully opaque onto a scratch surface, then apply the
+    # requested alpha once at the end. Overlapping shapes therefore merge
+    # with no double-alpha seam at the head/shaft junction.
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
     offset = pygame.Vector2(min_x, min_y)
+    pts = [(int(p.x - offset.x), int(p.y - offset.y)) for p in silhouette]
+    pygame.draw.polygon(surf, (*grad_end, 255), pts)
+    try:
+        pygame.gfxdraw.filled_polygon(surf, pts, (*grad_end, 255))
+        pygame.gfxdraw.aapolygon(surf, pts, (*grad_end, 255))
+    except Exception:
+        pass
 
-    # Draw gradient shaft as many small segments — anti-aliased via smooth line
+    # Gradient along the shaft, running into the head up to `joint`.
+    joint_frac = max(0.0, min(1.0, (joint - start).length() / length))
     segs = 24 if is_mate else 20
+    line_w = max(1, int(width))
     for i in range(segs):
         t0 = i / segs
         t1 = (i + 1) / segs
-        c = _lerp_color(grad_start, grad_end, t0)
-        rgba = (c[0], c[1], c[2], a)
-        p0 = start + (neck - start) * t0
-        p1 = start + (neck - start) * t1
-        pygame.draw.aaline(surf, rgba, p0 - offset, p1 - offset) if hasattr(pygame.draw, 'aaline') else None
-        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, max(1,int(width)))
+        c = _lerp_color(grad_start, grad_end, t0 * joint_frac)
+        rgba = (*c, 255)
+        p0 = start + (joint - start) * t0
+        p1 = start + (joint - start) * t1
+        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, line_w)
+        pygame.draw.circle(surf, rgba, (int(p0.x - offset.x), int(p0.y - offset.y)), max(1, int(shaft_half)))
 
-    # Arrow head in solid end colour with subtle anti-aliased edge
-    head_c = grad_end
-    head_rgba = (head_c[0], head_c[1], head_c[2], a)
-    pygame.draw.polygon(
-        surf, head_rgba, [point1 - offset, point2 - offset, point3 - offset]
-    )
-    # AA outline for head (smooth)
-    try:
-        pygame.gfxdraw.aapolygon(surf, [point1 - offset, point2 - offset, point3 - offset], head_rgba)
-    except Exception:
-        pass
+    # Weld discs: rounded tail and a solid joint where shaft meets head.
+    pygame.draw.circle(surf, (*grad_start, 255), (int(start.x - offset.x), int(start.y - offset.y)), max(1, int(shaft_half)))
+    pygame.draw.circle(surf, (*grad_end, 255), (int(head_base.x - offset.x), int(head_base.y - offset.y)), max(1, int(shaft_half)))
+    pygame.draw.circle(surf, (*grad_end, 255), (int(joint.x - offset.x), int(joint.y - offset.y)), max(1, int(shaft_half)))
+
+    if a < 255:
+        surf.fill((255, 255, 255, a), special_flags=pygame.BLEND_RGBA_MULT)
     screen.blit(surf, (min_x, min_y))
 
 
@@ -1615,7 +1724,11 @@ def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_
     v_unit = v / length
     head_length = width * 3
     head_width = width * 2.5
-    neck = end - v_unit * (head_length * 0.8)
+    shaft_half = width / 2.0
+    head_base = end - v_unit * head_length
+    # As in draw_arrow: run the shaft into the head and weld it there,
+    # rather than butting two separately-rounded shapes together.
+    joint = end - v_unit * (head_length * 0.45)
     perp = pygame.Vector2(-v_unit.y, v_unit.x) * (head_width / 2)
     point1 = end
     point2 = end - v_unit * head_length + perp
@@ -1628,7 +1741,7 @@ def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_
     grad_end = ARROW_MATE_END if is_mate else ARROW_GRAD_END
     xs = (start.x, corner.x, end.x, point1.x, point2.x, point3.x)
     ys = (start.y, corner.y, end.y, point1.y, point2.y, point3.y)
-    pad = width + 6
+    pad = int(width) + 6
     min_x = int(min(xs)) - pad
     min_y = int(min(ys)) - pad
     max_x = int(max(xs)) + pad
@@ -1636,36 +1749,47 @@ def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_
     w = max(1, max_x - min_x)
     h = max(1, max_y - min_y)
 
+    # Opaque scratch surface + single alpha multiply at the end (see
+    # draw_arrow) so the corner and the head junction have no seam.
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
     offset = pygame.Vector2(min_x, min_y)
 
+    head_pts = [(int(p.x - offset.x), int(p.y - offset.y)) for p in (point1, point2, point3)]
+    pygame.draw.polygon(surf, (*grad_end, 255), head_pts)
+    try:
+        pygame.gfxdraw.filled_polygon(surf, head_pts, (*grad_end, 255))
+        pygame.gfxdraw.aapolygon(surf, head_pts, (*grad_end, 255))
+    except Exception:
+        pass
+
     len1 = (corner - start).length()
-    len2 = (neck - corner).length()
+    len2 = (joint - corner).length()
     total = max(1, len1 + len2)
-    segs = 24
+    line_w = max(1, int(width))
+    segs = 28
     for i in range(segs):
         t0 = i / segs
         t1 = (i + 1) / segs
-        def point_at(t):
-            if t * total <= len1:
-                seg_t = (t * total) / max(1, len1)
+        def point_at(t, _len1=len1, _len2=len2, _total=total):
+            if t * _total <= _len1:
+                seg_t = (t * _total) / max(1, _len1)
                 return start + (corner - start) * seg_t
-            else:
-                seg_t = (t * total - len1) / max(1, len2)
-                return corner + (neck - corner) * seg_t
+            seg_t = (t * _total - _len1) / max(1, _len2)
+            return corner + (joint - corner) * seg_t
         p0 = point_at(t0)
         p1 = point_at(t1)
         c = _lerp_color(grad_start, grad_end, t0)
-        rgba = (c[0], c[1], c[2], a)
-        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, max(1,int(width)))
+        rgba = (*c, 255)
+        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, line_w)
+        pygame.draw.circle(surf, rgba, (int(p0.x - offset.x), int(p0.y - offset.y)), max(1, int(shaft_half)))
 
-    head_c = grad_end
-    head_rgba = (head_c[0], head_c[1], head_c[2], a)
-    pygame.draw.polygon(surf, head_rgba, [point1 - offset, point2 - offset, point3 - offset])
-    try:
-        pygame.gfxdraw.aapolygon(surf, [point1 - offset, point2 - offset, point3 - offset], head_rgba)
-    except Exception:
-        pass
+    # Weld discs at the tail, the L-bend, and the head junction.
+    corner_c = _lerp_color(grad_start, grad_end, len1 / total)
+    for pos, col in ((start, grad_start), (corner, corner_c), (head_base, grad_end), (joint, grad_end)):
+        pygame.draw.circle(surf, (*col, 255), (int(pos.x - offset.x), int(pos.y - offset.y)), max(1, int(shaft_half)))
+
+    if a < 255:
+        surf.fill((255, 255, 255, a), special_flags=pygame.BLEND_RGBA_MULT)
     screen.blit(surf, (min_x, min_y))
 
 
@@ -1870,29 +1994,50 @@ def draw_settings_button(screen, mouse_pos):
     )
 
 
+def navigate_to(page, forward=True):
+    """Start a page transition. Both pages are drawn sliding together
+    (see draw_settings_menu) instead of one sliding fully out before the
+    next slides in."""
+    global menu_transition_progress, menu_transition_direction
+    global settings_menu_target, settings_menu_from
+    if menu_transition_direction != "none" or page == settings_menu_state:
+        return
+    settings_menu_from = settings_menu_state
+    settings_menu_target = page
+    menu_transition_progress = 0.0
+    menu_transition_direction = "forward" if forward else "back"
+
+
+def navigate_back():
+    parent = SETTINGS_PAGE_PARENT.get(settings_menu_state)
+    if parent:
+        navigate_to(parent, forward=False)
+
+
+def settings_breadcrumb(page):
+    """['Settings', 'Board', 'Board Themes'] style path for a page."""
+    path = []
+    cur = page
+    while cur:
+        path.append(SETTINGS_PAGE_TITLES.get(cur, cur))
+        cur = SETTINGS_PAGE_PARENT.get(cur)
+    return list(reversed(path))
+
+
 def update_menu_transition():
     global menu_transition_progress, menu_transition_direction, settings_menu_state
-    global settings_menu_target
+    global settings_menu_target, settings_menu_from
 
     if menu_transition_direction != "none":
         menu_transition_progress += menu_transition_speed
-
         if menu_transition_progress >= 1.0:
+            settings_menu_state = settings_menu_target
+            settings_menu_from = settings_menu_state
             menu_transition_progress = 0.0
-
-            if menu_transition_direction == "left_out":
-                settings_menu_state = settings_menu_target
-                menu_transition_direction = "right_in"
-            elif menu_transition_direction == "right_out":
-                settings_menu_state = "main"
-                menu_transition_direction = "left_in"
-            elif menu_transition_direction == "right_in":
-                menu_transition_direction = "none"
-            elif menu_transition_direction == "left_in":
-                menu_transition_direction = "none"
+            menu_transition_direction = "none"
 
 
-def draw_board_theme_content(screen, offset_x=0, offset_y=0):
+def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
     global current_theme, theme_scroll_offset
 
     mx, my = pygame.mouse.get_pos()
@@ -2031,6 +2176,116 @@ def scroll_theme_list(delta):
     viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
     max_scroll = max(0, total_h - viewport_h)
     theme_scroll_offset = max(0.0, min(theme_scroll_offset + delta, max_scroll))
+
+
+# --- Board hub (Pieces Styles / Board Themes) ---
+def get_board_hub_rects(offset_x=0, offset_y=0):
+    w, h = 420, 104
+    x = WIDTH // 2 - w // 2 + offset_x
+    return {
+        "pieces_style": pygame.Rect(x, 190 + offset_y, w, h),
+        "board_themes": pygame.Rect(x, 318 + offset_y, w, h),
+    }
+
+
+def _draw_board_hub_card(screen, rect, title, subtitle, hovered):
+    bg = (82, 82, 125) if hovered else (58, 58, 68)
+    pygame.draw.rect(screen, bg, rect, border_radius=12)
+    pygame.draw.rect(screen, (150, 170, 255) if hovered else MENU_BORDER_COLOR, rect, 2, border_radius=12)
+    title_s = font_large.render(title, True, TEXT_COLOR)
+    screen.blit(title_s, (rect.x + 150, rect.y + 18))
+    sub_s = font_tiny.render(subtitle, True, TEXT_ACCENT if hovered else TEXT_MUTED)
+    screen.blit(sub_s, (rect.x + 150, rect.y + 54))
+    hint_s = font_tiny.render("Open", True, TEXT_MUTED)
+    screen.blit(hint_s, (rect.x + 150, rect.y + 76))
+    chev = font_large.render("›", True, (200, 210, 255) if hovered else TEXT_MUTED)
+    screen.blit(chev, chev.get_rect(center=(rect.right - 26, rect.centery)))
+
+
+def draw_board_hub_content(screen, offset_x=0, offset_y=0):
+    mx, my = pygame.mouse.get_pos()
+    idle = menu_transition_direction == "none"
+    intro = font_small.render("Choose what to customise", True, TEXT_MUTED)
+    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 142 + offset_y))
+
+    rects = get_board_hub_rects(offset_x, offset_y)
+    piece_name = next((d for tid, d in get_available_themes() if tid == current_theme), current_theme)
+    pieces_rect = rects["pieces_style"]
+    _draw_board_hub_card(screen, pieces_rect, "Pieces Styles", f"Currently: {piece_name}", idle and pieces_rect.collidepoint(mx, my))
+    prev = get_preview_images(current_theme)
+    for i, pkey in enumerate(("wk", "wq", "bk", "bq")):
+        if pkey in prev:
+            screen.blit(prev[pkey], (pieces_rect.x + 14 + i * 32, pieces_rect.centery - 14))
+
+    themes_rect = rects["board_themes"]
+    board_name = BOARD_THEMES[current_board_theme]["display"]
+    _draw_board_hub_card(screen, themes_rect, "Board Themes", f"Currently: {board_name}", idle and themes_rect.collidepoint(mx, my))
+    sq = 27
+    for r in range(2):
+        for f in range(4):
+            col = LIGHT_SQ if (r + f) % 2 == 0 else DARK_SQ
+            pygame.draw.rect(screen, col, (themes_rect.x + 14 + f * sq, themes_rect.centery - sq + r * sq, sq, sq), border_radius=2)
+
+
+# --- Board Themes page ---
+_BOARD_THEME_BLURBS = {
+    "classic": "warm wood tones",
+    "chesscom": "Chess.com green",
+}
+
+
+def get_board_theme_card_rects(offset_x=0, offset_y=0):
+    w, h = 420, 150
+    x = WIDTH // 2 - w // 2 + offset_x
+    return [
+        (tid, pygame.Rect(x, 154 + i * (h + 28) + offset_y, w, h))
+        for i, tid in enumerate(BOARD_THEME_ORDER)
+    ]
+
+
+def draw_board_themes_content(screen, offset_x=0, offset_y=0):
+    mx, my = pygame.mouse.get_pos()
+    idle = menu_transition_direction == "none"
+    intro = font_small.render("Light and dark square colours", True, TEXT_MUTED)
+    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 112 + offset_y))
+
+    prev = get_preview_images(current_theme)
+    for tid, rect in get_board_theme_card_rects(offset_x, offset_y):
+        theme = BOARD_THEMES[tid]
+        is_current = tid == current_board_theme
+        hovered = idle and rect.collidepoint(mx, my)
+        bg = (86, 86, 130) if is_current else (72, 72, 82) if hovered else (56, 56, 66)
+        pygame.draw.rect(screen, bg, rect, border_radius=12)
+        pygame.draw.rect(screen, (130, 220, 150) if is_current else (150, 170, 255) if hovered else MENU_BORDER_COLOR, rect, 2, border_radius=12)
+
+        # 4x4 mini-board preview in this theme's colours
+        sq = 26
+        bx, by = rect.x + 18, rect.y + 23
+        for r in range(4):
+            for f in range(4):
+                col = theme["light"] if (r + f) % 2 == 0 else theme["dark"]
+                pygame.draw.rect(screen, col, (bx + f * sq, by + r * sq, sq, sq))
+        pygame.draw.rect(screen, BOARD_BORDER_COLOR, (bx - 1, by - 1, sq * 4 + 2, sq * 4 + 2), 1)
+        if "wk" in prev:
+            screen.blit(prev["wk"], (bx, by + sq * 3))
+        if "bq" in prev:
+            screen.blit(prev["bq"], (bx + sq * 3, by))
+
+        name_s = font_large.render(theme["display"], True, TEXT_COLOR)
+        screen.blit(name_s, (rect.x + 142, rect.y + 20))
+        blurb_s = font_tiny.render(_BOARD_THEME_BLURBS.get(tid, ""), True, TEXT_MUTED)
+        screen.blit(blurb_s, (rect.x + 142, rect.y + 54))
+        light_hex = "#%02x%02x%02x" % theme["light"]
+        dark_hex = "#%02x%02x%02x" % theme["dark"]
+        hex_s = font_tiny.render(f"Light {light_hex}   Dark {dark_hex}", True, TEXT_MUTED)
+        screen.blit(hex_s, (rect.x + 142, rect.y + 78))
+        # colour chips
+        pygame.draw.rect(screen, theme["light"], (rect.x + 142, rect.y + 104, 18, 18), border_radius=3)
+        pygame.draw.rect(screen, theme["dark"], (rect.x + 166, rect.y + 104, 18, 18), border_radius=3)
+
+        if is_current:
+            sel = font_small.render("● Selected", True, (140, 230, 160))
+            screen.blit(sel, (rect.right - sel.get_width() - 16, rect.y + 20))
 
 
 # --- Engine Settings Page (Sliders) ---
@@ -2313,8 +2568,13 @@ def draw_flip_button(screen, mouse_pos):
         tip_bg = pygame.Surface((tip.get_width()+10, tip.get_height()+6), pygame.SRCALPHA)
         tip_bg.fill((30,30,30,220))
         pygame.draw.rect(tip_bg, MENU_BORDER_COLOR, tip_bg.get_rect(),1, border_radius=4)
-        screen.blit(tip_bg, (flip_button_rect.x -2, flip_button_rect.y - 22))
-        screen.blit(tip, (flip_button_rect.x +5 -2, flip_button_rect.y - 19))
+        # The button sits in the top bar (y=7), so a tooltip above it is
+        # clipped by the window edge. Draw it BELOW the button instead,
+        # clamped so it can never leave the window.
+        tip_x = max(4, min(flip_button_rect.centerx - tip_bg.get_width() // 2, WIDTH - tip_bg.get_width() - 4))
+        tip_y = min(flip_button_rect.bottom + 6, HEIGHT - tip_bg.get_height() - 4)
+        screen.blit(tip_bg, (tip_x, tip_y))
+        screen.blit(tip, (tip_x + 5, tip_y + 3))
 
 def get_flip_button_rect():
     return flip_button_rect
@@ -2334,131 +2594,167 @@ def draw_settings_menu(screen):
 
     # --- Unified eased open/close: single backdrop + slide for all content ---
     eased = cubic_ease_in_out(max(0.0, min(1.0, menu_anim_progress)))
-    # Backdrop — single source of truth (removed duplicate from draw_settings_button)
     backdrop_alpha = int(eased * 180)
     overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, backdrop_alpha))
     screen.blit(overlay, (0, 0))
-    # Content entrance: slide up + subtle scale via eased offset
-    open_slide = int((1 - eased) * 22)  # 22px slide fully resolves at eased=1
+    # Content entrance: slide up and settle as the menu opens.
+    open_slide = int((1 - eased) * 22)
 
-    offset_x = 0
-    if menu_transition_direction == "left_out":
-        offset_x = -int(400 * cubic_ease_in_out(menu_transition_progress))
-    elif menu_transition_direction == "right_out":
-        offset_x = int(400 * cubic_ease_in_out(menu_transition_progress))
-    elif menu_transition_direction == "right_in":
-        offset_x = int(400 * (1 - cubic_ease_in_out(menu_transition_progress)))
-    elif menu_transition_direction == "left_in":
-        offset_x = -int(400 * (1 - cubic_ease_in_out(menu_transition_progress)))
+    # --- Page switching ---
+    # The outgoing and incoming pages are drawn at the same time and slide
+    # together: going forward the new page pushes in from the right while
+    # the old one recedes slightly to the left (parallax) and dims; going
+    # back the current page slides away to reveal the previous one
+    # underneath. (The old version slid one page completely out, left the
+    # screen empty, then slid the next one in.)
+    out_off = in_off = 0
+    trans_e = 0.0
+    if menu_transition_direction == "none":
+        pages_to_draw = [(settings_menu_state, 0)]
+        effective_page = settings_menu_state
+    else:
+        trans_e = cubic_ease_in_out(max(0.0, min(1.0, menu_transition_progress)))
+        if menu_transition_direction == "forward":
+            out_off = -int(115 * trans_e)
+            in_off = int(390 * (1 - trans_e))
+            pages_to_draw = [(settings_menu_from, out_off), (settings_menu_target, in_off)]
+        else:  # back
+            out_off = int(390 * trans_e)
+            in_off = -int(115 * (1 - trans_e))
+            pages_to_draw = [(settings_menu_target, in_off), (settings_menu_from, out_off)]
+        effective_page = settings_menu_target if trans_e >= 0.5 else settings_menu_from
 
-    page_titles = {
-        "main": "Settings",
-        "board_theme": "Pieces Style",
-        "engine_settings": "Engine Settings",
-    }
-    title_text = font_large.render(
-        page_titles.get(settings_menu_state, "Settings"), True, TEXT_COLOR
-    )
-    title_rect = title_text.get_rect(center=(WIDTH // 2 + offset_x, 50 + open_slide))
-    screen.blit(title_text, title_rect)
+    def draw_page(page_state, offset_x):
+        if page_state == "main":
+            menu_items = SETTINGS_MAIN_ITEMS
+            item_height = 50
+            total_menu_height = len(menu_items) * item_height + (len(menu_items) - 1) * 20
+            start_y = (HEIGHT - total_menu_height) // 2
 
-    close_button_rect = pygame.Rect(WIDTH - 60, 20 + open_slide, 44, 32)
+            for i, item in enumerate(menu_items):
+                # Staggered entrance while the menu itself is opening.
+                item_delay = i * 0.06
+                item_eased = max(0.0, min(1.0, (eased - item_delay) / 0.82)) if eased > item_delay else 0.0
+                item_slide = int((1 - (cubic_ease_in_out(item_eased) if item_eased > 0 else 0)) * 14) if eased < 0.99 else 0
+                y_slide = open_slide + item_slide if eased < 1.0 else 0
+                item_rect = pygame.Rect(
+                    WIDTH // 2 - 200 + offset_x,
+                    start_y + i * (item_height + 20) + y_slide,
+                    400,
+                    item_height,
+                )
+
+                is_interactive = item in ("Board", "Engine Settings")
+                is_hovered = (
+                    is_interactive
+                    and transition_idle
+                    and item_rect.collidepoint(mx, my)
+                )
+                bg = (80, 80, 120) if is_hovered else (60, 60, 60)
+                pygame.draw.rect(screen, bg, item_rect, border_radius=10)
+                pygame.draw.rect(
+                    screen,
+                    (150, 170, 255) if is_hovered else MENU_BORDER_COLOR,
+                    item_rect, 1, border_radius=10,
+                )
+                text_color = TEXT_COLOR if is_interactive else (150, 150, 150)
+                item_text = font_large.render(item, True, text_color)
+                screen.blit(item_text, item_text.get_rect(center=item_rect.center))
+                if is_interactive:
+                    chev = font_large.render("›", True, (200, 210, 255) if is_hovered else TEXT_MUTED)
+                    screen.blit(chev, chev.get_rect(center=(item_rect.right - 24, item_rect.centery)))
+
+            about_y = start_y + len(menu_items) * (item_height + 20) + 40 + open_slide
+
+            about_title = font_large.render("About", True, TEXT_COLOR)
+            screen.blit(about_title, about_title.get_rect(center=(WIDTH // 2 + offset_x, about_y)))
+
+            version_text = font_small.render(
+                "ChessBotV Rewrite Version 1.5-beta2", True, TEXT_COLOR
+            )
+            screen.blit(version_text, version_text.get_rect(center=(WIDTH // 2 + offset_x, about_y + 40)))
+
+            github_rect = get_github_button_rect(offset_x, about_y)
+            github_hovered = transition_idle and github_rect.collidepoint(mx, my)
+            pygame.draw.rect(screen, (45, 85, 155) if github_hovered else (55, 75, 145), github_rect, border_radius=6)
+            pygame.draw.rect(screen, MENU_BORDER_COLOR, github_rect, 2, border_radius=6)
+            github_text = font_small.render("Github", True, TEXT_COLOR)
+            screen.blit(github_text, github_text.get_rect(center=github_rect.center))
+
+            restart_rect = get_restart_button_rect(offset_x, about_y)
+            restart_hovered = transition_idle and restart_rect.collidepoint(mx, my)
+            pygame.draw.rect(screen, (140, 50, 50) if restart_hovered else (100, 50, 50), restart_rect, border_radius=6)
+            pygame.draw.rect(screen, MENU_BORDER_COLOR, restart_rect, 2, border_radius=6)
+            restart_text = font_small.render("Restart", True, TEXT_COLOR)
+            screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
+
+        elif page_state == "board":
+            draw_board_hub_content(screen, offset_x, open_slide)
+        elif page_state == "pieces_style":
+            draw_pieces_style_content(screen, offset_x, open_slide)
+        elif page_state == "board_themes":
+            draw_board_themes_content(screen, offset_x, open_slide)
+        elif page_state == "engine_settings":
+            draw_engine_settings_content(screen, offset_x, open_slide)
+
+    for idx, (page_state, page_off) in enumerate(pages_to_draw):
+        # The page on top rides in on a "sheet" that occludes the page
+        # underneath (pages have different heights, so without it the old
+        # page would show through below the new one). The sheet fades in
+        # and back out over the transition, so nothing changes at rest.
+        if len(pages_to_draw) > 1 and idx == 1:
+            sheet_alpha = int(225 * math.sin(math.pi * max(0.0, min(1.0, trans_e))))
+            if sheet_alpha > 0:
+                sheet = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                sheet.fill((34, 34, 41, sheet_alpha))
+                screen.blit(sheet, (page_off, 0))
+                # soft shadow on the sheet's leading edge
+                shadow = pygame.Surface((22, HEIGHT), pygame.SRCALPHA)
+                for i in range(22):
+                    edge_a = int(sheet_alpha * 0.45 * (i / 22))
+                    if edge_a > 0:
+                        pygame.draw.line(shadow, (0, 0, 0, edge_a), (i, 0), (i, HEIGHT), 1)
+                screen.blit(shadow, (page_off - 22, 0))
+        draw_page(page_state, page_off)
+        # Dim the page underneath while the other one is on top of it.
+        if len(pages_to_draw) > 1 and idx == 0:
+            dim_alpha = int(100 * trans_e) if menu_transition_direction == "forward" else int(100 * (1 - trans_e))
+            if dim_alpha > 0:
+                dim = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                dim.fill((0, 0, 0, dim_alpha))
+                screen.blit(dim, (0, 0))
+
+    # --- Header: cross-fading title, breadcrumb, back/close ---
+    if menu_transition_direction == "none":
+        title_text = font_large.render(SETTINGS_PAGE_TITLES.get(settings_menu_state, "Settings"), True, TEXT_COLOR)
+        screen.blit(title_text, title_text.get_rect(center=(WIDTH // 2, 38 + open_slide)))
+    else:
+        out_title = font_large.render(SETTINGS_PAGE_TITLES.get(settings_menu_from, "Settings"), True, TEXT_COLOR)
+        out_title.set_alpha(max(0, int(255 * (1 - trans_e))))
+        screen.blit(out_title, out_title.get_rect(center=(WIDTH // 2 + out_off, 38 + open_slide)))
+        in_title = font_large.render(SETTINGS_PAGE_TITLES.get(settings_menu_target, "Settings"), True, TEXT_COLOR)
+        in_title.set_alpha(max(0, int(255 * trans_e)))
+        screen.blit(in_title, in_title.get_rect(center=(WIDTH // 2 + in_off, 38 + open_slide)))
+
+    crumbs = settings_breadcrumb(effective_page)
+    if len(crumbs) > 1:
+        crumb_text = font_tiny.render("  ›  ".join(crumbs), True, TEXT_MUTED)
+        screen.blit(crumb_text, crumb_text.get_rect(center=(WIDTH // 2, 62 + open_slide)))
+
+    # Thin accent line that fills as you go deeper into the menu.
+    line_w = 46 + 46 * (len(crumbs) - 1)
+    pygame.draw.line(screen, (110, 150, 255), (WIDTH // 2 - line_w // 2, 74 + open_slide), (WIDTH // 2 + line_w // 2, 74 + open_slide), 2)
+
+    close_button_rect = pygame.Rect(WIDTH - 60, 14 + open_slide, 44, 32)
     close_hovered = transition_idle and close_button_rect.collidepoint(mx, my)
     draw_polished_close_button(screen, close_button_rect, close_hovered)
 
-    if settings_menu_state != "main":
-        back_button_rect = pygame.Rect(20, 20 + open_slide, 44, 32)
+    show_back = effective_page != "main" or settings_menu_from != "main"
+    if show_back:
+        back_button_rect = pygame.Rect(20, 14 + open_slide, 44, 32)
         back_hovered = transition_idle and back_button_rect.collidepoint(mx, my)
         draw_polished_back_button(screen, back_button_rect, back_hovered)
-
-    if settings_menu_state == "main":
-        menu_items = [
-            "Engine Settings",
-            "Pieces Style",
-            "Sound Settings",
-            "Game Controls",
-            "Analysis Settings",
-        ]
-
-        item_height = 50
-        total_menu_height = len(menu_items) * item_height + (len(menu_items) - 1) * 20
-        start_y = (HEIGHT - total_menu_height) // 2
-
-        for i, item in enumerate(menu_items):
-            # Staggered entrance: each item slides in slightly after the previous
-            item_delay = i * 0.06
-            item_eased = max(0.0, min(1.0, (eased - item_delay) / 0.82)) if eased > item_delay else 0.0
-            item_slide = int((1 - (cubic_ease_in_out(item_eased) if item_eased > 0 else 0)) * 14) if eased < 0.99 else 0
-            # Combine global open_slide with per-item stagger for polished cascade
-            y_slide = open_slide + item_slide if eased < 1.0 else 0
-            item_rect = pygame.Rect(
-                WIDTH // 2 - 200 + offset_x,
-                start_y + i * (item_height + 20) + y_slide,
-                400,
-                item_height,
-            )
-
-            is_interactive = item in ("Pieces Style", "Engine Settings")
-            is_hovered = (
-                is_interactive
-                and transition_idle
-                and item_rect.collidepoint(mx, my)
-            )
-
-            if is_hovered:
-                bg = (80, 80, 120)
-            else:
-                bg = (60, 60, 60)
-
-            pygame.draw.rect(screen, bg, item_rect, border_radius=4)
-            pygame.draw.rect(
-                screen, MENU_BORDER_COLOR, item_rect, 1, border_radius=4
-            )
-
-            text_color = TEXT_COLOR if is_interactive else (150, 150, 150)
-            item_text = font_large.render(item, True, text_color)
-            item_text_rect = item_text.get_rect(center=item_rect.center)
-            screen.blit(item_text, item_text_rect)
-
-        about_y = start_y + len(menu_items) * (item_height + 20) + 40 + open_slide
-
-        about_title = font_large.render("About", True, TEXT_COLOR)
-        about_title_rect = about_title.get_rect(
-            center=(WIDTH // 2 + offset_x, about_y)
-        )
-        screen.blit(about_title, about_title_rect)
-
-        version_text = font_small.render(
-            "ChessBotV Rewrite Version 1.5-beta2", True, TEXT_COLOR
-        )
-        version_rect = version_text.get_rect(
-            center=(WIDTH // 2 + offset_x, about_y + 40)
-        )
-        screen.blit(version_text, version_rect)
-
-        # Github button
-        github_rect = get_github_button_rect(offset_x, about_y)
-        github_hovered = transition_idle and github_rect.collidepoint(mx, my)
-        pygame.draw.rect(screen, (45, 85, 155) if github_hovered else (55, 75, 145), github_rect, border_radius=6)
-        pygame.draw.rect(screen, MENU_BORDER_COLOR, github_rect, 2, border_radius=6)
-        github_text = font_small.render("Github", True, TEXT_COLOR)
-        screen.blit(github_text, github_text.get_rect(center=github_rect.center))
-
-        # Restart button
-        restart_rect = get_restart_button_rect(offset_x, about_y)
-        restart_hovered = transition_idle and restart_rect.collidepoint(mx, my)
-        pygame.draw.rect(screen, (140, 50, 50) if restart_hovered else (100, 50, 50), restart_rect, border_radius=6)
-        pygame.draw.rect(screen, MENU_BORDER_COLOR, restart_rect, 2, border_radius=6)
-        restart_text = font_small.render("Restart", True, TEXT_COLOR)
-        screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
-
-    elif settings_menu_state == "board_theme":
-        draw_board_theme_content(screen, offset_x, open_slide)
-
-    elif settings_menu_state == "engine_settings":
-        draw_engine_settings_content(screen, offset_x, open_slide)
-
 
 def handle_menu_click(mx, my):
     global menu_anim_closing, settings_menu_state, menu_transition_direction
@@ -2468,18 +2764,33 @@ def handle_menu_click(mx, my):
     if menu_anim_progress < 1.0 or menu_transition_direction != "none":
         return True
 
-    close_button_rect = pygame.Rect(WIDTH - 60, 20, 44, 32)
+    close_button_rect = pygame.Rect(WIDTH - 60, 14, 44, 32)
     if close_button_rect.collidepoint(mx, my):
         menu_anim_closing = True
         return True
 
     if settings_menu_state != "main":
-        back_button_rect = pygame.Rect(20, 20, 44, 32)
+        back_button_rect = pygame.Rect(20, 14, 44, 32)
         if back_button_rect.collidepoint(mx, my):
-            menu_transition_direction = "right_out"
+            navigate_back()
             return True
 
-    if settings_menu_state == "board_theme":
+    if settings_menu_state == "board":
+        for page, rect in get_board_hub_rects().items():
+            if rect.collidepoint(mx, my):
+                if page == "pieces_style":
+                    theme_scroll_offset = 0.0
+                navigate_to(page, forward=True)
+                return True
+
+    elif settings_menu_state == "board_themes":
+        for theme_id, rect in get_board_theme_card_rects():
+            if rect.collidepoint(mx, my):
+                if theme_id != current_board_theme:
+                    apply_board_theme(theme_id, persist=True)
+                return True
+
+    elif settings_menu_state == "pieces_style":
         themes = get_available_themes()
         item_height = THEME_ITEM_HEIGHT
         gap = THEME_ITEM_GAP
@@ -2522,13 +2833,7 @@ def handle_menu_click(mx, my):
             return True
 
     elif settings_menu_state == "main":
-        menu_items = [
-            "Engine Settings",
-            "Pieces Style",
-            "Sound Settings",
-            "Game Controls",
-            "Analysis Settings",
-        ]
+        menu_items = SETTINGS_MAIN_ITEMS
         item_height = 50
         total_menu_height = len(menu_items) * item_height + (len(menu_items) - 1) * 20
         start_y = (HEIGHT - total_menu_height) // 2
@@ -2541,13 +2846,10 @@ def handle_menu_click(mx, my):
                 item_height,
             )
             if item_rect.collidepoint(mx, my):
-                if item == "Pieces Style":
-                    theme_scroll_offset = 0.0
-                    settings_menu_target = "board_theme"
-                    menu_transition_direction = "left_out"
+                if item == "Board":
+                    navigate_to("board", forward=True)
                 elif item == "Engine Settings":
-                    settings_menu_target = "engine_settings"
-                    menu_transition_direction = "left_out"
+                    navigate_to("engine_settings", forward=True)
                 return True
 
         # About section buttons — compute same about_y as draw
@@ -2604,9 +2906,73 @@ def draw_confirm_dialog(screen):
     screen.blit(no_t, no_t.get_rect(center=no_rect.center))
     return yes_rect, no_rect
 
+
+def get_game_over_rects():
+    """Panel + button rects for the game-over dialog (drawn & clicked)."""
+    e = cubic_ease_in_out(max(0.0, min(1.0, game_over_anim)))
+    w, h = 384, 204
+    x = WIDTH // 2 - w // 2
+    y = HEIGHT // 2 - h // 2 - int((1 - e) * 18)
+    panel = pygame.Rect(x, y, w, h)
+    new_rect = pygame.Rect(x + 28, y + h - 62, 152, 42)
+    keep_rect = pygame.Rect(x + w - 180, y + h - 62, 152, 42)
+    return panel, new_rect, keep_rect
+
+
+def draw_game_over_dialog(screen, board):
+    """Win/draw dialog offering a fresh game (or keep viewing the board)."""
+    result = get_game_result(board)
+    if result is None:
+        return None, None
+    title, subtitle, score, colour = result
+    e = cubic_ease_in_out(max(0.0, min(1.0, game_over_anim)))
+    panel, new_rect, keep_rect = get_game_over_rects()
+
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, int(165 * e)))
+    screen.blit(overlay, (0, 0))
+
+    # soft shadow + panel
+    pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
+    pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
+    pygame.draw.rect(screen, colour, panel, 2, border_radius=14)
+    # accent strip across the top
+    pygame.draw.line(screen, colour, (panel.x + 18, panel.y + 3), (panel.right - 18, panel.y + 3), 3)
+
+    score_s = font_large.render(score, True, colour)
+    screen.blit(score_s, score_s.get_rect(center=(panel.centerx, panel.y + 32)))
+    title_s = font_large.render(title, True, TEXT_COLOR)
+    screen.blit(title_s, title_s.get_rect(center=(panel.centerx, panel.y + 66)))
+    ply = len(board.move_stack)
+    moves = (ply + 1) // 2
+    sub = f"{subtitle} · {moves} move{'s' if moves != 1 else ''}"
+    opening = update_opening_name(board)
+    if opening and opening != "Unknown Opening":
+        sub += f" · {opening}"
+    sub_s = font_small.render(sub, True, TEXT_MUTED)
+    # keep the line inside the panel even for long opening names
+    if sub_s.get_width() > panel.width - 24:
+        sub_s = font_tiny.render(sub, True, TEXT_MUTED)
+    screen.blit(sub_s, sub_s.get_rect(center=(panel.centerx, panel.y + 96)))
+    ask_s = font_tiny.render("Start a new game?", True, TEXT_MUTED)
+    screen.blit(ask_s, ask_s.get_rect(center=(panel.centerx, panel.y + 118)))
+
+    mx, my = pygame.mouse.get_pos()
+    new_hover = new_rect.collidepoint(mx, my)
+    keep_hover = keep_rect.collidepoint(mx, my)
+    pygame.draw.rect(screen, (74, 158, 96) if new_hover else (56, 130, 78), new_rect, border_radius=9)
+    pygame.draw.rect(screen, (120, 220, 150) if new_hover else MENU_BORDER_COLOR, new_rect, 2, border_radius=9)
+    pygame.draw.rect(screen, (98, 98, 110) if keep_hover else (72, 72, 84), keep_rect, border_radius=9)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, keep_rect, 2, border_radius=9)
+    new_t = font_small.render("New Game", True, TEXT_COLOR)
+    keep_t = font_small.render("Keep viewing", True, TEXT_COLOR)
+    screen.blit(new_t, new_t.get_rect(center=new_rect.center))
+    screen.blit(keep_t, keep_t.get_rect(center=keep_rect.center))
+    return new_rect, keep_rect
+
 def draw_gui(
     screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos,
-    drag_sq=None, drag_offset=None, dragging=False
+    drag_sq=None, drag_offset=None, dragging=False, view_ply=None, total_ply=None
 ):
     screen.fill(BG_COLOR)
 
@@ -2621,6 +2987,15 @@ def draw_gui(
         (WIDTH - PADDING, TOP_BAR_HEIGHT - 1),
         1,
     )
+
+    # Move counter / history position (← / → step through the game)
+    if total_ply:
+        _view = len(board.move_stack) if view_ply is None else view_ply
+        if _view < total_ply:
+            hist_s = font_tiny.render(f"◀  Move {_view}/{total_ply} — viewing history  ▶", True, (255, 205, 110))
+        else:
+            hist_s = font_tiny.render(f"Move {_view}", True, TEXT_MUTED)
+        screen.blit(hist_s, (PADDING, (TOP_BAR_HEIGHT - hist_s.get_height()) // 2))
 
     # 1. Evaluation bar — dynamic position with winning highlight and smooth slide
     eval_bar_x = int(eval_bar_x_current)
@@ -3101,6 +3476,10 @@ def draw_gui(
     if menu_anim_progress > 0.01:
         draw_settings_menu(screen)
 
+    # Win/draw dialog sits above everything else.
+    if show_game_over:
+        draw_game_over_dialog(screen, board)
+
     pygame.display.flip()
 
 
@@ -3109,6 +3488,7 @@ def main():
     global menu_transition_direction, engine_thread, promotion_pending, restart_requested, engine_slider_dragging
     global show_newgame_confirm, confirm_anim, board_flipped, board_ox_current, eval_bar_x_current, board_ox_target, eval_bar_x_target, board_anim_t, eval_bar_side
     global engine_draft, engine_slider_display, engine_has_changes
+    global show_game_over, game_over_anim, game_over_seen_key
 
     clock = pygame.time.Clock()
     board = chess.Board()
@@ -3121,14 +3501,59 @@ def main():
     drag_sq = None
     drag_offset = None
     running = True
+    # Moves stepped back over with ←; → replays them (and only them).
+    history_redo = []
 
-    def do_new_game():
+    def reset_game():
+        """Start a fresh game (used by New, the confirm dialog, and the
+        game-over dialog)."""
+        global promotion_pending, show_game_over, game_over_seen_key
+        nonlocal selected_sq, dragging, drag_sq, drag_offset
         old_board = board.copy()
-        new_board = chess.Board()
-        anim_mgr.add_board_reset(old_board, new_board)
+        anim_mgr.add_board_reset(old_board, chess.Board())
         board.reset()
         reset_opening()
-        return False, None, None, None  # will reset selected/drag in caller
+        history_redo.clear()
+        selected_sq = None
+        dragging = False
+        drag_sq = None
+        drag_offset = None
+        anim_mgr.capture_anims = []
+        anim_mgr.current_eval = 0.0
+        anim_mgr.target_eval = 0.0
+        anim_mgr.arrow_target_alpha = 0.0
+        anim_mgr.set_multipv_arrows({})
+        check_effect.reset()
+        engine_thread.update_position(board)
+        promotion_pending = None
+        show_game_over = False
+        game_over_seen_key = None
+
+    def note_new_move():
+        """A move was just played from the displayed position. If it is
+        exactly the next move in the recorded line, keep the rest of that
+        line for →; otherwise the game has branched, so drop it."""
+        if history_redo and board.move_stack and history_redo[-1] == board.move_stack[-1]:
+            history_redo.pop()
+        else:
+            history_redo.clear()
+
+    def sync_after_history_step():
+        """Common cleanup after ← / → changes the displayed position."""
+        global promotion_pending
+        nonlocal selected_sq, dragging, drag_sq, drag_offset
+        selected_sq = None
+        dragging = False
+        drag_sq = None
+        drag_offset = None
+        promotion_pending = None
+        anim_mgr.move_anim = None
+        anim_mgr.rook_anim = None
+        anim_mgr.capture_anims = []
+        anim_mgr.arrow_target_alpha = 0.0
+        anim_mgr.set_multipv_arrows({})
+        check_effect.reset()
+        engine_thread.update_position(board)
 
     while running:
         anim_mgr.update()
@@ -3142,6 +3567,20 @@ def main():
             board.king(board.turn) if (is_check or is_mate) else None
         )
         check_effect.update(is_check, is_mate, king_sq)
+
+        # Game-over dialog: show once per finished position (win or draw).
+        # Stepping back with ← hides it; "Keep viewing" dismisses it for
+        # this position only.
+        _result = get_game_result(board)
+        if _result is not None:
+            _term_key = (board.fen(), len(board.move_stack))
+            if not show_game_over and _term_key != game_over_seen_key:
+                show_game_over = True
+                game_over_anim = 0.0
+                game_over_seen_key = _term_key
+        else:
+            show_game_over = False
+            game_over_seen_key = None
 
         update_menu_animation()
         if restart_requested:
@@ -3167,23 +3606,7 @@ def main():
                     yes_rect = pygame.Rect(x+30, y+95, 140, 40)
                     no_rect = pygame.Rect(x+w-170, y+95, 140, 40)
                     if yes_rect.collidepoint(mx, my):
-                        # confirmed — reset board
-                        old_board = board.copy()
-                        new_board = chess.Board()
-                        anim_mgr.add_board_reset(old_board, new_board)
-                        board.reset()
-                        reset_opening()
-                        selected_sq = None
-                        dragging = False
-                        drag_sq = None
-                        drag_offset = None
-                        anim_mgr.capture_anims = []
-                        anim_mgr.current_eval = 0.0
-                        anim_mgr.target_eval = 0.0
-                        anim_mgr.arrow_target_alpha = 0.0
-                        check_effect.reset()
-                        engine_thread.update_position(board)
-                        promotion_pending = None
+                        reset_game()
                         show_newgame_confirm = False
                     elif no_rect.collidepoint(mx, my):
                         show_newgame_confirm = False
@@ -3191,6 +3614,18 @@ def main():
                         # click outside — dismiss
                         # keep dialog open? we close on outside click for convenience
                         show_newgame_confirm = False
+                    continue
+
+                # Game-over dialog (win / draw) — modal, above the board
+                if show_game_over:
+                    _panel, _new_rect, _keep_rect = get_game_over_rects()
+                    if _new_rect.collidepoint(mx, my):
+                        reset_game()
+                    elif _keep_rect.collidepoint(mx, my):
+                        # game_over_seen_key already holds this position,
+                        # so the dialog stays dismissed until the position
+                        # stops being terminal (e.g. stepping back).
+                        show_game_over = False
                     continue
 
                 menu_active = (
@@ -3206,7 +3641,8 @@ def main():
                         for idx, rect in enumerate(rects):
                             if rect.collidepoint(mx, my):
                                 promo_piece = PROMOTION_CHOICES[idx]
-                                try_execute_promotion(board, anim_mgr, engine_thread, promotion_pending["from_sq"], promotion_pending["to_sq"], promo_piece, animate=True)
+                                if try_execute_promotion(board, anim_mgr, engine_thread, promotion_pending["from_sq"], promotion_pending["to_sq"], promo_piece, animate=True):
+                                    note_new_move()
                                 selected_sq = None
                                 dragging = False
                                 drag_sq = None
@@ -3233,26 +3669,11 @@ def main():
                         continue
 
                     if new_game_button_rect.collidepoint(mx, my):
-                        if len(board.move_stack) > 0:
+                        if len(board.move_stack) + len(history_redo) > 0:
                             show_newgame_confirm = True
                             confirm_anim = 0.0
                         else:
-                            old_board = board.copy()
-                            new_board = chess.Board()
-                            anim_mgr.add_board_reset(old_board, new_board)
-                            board.reset()
-                            reset_opening()
-                            selected_sq = None
-                            dragging = False
-                            drag_sq = None
-                            drag_offset = None
-                            anim_mgr.capture_anims = []
-                            anim_mgr.current_eval = 0.0
-                            anim_mgr.target_eval = 0.0
-                            anim_mgr.arrow_target_alpha = 0.0
-                            check_effect.reset()
-                            engine_thread.update_position(board)
-                            promotion_pending = None
+                            reset_game()
                         continue
 
                     elif settings_button_rect.collidepoint(mx, my):
@@ -3280,6 +3701,7 @@ def main():
                                                 drag_offset = None
                                                 continue
                                         if try_execute_move(board, anim_mgr, engine_thread, selected_sq, sq, animate=True):
+                                            note_new_move()
                                             selected_sq = None
                                         else:
                                             if piece and piece.color == board.turn:
@@ -3313,6 +3735,7 @@ def main():
                                 drag_offset = None
                                 continue
                         if try_execute_move(board, anim_mgr, engine_thread, drag_sq, drop_sq, animate=False):
+                            note_new_move()
                             selected_sq = None
                         else:
                             piece = board.piece_at(drop_sq)
@@ -3338,15 +3761,20 @@ def main():
             elif event.type == pygame.MOUSEWHEEL:
                 if (
                     settings_menu_open
-                    and settings_menu_state == "board_theme"
+                    and settings_menu_state == "pieces_style"
                     and menu_transition_direction == "none"
                 ):
-                    scroll_theme_list(event.y * theme_scroll_speed)
+                    # pygame reports wheel-up as +y; negating makes scrolling
+                    # down move the list down (and up move it up).
+                    scroll_theme_list(-event.y * theme_scroll_speed)
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     if show_newgame_confirm:
                         show_newgame_confirm=False
+                        continue
+                    if show_game_over:
+                        show_game_over=False
                         continue
                     if promotion_pending is not None:
                         promotion_pending = None
@@ -3357,11 +3785,22 @@ def main():
                         if menu_transition_direction != "none":
                             pass
                         elif settings_menu_state != "main":
-                            menu_transition_direction = "right_out"
+                            navigate_back()
                         else:
                             menu_anim_closing = True
                     else:
                         selected_sq = None
+                elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and promotion_pending is None and not dragging and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
+                    if event.key == pygame.K_LEFT:
+                        # Previous move (kept in history_redo for →)
+                        if board.move_stack:
+                            history_redo.append(board.pop())
+                            sync_after_history_step()
+                    else:
+                        # Next move — only if it has actually been played
+                        if history_redo:
+                            board.push(history_redo.pop())
+                            sync_after_history_step()
                 elif event.key == pygame.K_f and menu_anim_progress == 0 and not show_newgame_confirm:
                     toggle_flip_board()
                 elif event.key == pygame.K_e and menu_anim_progress == 0 and not show_newgame_confirm:
@@ -3444,6 +3883,7 @@ def main():
                                 rook_piece,
                             )
                             board.push(best_move)
+                            note_new_move()
                             engine_thread.update_position(board)
 
         draw_gui(
@@ -3457,6 +3897,8 @@ def main():
             drag_sq=drag_sq,
             drag_offset=drag_offset,
             dragging=dragging,
+            view_ply=len(board.move_stack),
+            total_ply=len(board.move_stack) + len(history_redo),
         )
         clock.tick(FPS)
 
