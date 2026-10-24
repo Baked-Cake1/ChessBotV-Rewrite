@@ -78,22 +78,101 @@ font_tiny = pygame.font.SysFont("segoeui", 15)
 
 
 # --- Ctypes: Always on Top ---
-def set_always_on_top():
+def set_always_on_top(enabled=True):
+    """Pin (or unpin) the window above other windows (Windows HWND_TOPMOST)."""
     try:
         hwnd = pygame.display.get_wm_info()["window"]
-        ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 3)
+        insert_after = -1 if enabled else -2  # HWND_TOPMOST / HWND_NOTOPMOST
+        ctypes.windll.user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, 3)
+        return True
+    except Exception:
+        return False
+
+
+# --- Safe engine resource limits ---
+def _total_physical_mem_mb():
+    """Total physical RAM in MB, or None if it cannot be determined."""
+    try:
+        if os.name == "nt":
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullTotalPhys // (1024 * 1024))
     except Exception:
         pass
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1024 * 1024))
+    except Exception:
+        return None
 
 
-set_always_on_top()
+def _safe_hash_mb(total_mb):
+    """Largest power-of-two hash (MB) that stays within a safe share of RAM:
+    at most half of physical memory, always leaving the OS/apps headroom,
+    so a big hash cannot page the machine into a slowdown or OOM crash."""
+    if not total_mb:
+        return 2048
+    if total_mb > 2048:
+        budget = min(total_mb // 2, max(1024, total_mb - 2048))
+    else:
+        budget = max(256, total_mb // 2)
+    step = 16
+    while step * 2 <= budget:
+        step *= 2
+    return step
+
+
+TOTAL_RAM_MB = _total_physical_mem_mb()
+SAFE_HASH_MB = _safe_hash_mb(TOTAL_RAM_MB)
+MAX_THREADS = max(1, os.cpu_count() or 1)
 
 
 # --- Constants ---
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic"}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both"}
+_STRING_CONFIG_KEYS = ("theme", "board_theme", "auto_move_color")
+
+
+def _snap_hash_down(value):
+    step = 16
+    while step * 2 <= value:
+        step *= 2
+    return step
+
+
+def _clamp_config_limits(cfg):
+    """Never let a saved config exceed this machine's safe limits."""
+    try:
+        cfg["threads"] = max(1, min(int(cfg.get("threads", 4)), MAX_THREADS))
+    except Exception:
+        cfg["threads"] = min(4, MAX_THREADS)
+    try:
+        h = int(cfg.get("hash", 2048))
+    except Exception:
+        h = 2048
+    if h > SAFE_HASH_MB:
+        h = _snap_hash_down(SAFE_HASH_MB)
+    cfg["hash"] = max(16, h)
+    color = str(cfg.get("auto_move_color", "both")).strip().lower()
+    cfg["auto_move_color"] = color if color in ("white", "black", "both") else "both"
+    cfg["always_on_top"] = 1 if cfg.get("always_on_top", 1) else 0
+    cfg["auto_move"] = 1 if cfg.get("auto_move", 0) else 0
+    return cfg
 
 
 def load_config():
@@ -111,12 +190,12 @@ def load_config():
                         k, v = line.split("=", 1)
                         k=k.strip().lower()
                         v=v.strip()
-                        if k in cfg and k not in ("theme", "board_theme"):
+                        if k in cfg and k not in _STRING_CONFIG_KEYS:
                             try:
                                 cfg[k] = int(v)
                             except ValueError:
                                 pass
-                        elif k in ("theme", "board_theme"):
+                        elif k in _STRING_CONFIG_KEYS:
                             cfg[k] = v
                         elif k == "flipped":
                             cfg[k] = v.lower() in ("1","true","yes")
@@ -124,12 +203,12 @@ def load_config():
                             if v in ("left","right"):
                                 cfg[k]=v
             print(f"Loaded configuration from {config_file}")
-            return cfg
+            return _clamp_config_limits(cfg)
         except FileNotFoundError:
             continue
 
     print("No configuration file found. Using defaults.")
-    return cfg
+    return _clamp_config_limits(cfg)
 
 
 def save_config():
@@ -143,6 +222,9 @@ def save_config():
             f.write(f"multipv={config.get('multipv', 1)}\n")
             f.write(f"theme={config.get('theme', current_theme)}\n")
             f.write(f"board_theme={config.get('board_theme', current_board_theme)}\n")
+            f.write(f"always_on_top={1 if config.get('always_on_top', 1) else 0}\n")
+            f.write(f"auto_move={1 if config.get('auto_move', 0) else 0}\n")
+            f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
 
@@ -151,6 +233,42 @@ def save_theme_config(theme_id):
     """Persist only theme change (keeps engine settings)."""
     config["theme"]=theme_id
     save_config()
+
+
+# Runtime mirrors of the persisted toggles (initialised after config load).
+always_on_top_enabled = True
+auto_move_enabled = False
+auto_move_color = "both"  # "white" | "black" | "both"
+auto_move_arm_reset = False  # main() consumes this to re-arm Auto-Move
+auto_move_status_text = ""  # human-readable arming state for the Analysis page
+show_auto_color_dialog = False
+auto_color_dialog_anim = 0.0
+
+
+def apply_always_on_top(enabled, persist=False):
+    global always_on_top_enabled
+    always_on_top_enabled = bool(enabled)
+    set_always_on_top(always_on_top_enabled)
+    config["always_on_top"] = 1 if always_on_top_enabled else 0
+    if persist:
+        save_config()
+    return always_on_top_enabled
+
+
+def set_auto_move(enabled, color=None, persist=True):
+    """Enable/disable Auto-Move (optionally choosing its colour) and ask
+    main() to restart its arming sequence."""
+    global auto_move_enabled, auto_move_color, auto_move_arm_reset
+    if color is not None:
+        c = str(color).strip().lower()
+        auto_move_color = c if c in ("white", "black", "both") else "both"
+    auto_move_enabled = bool(enabled)
+    config["auto_move"] = 1 if auto_move_enabled else 0
+    config["auto_move_color"] = auto_move_color
+    auto_move_arm_reset = True
+    if persist:
+        save_config()
+    return auto_move_enabled
 
 
 def normalise_board_theme(value):
@@ -291,6 +409,12 @@ if available_themes and all(t[0] != current_theme for t in available_themes):
     config["theme"]=current_theme
 # Board square colours from config ("Classic" unless saved as Chess.com)
 apply_board_theme(config.get("board_theme", "classic"))
+# Window / analysis toggles from config
+always_on_top_enabled = bool(config.get("always_on_top", 1))
+set_always_on_top(always_on_top_enabled)
+auto_move_enabled = bool(config.get("auto_move", 0))
+auto_move_color = config.get("auto_move_color", "both")
+auto_move_arm_reset = True
 
 # Pieces Style (board theme) menu layout & scrolling — compact 2-column + preview
 # Container was clipping second row of preview pieces (44 + 34 + 28 =106 >92); enlarge to fit
@@ -306,7 +430,7 @@ theme_scroll_offset = 0.0
 theme_scroll_speed = 70.0
 
 # Settings menu state — pages form a small hierarchy:
-#   main -> engine_settings
+#   main -> engine_settings / analysis
 #   main -> board -> pieces_style / board_themes
 settings_menu_state = "main"
 settings_menu_target = "pieces_style"
@@ -320,10 +444,12 @@ SETTINGS_PAGE_TITLES = {
     "pieces_style": "Pieces Styles",
     "board_themes": "Board Themes",
     "engine_settings": "Engine Settings",
+    "analysis": "Analysis",
 }
 SETTINGS_PAGE_PARENT = {
     "main": None,
     "engine_settings": "main",
+    "analysis": "main",
     "board": "main",
     "pieces_style": "board",
     "board_themes": "board",
@@ -331,10 +457,14 @@ SETTINGS_PAGE_PARENT = {
 SETTINGS_MAIN_ITEMS = [
     "Engine Settings",
     "Board",
-    "Sound Settings",
     "Game Controls",
     "Analysis Settings",
 ]
+# Toggle knob animation (0 = off, 1 = on)
+always_on_top_anim = 1.0 if always_on_top_enabled else 0.0
+auto_move_anim = 1.0 if auto_move_enabled else 0.0
+# Smoothed depth progress-bar fill (0..1 of the target depth)
+depth_bar_fraction = 0.0
 
 images = load_images(current_theme)
 openings = load_openings()
@@ -369,7 +499,7 @@ engine_draft = dict(config)  # staged values, only applied on Save
 engine_slider_display = {}  # visual lerp towards draft (per key)
 engine_slider_velocity = {}
 for _k in ENGINE_DEFAULTS:
-    if _k not in ("theme", "board_theme"):
+    if _k not in _STRING_CONFIG_KEYS:
         engine_slider_display[_k]=float(engine_draft.get(_k, ENGINE_DEFAULTS[_k]))
         engine_slider_velocity[_k]=0.0
 engine_has_changes = False
@@ -489,6 +619,7 @@ def update_slider_display():
 
 def update_global_anims():
     global legal_pulse_t, eval_highlight_pulse, confirm_anim, game_over_anim
+    global always_on_top_anim, auto_move_anim, auto_color_dialog_anim
     legal_pulse_t += 0.08
     eval_highlight_pulse += 0.06
     if show_newgame_confirm:
@@ -499,6 +630,14 @@ def update_global_anims():
         game_over_anim = min(1.0, game_over_anim + 0.10)
     else:
         game_over_anim = max(0.0, game_over_anim - 0.12)
+    if show_auto_color_dialog:
+        auto_color_dialog_anim = min(1.0, auto_color_dialog_anim + 0.12)
+    else:
+        auto_color_dialog_anim = max(0.0, auto_color_dialog_anim - 0.12)
+    for name, on in (("always_on_top_anim", always_on_top_enabled), ("auto_move_anim", auto_move_enabled or show_auto_color_dialog)):
+        cur = globals()[name]
+        target = 1.0 if on else 0.0
+        globals()[name] = target if abs(cur - target) < 0.02 else cur + (target - cur) * 0.25
 
 # --- Math & Animations ---
 def cubic_ease_in_out(t):
@@ -715,6 +854,23 @@ class AnimationManager:
                 "speed": 0.04,
                 "target_sq": rook_target_sq,
             }
+
+    def add_rook_only(self, rook_piece, rook_start_sq, rook_target_sq):
+        """Animate only the rook (drag-castling: the king was dragged by
+        hand, so it must not slide again, but the rook should still move
+        smoothly instead of teleporting)."""
+        if rook_piece is None or rook_start_sq is None or rook_target_sq is None:
+            return
+        rx, ry = square_to_screen(rook_start_sq)
+        rex, rey = square_to_screen(rook_target_sq)
+        self.rook_anim = {
+            "piece": rook_piece,
+            "start": (rx, ry),
+            "end": (rex, rey),
+            "progress": 0.0,
+            "speed": 0.04,
+            "target_sq": rook_target_sq,
+        }
 
     def add_capture(self, piece, sq):
         x, y = square_to_screen(sq)
@@ -1504,6 +1660,10 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
             rook_target_sq,
             rook_piece,
         )
+    elif is_castling:
+        # Dragged king: no king slide (it followed the cursor), but the
+        # rook still animates to its castled square.
+        anim_mgr.add_rook_only(rook_piece, rook_start_sq, rook_target_sq)
 
     board.push(move)
     engine_thread.update_position(board)
@@ -1575,6 +1735,47 @@ def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_
     board.push(move)
     engine_thread.update_position(board)
     return True
+
+
+_CASTLING_ROOK_PAIRS = {
+    (chess.E1, chess.G1): (chess.H1, chess.F1),
+    (chess.E1, chess.C1): (chess.A1, chess.D1),
+    (chess.E8, chess.G8): (chess.H8, chess.F8),
+    (chess.E8, chess.C8): (chess.A8, chess.D8),
+}
+
+
+def add_move_animation_for_move(anim_mgr, board_before, move, reverse=False):
+    """Queue the normal piece-slide animation for a history step.
+
+    Call BEFORE push/pop, with the board still in its pre-step state.
+    reverse=False replays the move (→); reverse=True plays it backwards
+    (←), including the rook hop for castling in either direction."""
+    if not reverse:
+        piece = board_before.piece_at(move.from_square)
+        if not piece:
+            return
+        # capture flourish, mirroring try_execute_move (incl. en passant)
+        captured = board_before.piece_at(move.to_square)
+        cap_sq = move.to_square
+        if not captured and board_before.is_en_passant(move):
+            cap_sq = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
+            captured = board_before.piece_at(cap_sq)
+        if captured:
+            anim_mgr.add_capture(captured, cap_sq)
+        is_castling, rs, rt, rp = get_castling_info(board_before, move.from_square, move.to_square)
+        anim_mgr.add_move(piece, move.from_square, move.to_square, is_castling, rs, rt, rp)
+    else:
+        piece = board_before.piece_at(move.to_square)
+        if not piece:
+            return
+        rook_pair = _CASTLING_ROOK_PAIRS.get((move.from_square, move.to_square))
+        if rook_pair and piece.piece_type == chess.KING:
+            rook_from, rook_to = rook_pair[1], rook_pair[0]  # castled -> home
+            rook_piece = board_before.piece_at(rook_from)
+            anim_mgr.add_move(piece, move.to_square, move.from_square, True, rook_from, rook_to, rook_piece)
+        else:
+            anim_mgr.add_move(piece, move.to_square, move.from_square)
 
 
 def format_nps(nps):
@@ -2288,12 +2489,162 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
             screen.blit(sel, (rect.right - sel.get_width() - 16, rect.y + 20))
 
 
+# --- Toggle rows / Analysis page ---
+def draw_toggle_row(screen, rect, label, subtitle, on, anim, hovered):
+    """Card row with a sliding on/off pill on the right."""
+    bg = (78, 78, 118) if hovered else (58, 58, 68)
+    pygame.draw.rect(screen, bg, rect, border_radius=12)
+    pygame.draw.rect(screen, (150, 170, 255) if hovered else MENU_BORDER_COLOR, rect, 2, border_radius=12)
+    big = rect.height >= 70
+    title_font = font_large if big else font_small
+    title_s = title_font.render(label, True, TEXT_COLOR)
+    ty = rect.y + 16 if big else rect.centery - title_s.get_height() // 2
+    screen.blit(title_s, (rect.x + 18, ty))
+    if subtitle and big:
+        sub_s = font_tiny.render(subtitle, True, TEXT_MUTED)
+        screen.blit(sub_s, (rect.x + 18, rect.y + 52))
+    # pill + knob
+    pill_w, pill_h = 54, 28
+    pill = pygame.Rect(rect.right - 18 - pill_w, rect.centery - pill_h // 2, pill_w, pill_h)
+    e = cubic_ease_in_out(max(0.0, min(1.0, anim)))
+    on_col, off_col = (72, 175, 105), (95, 95, 105)
+    pill_col = tuple(int(off_col[i] + (on_col[i] - off_col[i]) * e) for i in range(3))
+    pygame.draw.rect(screen, pill_col, pill, border_radius=pill_h // 2)
+    pygame.draw.rect(screen, (35, 35, 40), pill, 1, border_radius=pill_h // 2)
+    knob_r = 11
+    knob_x = int(pill.x + 4 + knob_r + e * (pill_w - 8 - knob_r * 2))
+    pygame.draw.circle(screen, (235, 235, 240), (knob_x, pill.centery), knob_r)
+    try:
+        pygame.gfxdraw.aacircle(screen, knob_x, pill.centery, knob_r, (235, 235, 240))
+    except Exception:
+        pass
+    state_s = font_tiny.render("On" if on else "Off", True, (140, 230, 160) if on else TEXT_MUTED)
+    screen.blit(state_s, (pill.x - state_s.get_width() - 10, rect.centery - state_s.get_height() // 2))
+    return pill
+
+
+def get_always_on_top_rect(offset_x=0, offset_y=0):
+    return pygame.Rect(WIDTH // 2 - 200 + offset_x, HEIGHT - 56 + offset_y, 400, 40)
+
+
+def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
+    return pygame.Rect(WIDTH // 2 - 220 + offset_x, 150 + offset_y, 440, 94)
+
+
+def get_auto_move_color_rects(offset_x=0, offset_y=0):
+    colors = ("white", "black", "both")
+    w, h, gap = 140, 46, 10
+    total = 3 * w + 2 * gap
+    x0 = WIDTH // 2 - total // 2 + offset_x
+    return {c: pygame.Rect(x0 + i * (w + gap), 332 + offset_y, w, h) for i, c in enumerate(colors)}
+
+
+def draw_analysis_content(screen, offset_x=0, offset_y=0):
+    mx, my = pygame.mouse.get_pos()
+    idle = menu_transition_direction == "none"
+    intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
+    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 112 + offset_y))
+
+    threshold = min(20, ANALYSIS_DEPTH)
+    rect = get_auto_move_toggle_rect(offset_x, offset_y)
+    shown_on = auto_move_enabled or show_auto_color_dialog
+    draw_toggle_row(
+        screen, rect, "Auto-Move",
+        f"Play the best move automatically at depth {threshold}",
+        shown_on, auto_move_anim, idle and rect.collidepoint(mx, my),
+    )
+
+    line1 = font_tiny.render("When on, the engine's best move is played for you", True, TEXT_MUTED)
+    line2 = font_tiny.render(f"as soon as the search reaches depth {threshold}.", True, TEXT_MUTED)
+    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, 258 + offset_y))
+    screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, 278 + offset_y))
+
+    if auto_move_enabled:
+        label = font_small.render("Auto-move for", True, TEXT_COLOR)
+        screen.blit(label, (WIDTH // 2 - label.get_width() // 2 + offset_x, 306 + offset_y))
+        for color, crect in get_auto_move_color_rects(offset_x, offset_y).items():
+            selected = color == auto_move_color
+            hovered = idle and crect.collidepoint(mx, my)
+            bg = (86, 86, 130) if selected else (72, 72, 82) if hovered else (56, 56, 66)
+            pygame.draw.rect(screen, bg, crect, border_radius=10)
+            pygame.draw.rect(screen, (130, 220, 150) if selected else (150, 170, 255) if hovered else MENU_BORDER_COLOR, crect, 2, border_radius=10)
+            txt = font_small.render(color.capitalize(), True, TEXT_COLOR)
+            screen.blit(txt, txt.get_rect(center=crect.center))
+        status = auto_move_status_text or "Active"
+        status_s = font_tiny.render(status, True, TEXT_ACCENT)
+        screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 398 + offset_y))
+
+
+def get_auto_color_dialog_rects():
+    """Panel + White/Black/Both/Cancel rects for the colour question."""
+    e = cubic_ease_in_out(max(0.0, min(1.0, auto_color_dialog_anim)))
+    w, h = 420, 210
+    x = WIDTH // 2 - w // 2
+    y = HEIGHT // 2 - h // 2 - int((1 - e) * 18)
+    panel = pygame.Rect(x, y, w, h)
+    bw, bh, gap = 118, 44, 12
+    total = 3 * bw + 2 * gap
+    x0 = panel.centerx - total // 2
+    choices = {c: pygame.Rect(x0 + i * (bw + gap), y + 96, bw, bh) for i, c in enumerate(("white", "black", "both"))}
+    cancel = pygame.Rect(panel.centerx - 70, y + h - 52, 140, 36)
+    return panel, choices, cancel
+
+
+def draw_auto_color_dialog(screen):
+    e = cubic_ease_in_out(max(0.0, min(1.0, auto_color_dialog_anim)))
+    panel, choices, cancel = get_auto_color_dialog_rects()
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, int(165 * e)))
+    screen.blit(overlay, (0, 0))
+    pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
+    pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
+    pygame.draw.rect(screen, (130, 220, 150), panel, 2, border_radius=14)
+
+    title = font_large.render("Auto-Move", True, TEXT_COLOR)
+    screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 30)))
+    q = font_small.render("Which colour should auto-move?", True, TEXT_MUTED)
+    screen.blit(q, q.get_rect(center=(panel.centerx, panel.y + 62)))
+
+    mx, my = pygame.mouse.get_pos()
+    for color, rect in choices.items():
+        hovered = rect.collidepoint(mx, my)
+        bg = (74, 158, 96) if hovered else (60, 100, 130) if color == "both" else (66, 66, 80)
+        pygame.draw.rect(screen, bg, rect, border_radius=10)
+        pygame.draw.rect(screen, (140, 230, 160) if hovered else MENU_BORDER_COLOR, rect, 2, border_radius=10)
+        # small king disc hinting the side
+        if color in ("white", "both"):
+            pygame.draw.circle(screen, (240, 240, 240), (rect.x + 20, rect.centery), 8)
+        if color in ("black", "both"):
+            pygame.draw.circle(screen, (25, 25, 25), (rect.x + (34 if color == "both" else 20), rect.centery), 8)
+        txt = font_small.render(color.capitalize(), True, TEXT_COLOR)
+        screen.blit(txt, txt.get_rect(center=(rect.centerx + 10, rect.centery)))
+
+    chov = cancel.collidepoint(mx, my)
+    pygame.draw.rect(screen, (98, 98, 110) if chov else (72, 72, 84), cancel, border_radius=9)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, cancel, 2, border_radius=9)
+    ctxt = font_small.render("Cancel", True, TEXT_COLOR)
+    screen.blit(ctxt, ctxt.get_rect(center=cancel.center))
+    hint = font_tiny.render("White/Black start after you move once, then the opponent moves.", True, TEXT_MUTED)
+    if hint.get_width() <= panel.width - 16:
+        screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.bottom + 16)))
+    return choices, cancel
+
+
 # --- Engine Settings Page (Sliders) ---
 ENGINE_ROW_KEYS = ["threads", "skill", "hash", "depth", "multipv"]
 ENGINE_ROW_LABELS = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash", "depth": "Depth Limit", "multipv": "MultiPV"}
-ENGINE_ROW_LIMITS = {"threads": (1, 1024), "skill": (0, 20), "hash": (16, 32768), "depth": (5, 40), "multipv": (1, 5)}
+# Threads are capped at the processor's logical thread count and Hash at a
+# safe share of physical RAM (see _safe_hash_mb), so neither slider can be
+# pushed into slowdown/crash territory on this machine.
+ENGINE_ROW_LIMITS = {"threads": (1, MAX_THREADS), "skill": (0, 20), "hash": (16, SAFE_HASH_MB), "depth": (5, 40), "multipv": (1, 5)}
 ENGINE_PARAM_NAMES = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash", "multipv": "MultiPV"}
-HASH_STEPS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+HASH_STEPS = []
+_step = 16
+while _step <= SAFE_HASH_MB:
+    HASH_STEPS.append(_step)
+    _step *= 2
+if not HASH_STEPS:
+    HASH_STEPS = [16]
 
 ENGINE_ROW_TOP = 120
 ENGINE_ROW_HEIGHT = 64
@@ -2352,10 +2703,15 @@ def set_engine_slider_value(key, mouse_x, track_rect):
         # display will smoothly lerp via update_slider_display()
 
 def reset_engine_settings():
-    # Reset draft to defaults, not yet saved
+    # Reset draft to defaults (clamped to this machine's safe limits),
+    # not yet saved
     for k in ENGINE_ROW_KEYS:
         if k in ENGINE_DEFAULTS:
-            engine_draft[k]=ENGINE_DEFAULTS[k]
+            low, high = ENGINE_ROW_LIMITS[k]
+            value = max(low, min(ENGINE_DEFAULTS[k], high))
+            if k == "hash":
+                value = _snap_hash_down(value)
+            engine_draft[k]=value
 
 def apply_engine_settings():
     global ANALYSIS_DEPTH, engine_has_changes
@@ -2375,6 +2731,10 @@ def apply_engine_settings():
 
 def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
+
+    ram_txt = f"{TOTAL_RAM_MB} MB RAM" if TOTAL_RAM_MB else "RAM unknown"
+    limits_s = font_tiny.render(f"Safe limits for this PC: {MAX_THREADS} threads · {SAFE_HASH_MB} MB hash ({ram_txt})", True, TEXT_MUTED)
+    screen.blit(limits_s, (WIDTH // 2 - limits_s.get_width() // 2 + offset_x, ENGINE_ROW_TOP - 26 + offset_y))
 
     for i, key in enumerate(ENGINE_ROW_KEYS):
         row_rect, track_rect, value_rect = get_engine_slider_rects(i, offset_x, offset_y)
@@ -2645,7 +3005,7 @@ def draw_settings_menu(screen):
                     item_height,
                 )
 
-                is_interactive = item in ("Board", "Engine Settings")
+                is_interactive = item in ("Board", "Engine Settings", "Analysis Settings")
                 is_hovered = (
                     is_interactive
                     and transition_idle
@@ -2689,6 +3049,14 @@ def draw_settings_menu(screen):
             restart_text = font_small.render("Restart", True, TEXT_COLOR)
             screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
 
+            # Always on Top toggle, pinned to the bottom of the main menu
+            aot_rect = get_always_on_top_rect(offset_x, open_slide)
+            draw_toggle_row(
+                screen, aot_rect, "Always on Top", None,
+                always_on_top_enabled, always_on_top_anim,
+                transition_idle and aot_rect.collidepoint(mx, my),
+            )
+
         elif page_state == "board":
             draw_board_hub_content(screen, offset_x, open_slide)
         elif page_state == "pieces_style":
@@ -2697,6 +3065,8 @@ def draw_settings_menu(screen):
             draw_board_themes_content(screen, offset_x, open_slide)
         elif page_state == "engine_settings":
             draw_engine_settings_content(screen, offset_x, open_slide)
+        elif page_state == "analysis":
+            draw_analysis_content(screen, offset_x, open_slide)
 
     for idx, (page_state, page_off) in enumerate(pages_to_draw):
         # The page on top rides in on a "sheet" that occludes the page
@@ -2760,6 +3130,7 @@ def handle_menu_click(mx, my):
     global menu_anim_closing, settings_menu_state, menu_transition_direction
     global current_theme, images, theme_scroll_offset, settings_menu_target
     global engine_slider_dragging, restart_requested
+    global show_auto_color_dialog, auto_color_dialog_anim
 
     if menu_anim_progress < 1.0 or menu_transition_direction != "none":
         return True
@@ -2775,7 +3146,24 @@ def handle_menu_click(mx, my):
             navigate_back()
             return True
 
-    if settings_menu_state == "board":
+    if settings_menu_state == "analysis":
+        if get_auto_move_toggle_rect().collidepoint(mx, my):
+            if auto_move_enabled:
+                set_auto_move(False)
+            elif not show_auto_color_dialog:
+                # Ask which colour first; Auto-Move only turns on once
+                # a colour is chosen in the dialog.
+                show_auto_color_dialog = True
+                auto_color_dialog_anim = 0.0
+            return True
+        if auto_move_enabled:
+            for color, rect in get_auto_move_color_rects().items():
+                if rect.collidepoint(mx, my):
+                    if color != auto_move_color:
+                        set_auto_move(True, color=color)
+                    return True
+
+    elif settings_menu_state == "board":
         for page, rect in get_board_hub_rects().items():
             if rect.collidepoint(mx, my):
                 if page == "pieces_style":
@@ -2850,7 +3238,13 @@ def handle_menu_click(mx, my):
                     navigate_to("board", forward=True)
                 elif item == "Engine Settings":
                     navigate_to("engine_settings", forward=True)
+                elif item == "Analysis Settings":
+                    navigate_to("analysis", forward=True)
                 return True
+
+        if get_always_on_top_rect().collidepoint(mx, my):
+            apply_always_on_top(not always_on_top_enabled, persist=True)
+            return True
 
         # About section buttons — compute same about_y as draw
         about_y = start_y + len(menu_items) * (item_height + 20) + 40
@@ -2974,6 +3368,7 @@ def draw_gui(
     screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos,
     drag_sq=None, drag_offset=None, dragging=False, view_ply=None, total_ply=None
 ):
+    global depth_bar_fraction
     screen.fill(BG_COLOR)
 
     # Compute status once for the whole frame
@@ -2988,14 +3383,21 @@ def draw_gui(
         1,
     )
 
-    # Move counter / history position (← / → step through the game)
+    # App title (top-left, left of the top-bar buttons incl. Flip) and the
+    # move counter / history position beside it (← / → step through it).
+    hist_x = PADDING
+    if menu_anim_progress == 0:
+        title_s = font_large.render("ChessBotV Rewrite", True, TEXT_COLOR)
+        screen.blit(title_s, (PADDING, (TOP_BAR_HEIGHT - title_s.get_height()) // 2))
+        hist_x = PADDING + title_s.get_width() + 16
     if total_ply:
         _view = len(board.move_stack) if view_ply is None else view_ply
         if _view < total_ply:
             hist_s = font_tiny.render(f"◀  Move {_view}/{total_ply} — viewing history  ▶", True, (255, 205, 110))
         else:
             hist_s = font_tiny.render(f"Move {_view}", True, TEXT_MUTED)
-        screen.blit(hist_s, (PADDING, (TOP_BAR_HEIGHT - hist_s.get_height()) // 2))
+        if hist_x + hist_s.get_width() < flip_button_rect.x - 8:
+            screen.blit(hist_s, (hist_x, (TOP_BAR_HEIGHT - hist_s.get_height()) // 2))
 
     # 1. Evaluation bar — dynamic position with winning highlight and smooth slide
     eval_bar_x = int(eval_bar_x_current)
@@ -3173,7 +3575,7 @@ def draw_gui(
         if sq == moving_sq:
             continue
         if (
-            is_castling
+            (is_castling or anim_mgr.rook_anim)
             and (sq == rook_target_sq or sq == rook_start_sq)
             and piece
             and piece.piece_type == chess.ROOK
@@ -3404,9 +3806,28 @@ def draw_gui(
     screen.blit(stats_label, (col1_x, stats_y))
     screen.blit(stats_value, (col1_x + stats_label.get_width() + 8, stats_y))
     screen.blit(depth_label, (col2_x, stats_y))
-    screen.blit(depth_value, (col2_x + depth_label.get_width() + 8, stats_y))
+    target_depth_str = f"/{ANALYSIS_DEPTH}" if ANALYSIS_DEPTH else ""
+    depth_value_full = font_small.render(f"{depth}{target_depth_str}", True, TEXT_COLOR)
+    screen.blit(depth_value_full, (col2_x + depth_label.get_width() + 8, stats_y))
     screen.blit(nps_label, (col3_x, stats_y))
     screen.blit(nps_value, (col3_x + nps_label.get_width() + 8, stats_y))
+
+    # Small progress bar under the Depth readout (depth / target depth)
+    _target_frac = max(0.0, min(1.0, depth / max(1, ANALYSIS_DEPTH))) if ANALYSIS_DEPTH else 0.0
+    if _target_frac < depth_bar_fraction - 0.02:
+        depth_bar_fraction = _target_frac  # new search: snap back
+    else:
+        depth_bar_fraction += (_target_frac - depth_bar_fraction) * 0.20
+        if abs(depth_bar_fraction - _target_frac) < 0.005:
+            depth_bar_fraction = _target_frac
+    bar_w = min(140, col3_x - col2_x - 16)
+    bar_rect = pygame.Rect(col2_x, stats_y + 23, bar_w, 5)
+    pygame.draw.rect(screen, (52, 52, 60), bar_rect, border_radius=3)
+    fill_w = int(bar_rect.width * depth_bar_fraction)
+    if fill_w > 0:
+        fill_col = (110, 220, 140) if depth_bar_fraction >= 0.999 else (90, 150, 255)
+        pygame.draw.rect(screen, fill_col, (bar_rect.x, bar_rect.y, fill_w, bar_rect.height), border_radius=3)
+    pygame.draw.rect(screen, (90, 90, 100), bar_rect, 1, border_radius=3)
 
     rec_y = info_top + 88
     if game_over:
@@ -3480,6 +3901,11 @@ def draw_gui(
     if show_game_over:
         draw_game_over_dialog(screen, board)
 
+    # Auto-Move colour question (opened from the Analysis page, so it
+    # must render above the settings menu).
+    if show_auto_color_dialog:
+        draw_auto_color_dialog(screen)
+
     pygame.display.flip()
 
 
@@ -3489,6 +3915,7 @@ def main():
     global show_newgame_confirm, confirm_anim, board_flipped, board_ox_current, eval_bar_x_current, board_ox_target, eval_bar_x_target, board_anim_t, eval_bar_side
     global engine_draft, engine_slider_display, engine_has_changes
     global show_game_over, game_over_anim, game_over_seen_key
+    global show_auto_color_dialog, auto_color_dialog_anim, auto_move_status_text, auto_move_arm_reset
 
     clock = pygame.time.Clock()
     board = chess.Board()
@@ -3508,7 +3935,7 @@ def main():
         """Start a fresh game (used by New, the confirm dialog, and the
         game-over dialog)."""
         global promotion_pending, show_game_over, game_over_seen_key
-        nonlocal selected_sq, dragging, drag_sq, drag_offset
+        nonlocal selected_sq, dragging, drag_sq, drag_offset, auto_seen_ply, auto_fired_key
         old_board = board.copy()
         anim_mgr.add_board_reset(old_board, chess.Board())
         board.reset()
@@ -3528,6 +3955,8 @@ def main():
         promotion_pending = None
         show_game_over = False
         game_over_seen_key = None
+        auto_seen_ply = 0
+        auto_fired_key = None
 
     def note_new_move():
         """A move was just played from the displayed position. If it is
@@ -3539,7 +3968,9 @@ def main():
             history_redo.clear()
 
     def sync_after_history_step():
-        """Common cleanup after ← / → changes the displayed position."""
+        """Common cleanup after ← / → changes the displayed position.
+        The move animation queued by add_move_animation_for_move is
+        deliberately kept so the piece still slides to its square."""
         global promotion_pending
         nonlocal selected_sq, dragging, drag_sq, drag_offset
         selected_sq = None
@@ -3547,13 +3978,34 @@ def main():
         drag_sq = None
         drag_offset = None
         promotion_pending = None
-        anim_mgr.move_anim = None
-        anim_mgr.rook_anim = None
-        anim_mgr.capture_anims = []
         anim_mgr.arrow_target_alpha = 0.0
         anim_mgr.set_multipv_arrows({})
         check_effect.reset()
         engine_thread.update_position(board)
+
+    def execute_engine_best_move():
+        """Play the engine's current best move (Space / Auto-Move)."""
+        if board.is_game_over(claim_draw=True):
+            return False
+        with engine_thread.lock:
+            pv = list(engine_thread.info.get("pv", []))
+        if not pv or pv[0] not in board.legal_moves:
+            return False
+        best_move = pv[0]
+        add_move_animation_for_move(anim_mgr, board, best_move, reverse=False)
+        board.push(best_move)
+        note_new_move()
+        engine_thread.update_position(board)
+        return True
+
+    # Auto-Move arming: for a single colour it only starts after that
+    # colour has moved once since it was turned on AND the opponent has
+    # replied ("both" skips this waiting entirely).
+    auto_stage = 2 if auto_move_color == "both" else 0  # 0 own, 1 opp, 2 armed
+    auto_seen_ply = len(board.move_stack)
+    auto_fired_key = None
+    auto_pos_key = None
+    auto_pos_frames = 0
 
     while running:
         anim_mgr.update()
@@ -3581,6 +4033,78 @@ def main():
         else:
             show_game_over = False
             game_over_seen_key = None
+
+        # --- Auto-Move ---
+        if auto_move_arm_reset:
+            auto_move_arm_reset = False
+            auto_stage = 2 if auto_move_color == "both" else 0
+            auto_seen_ply = len(board.move_stack)
+            auto_fired_key = None
+            auto_pos_key = None
+            auto_pos_frames = 0
+        _ply = len(board.move_stack)
+        if auto_move_color != "both":
+            _chosen = chess.WHITE if auto_move_color == "white" else chess.BLACK
+            if _ply > auto_seen_ply:
+                for _i in range(auto_seen_ply, _ply):
+                    _mover = chess.WHITE if _i % 2 == 0 else chess.BLACK
+                    if auto_stage == 0 and _mover == _chosen:
+                        auto_stage = 1
+                    elif auto_stage == 1 and _mover != _chosen:
+                        auto_stage = 2
+            auto_seen_ply = _ply
+        else:
+            auto_stage = 2
+            auto_seen_ply = _ply
+        if not auto_move_enabled:
+            auto_move_status_text = ""
+        elif auto_move_color == "both":
+            auto_move_status_text = "Active — auto-moving both colours"
+        elif auto_stage == 0:
+            auto_move_status_text = f"Waiting — move once as {auto_move_color.capitalize()} first"
+        elif auto_stage == 1:
+            _opp = "Black" if auto_move_color == "white" else "White"
+            auto_move_status_text = f"Waiting for {_opp} to move"
+        else:
+            auto_move_status_text = f"Active — auto-moving {auto_move_color.capitalize()}"
+
+        _pos_key = (board.fen(), _ply, len(history_redo))
+        if _pos_key != auto_pos_key:
+            auto_pos_key = _pos_key
+            auto_pos_frames = 0
+        else:
+            auto_pos_frames += 1
+        if (
+            auto_move_enabled
+            and auto_stage == 2
+            and not history_redo
+            and menu_anim_progress == 0
+            and not (menu_anim_opening or menu_anim_closing)
+            and not show_newgame_confirm
+            and not show_game_over
+            and not show_auto_color_dialog
+            and promotion_pending is None
+            and not dragging
+            and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims)
+            and _result is None
+            and auto_pos_frames >= 2
+            and _pos_key != auto_fired_key
+            and (auto_move_color == "both" or board.turn == (chess.WHITE if auto_move_color == "white" else chess.BLACK))
+        ):
+            _threshold = min(20, ANALYSIS_DEPTH) if ANALYSIS_DEPTH else 20
+            with engine_thread.lock:
+                _depth_now = engine_thread.info.get("depth", 0)
+                _pv_now = list(engine_thread.info.get("pv", []))
+                _engine_fen = engine_thread.board.fen() if getattr(engine_thread, "board", None) is not None else None
+            if (
+                _depth_now >= _threshold
+                and _pv_now
+                and _pv_now[0] in board.legal_moves
+                and _engine_fen == board.fen()
+            ):
+                if execute_engine_best_move():
+                    auto_fired_key = _pos_key
+                    auto_seen_ply = len(board.move_stack)
 
         update_menu_animation()
         if restart_requested:
@@ -3626,6 +4150,21 @@ def main():
                         # so the dialog stays dismissed until the position
                         # stops being terminal (e.g. stepping back).
                         show_game_over = False
+                    continue
+
+                # Auto-Move colour question — modal, above the settings menu
+                if show_auto_color_dialog:
+                    _panel, _choices, _cancel = get_auto_color_dialog_rects()
+                    _picked = None
+                    for _color, _rect in _choices.items():
+                        if _rect.collidepoint(mx, my):
+                            _picked = _color
+                            break
+                    if _picked is not None:
+                        set_auto_move(True, color=_picked)
+                        show_auto_color_dialog = False
+                    elif _cancel.collidepoint(mx, my) or not _panel.collidepoint(mx, my):
+                        show_auto_color_dialog = False
                     continue
 
                 menu_active = (
@@ -3776,6 +4315,9 @@ def main():
                     if show_game_over:
                         show_game_over=False
                         continue
+                    if show_auto_color_dialog:
+                        show_auto_color_dialog=False
+                        continue
                     if promotion_pending is not None:
                         promotion_pending = None
                         continue
@@ -3790,15 +4332,17 @@ def main():
                             menu_anim_closing = True
                     else:
                         selected_sq = None
-                elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and promotion_pending is None and not dragging and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
+                elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and not show_auto_color_dialog and promotion_pending is None and not dragging and not anim_mgr.board_reset_anims:
                     if event.key == pygame.K_LEFT:
-                        # Previous move (kept in history_redo for →)
+                        # Previous move (kept in history_redo for →), played backwards
                         if board.move_stack:
+                            add_move_animation_for_move(anim_mgr, board, board.move_stack[-1], reverse=True)
                             history_redo.append(board.pop())
                             sync_after_history_step()
                     else:
                         # Next move — only if it has actually been played
                         if history_redo:
+                            add_move_animation_for_move(anim_mgr, board, history_redo[-1], reverse=False)
                             board.push(history_redo.pop())
                             sync_after_history_step()
                 elif event.key == pygame.K_f and menu_anim_progress == 0 and not show_newgame_confirm:
@@ -3806,85 +4350,10 @@ def main():
                 elif event.key == pygame.K_e and menu_anim_progress == 0 and not show_newgame_confirm:
                     toggle_eval_side()
 
-                elif event.key == pygame.K_SPACE and menu_anim_progress == 0:
-                    if (
-                        not (anim_mgr.move_anim or anim_mgr.rook_anim)
-                        and not board.is_game_over(claim_draw=True)
-                    ):
-                        with engine_thread.lock:
-                            pv = engine_thread.info["pv"]
-                        # Guard against a stale pv (a move was just played
-                        # but the new search has not started yet): never
-                        # push an illegal move onto the board.
-                        if pv and pv[0] in board.legal_moves:
-                            best_move = pv[0]
-                            captured_piece = board.piece_at(best_move.to_square)
-                            if captured_piece:
-                                anim_mgr.add_capture(
-                                    captured_piece, best_move.to_square
-                                )
+                elif event.key == pygame.K_SPACE and menu_anim_progress == 0 and not show_auto_color_dialog:
+                    if not (anim_mgr.move_anim or anim_mgr.rook_anim):
+                        execute_engine_best_move()
 
-                            is_castling = False
-                            rook_start_sq = None
-                            rook_target_sq = None
-                            rook_piece = None
-
-                            if (
-                                board.piece_at(best_move.from_square)
-                                and board.piece_at(best_move.from_square).piece_type
-                                == chess.KING
-                            ):
-                                if (
-                                    best_move.from_square == chess.E1
-                                    and best_move.to_square == chess.G1
-                                ) or (
-                                    best_move.from_square == chess.E8
-                                    and best_move.to_square == chess.G8
-                                ):
-                                    is_castling = True
-                                    rook_start_sq = (
-                                        chess.H1
-                                        if best_move.from_square == chess.E1
-                                        else chess.H8
-                                    )
-                                    rook_target_sq = (
-                                        chess.F1
-                                        if best_move.from_square == chess.E1
-                                        else chess.F8
-                                    )
-                                    rook_piece = board.piece_at(rook_start_sq)
-                                elif (
-                                    best_move.from_square == chess.E1
-                                    and best_move.to_square == chess.C1
-                                ) or (
-                                    best_move.from_square == chess.E8
-                                    and best_move.to_square == chess.C8
-                                ):
-                                    is_castling = True
-                                    rook_start_sq = (
-                                        chess.A1
-                                        if best_move.from_square == chess.E1
-                                        else chess.A8
-                                    )
-                                    rook_target_sq = (
-                                        chess.D1
-                                        if best_move.from_square == chess.E1
-                                        else chess.D8
-                                    )
-                                    rook_piece = board.piece_at(rook_start_sq)
-
-                            anim_mgr.add_move(
-                                board.piece_at(best_move.from_square),
-                                best_move.from_square,
-                                best_move.to_square,
-                                is_castling,
-                                rook_start_sq,
-                                rook_target_sq,
-                                rook_piece,
-                            )
-                            board.push(best_move)
-                            note_new_move()
-                            engine_thread.update_position(board)
 
         draw_gui(
             screen,
