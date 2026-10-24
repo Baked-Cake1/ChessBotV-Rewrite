@@ -1766,7 +1766,7 @@ def draw_settings_menu(screen):
         screen.blit(about_title, about_title_rect)
 
         version_text = font_small.render(
-            "ChessBotV Rewrite Version 1.2.1-beta", True, TEXT_COLOR
+            "ChessBotV Rewrite Version 1.5-beta", True, TEXT_COLOR
         )
         version_rect = version_text.get_rect(
             center=(WIDTH // 2 + offset_x, about_y + 40)
