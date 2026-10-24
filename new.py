@@ -86,7 +86,7 @@ set_always_on_top()
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "theme": "classic"}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic"}
 
 
 def load_config():
@@ -133,6 +133,7 @@ def save_config():
             f.write(f"threads={config['threads']}\n")
             f.write(f"skill={config['skill']}\n")
             f.write(f"depth={config.get('depth', 25)}\n")
+            f.write(f"multipv={config.get('multipv', 1)}\n")
             f.write(f"theme={config.get('theme', current_theme)}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
@@ -453,7 +454,7 @@ class AnimationManager:
         self.target_eval = 0.0
         self.eval_interpolation_speed = 0.08
 
-        # Engine arrow animation state.
+        # Engine arrow animation state (single fallback).
         self.arrow_start = None
         self.arrow_end = None
         self.arrow_target_start = None
@@ -462,6 +463,10 @@ class AnimationManager:
         self.arrow_target_alpha = 0.0
         self.arrow_fade_speed = 0.15
         self.arrow_morph_speed = 0.18
+        # MultiPV arrows: dict id -> {start,end,target_start,target_end,alpha,target_alpha,is_knight,is_mate}
+        self.multi_arrows = {}
+        self.multi_arrow_fade_speed = 0.15
+        self.multi_arrow_morph_speed = 0.18
 
     def update(self):
         if self.move_anim:
@@ -516,6 +521,28 @@ class AnimationManager:
             else:
                 self.arrow_end = self.arrow_target_end.copy()
 
+        # MultiPV arrows update
+        for aid, adata in list(self.multi_arrows.items()):
+            if abs(adata["alpha"] - adata["target_alpha"]) > 0.5:
+                adata["alpha"] += (adata["target_alpha"] - adata["alpha"]) * self.multi_arrow_fade_speed
+            else:
+                adata["alpha"] = adata["target_alpha"]
+            if adata["start"] is not None and adata["end"] is not None and adata["target_start"] is not None and adata["target_end"] is not None:
+                ds = adata["target_start"] - adata["start"]
+                if ds.length_squared() > 1.0:
+                    adata["start"] += ds * self.multi_arrow_morph_speed
+                else:
+                    adata["start"] = adata["target_start"].copy()
+                de = adata["target_end"] - adata["end"]
+                if de.length_squared() > 1.0:
+                    adata["end"] += de * self.multi_arrow_morph_speed
+                else:
+                    adata["end"] = adata["target_end"].copy()
+            # prune faded out arrows that are no longer wanted
+            if adata["target_alpha"] == 0 and adata["alpha"] < 1:
+                # keep for a moment, will be removed by set_multipv_arrows if not in targets
+                pass
+
     def set_arrow_target(self, start_pos, end_pos, visible):
         if not visible:
             self.arrow_target_alpha = 0.0
@@ -532,6 +559,54 @@ class AnimationManager:
         self.arrow_target_end = new_end
         # 0.4 opacity so arrow doesn't disrupt board
         self.arrow_target_alpha = 255 * 0.4
+
+    def set_multipv_arrows(self, targets):
+        """targets: dict id -> (start_pos, end_pos, is_knight, is_mate, visible) or None to clear.
+        Handles fading and morphing for multiple suggestion arrows."""
+        if not targets:
+            # fade out all
+            for aid in self.multi_arrows:
+                self.multi_arrows[aid]["target_alpha"] = 0.0
+            return
+        # Update / create entries for each target
+        for aid, t in targets.items():
+            if t is None:
+                if aid in self.multi_arrows:
+                    self.multi_arrows[aid]["target_alpha"] = 0.0
+                continue
+            start_pos, end_pos, is_knight, is_mate, visible = t
+            if not visible:
+                if aid in self.multi_arrows:
+                    self.multi_arrows[aid]["target_alpha"] = 0.0
+                continue
+            new_start = pygame.Vector2(start_pos)
+            new_end = pygame.Vector2(end_pos)
+            if aid not in self.multi_arrows:
+                self.multi_arrows[aid] = {
+                    "start": new_start.copy(),
+                    "end": new_end.copy(),
+                    "target_start": new_start.copy(),
+                    "target_end": new_end.copy(),
+                    "alpha": 0.0,
+                    "target_alpha": 255 * 0.4,
+                    "is_knight": is_knight,
+                    "is_mate": is_mate,
+                }
+            else:
+                adata = self.multi_arrows[aid]
+                # initialize if was faded out
+                if adata["alpha"] < 10 or adata["target_start"] is None:
+                    adata["start"] = new_start.copy()
+                    adata["end"] = new_end.copy()
+                adata["target_start"] = new_start
+                adata["target_end"] = new_end
+                adata["target_alpha"] = 255 * 0.4
+                adata["is_knight"] = is_knight
+                adata["is_mate"] = is_mate
+        # fade out ids no longer in targets
+        for aid in list(self.multi_arrows.keys()):
+            if aid not in targets:
+                self.multi_arrows[aid]["target_alpha"] = 0.0
 
     def add_move(
         self,
@@ -939,6 +1014,7 @@ class EngineThread:
             "nps": 0,
             "pv": [],
             "mate": None,
+            "lines": {},  # multipv number -> {score, mate, pv}
         }
 
         # Parameters waiting to be applied before the next search so we
@@ -994,6 +1070,7 @@ class EngineThread:
                 "Threads": cfg.get("threads", 4),
                 "Hash": cfg.get("hash", 2048),
                 "Skill Level": cfg.get("skill", 20),
+                "MultiPV": cfg.get("multipv", 1),
             }
         )
 
@@ -1020,6 +1097,7 @@ class EngineThread:
                 "nps": 0,
                 "pv": [],
                 "mate": None,
+                "lines": {},
             }
 
     def set_pending_parameters(self, params):
@@ -1089,11 +1167,13 @@ class EngineThread:
                 self._parse_info_line(line, white_to_move)
 
     def _parse_info_line(self, line, white_to_move):
-        """Extract depth/nps/score/pv from a UCI info line."""
+        """Extract depth/nps/score/pv/multipv from a UCI info line. Supports MultiPV."""
         tokens = line.split()
         updates = {}
         score = None
+        mate_score = None
         pv_tokens = None
+        multipv_num = None
 
         try:
             i = 1
@@ -1105,48 +1185,89 @@ class EngineThread:
                 elif tok == "nps" and i + 1 < len(tokens):
                     updates["nps"] = int(tokens[i + 1])
                     i += 2
+                elif tok == "multipv" and i + 1 < len(tokens):
+                    multipv_num = int(tokens[i + 1])
+                    i += 2
                 elif tok == "score" and i + 2 < len(tokens):
                     kind, value = tokens[i + 1], tokens[i + 2]
                     if kind == "cp":
                         score = int(value)
+                        mate_score = None
                     elif kind == "mate":
-                        updates["mate"] = int(value)
-                        score = 10000 if updates["mate"] > 0 else -10000
+                        mate_score = int(value)
+                        score = 10000 if mate_score > 0 else -10000
                     i += 3
                 elif tok == "pv":
-                    pv_tokens = tokens[i + 1 : i + 9]
+                    pv_tokens = tokens[i + 1 :]
                     break
                 else:
                     i += 1
         except ValueError:
             return
 
-        # UCI scores are relative to the side to move; convert to
-        # white-relative so the eval bar means what its W/B labels say.
+        # Convert to white-relative
         if not white_to_move:
             if score is not None:
                 score = -score
-            if "mate" in updates:
-                updates["mate"] = -updates["mate"]
+            if mate_score is not None:
+                mate_score = -mate_score
 
-        if score is not None:
-            updates["score"] = score
-
+        moves = []
         if pv_tokens:
-            moves = []
             for uci_move in pv_tokens:
                 try:
                     moves.append(chess.Move.from_uci(uci_move))
                 except ValueError:
                     break
-            if moves:
-                updates["pv"] = moves
 
-        if not updates:
-            return
-
+        # Depth/nps are global
         with self.lock:
-            self.info.update(updates)
+            if "depth" in updates:
+                self.info["depth"] = updates["depth"]
+            if "nps" in updates:
+                self.info["nps"] = updates["nps"]
+
+            # If multipv was indicated, store per-line
+            if multipv_num is not None and moves:
+                line_data = {}
+                if score is not None:
+                    line_data["score"] = score
+                if mate_score is not None:
+                    line_data["mate"] = mate_score
+                else:
+                    line_data["mate"] = None
+                line_data["pv"] = moves
+                # Also store depth for that line
+                if "depth" in updates:
+                    line_data["depth"] = updates["depth"]
+                self.info.setdefault("lines", {})[multipv_num] = line_data
+                # Keep #1 as primary for eval bar / single-arrow compat
+                if multipv_num == 1:
+                    if score is not None:
+                        self.info["score"] = score
+                    if mate_score is not None:
+                        self.info["mate"] = mate_score
+                    else:
+                        # clear mate if this line is not mate (but keep None)
+                        if "mate" in self.info and mate_score is None and score is not None:
+                            # only clear if previous was mate but now cp
+                            self.info["mate"] = None
+                    self.info["pv"] = moves
+                return
+
+            # Fallback for non-multipv (single PV) lines
+            if score is not None:
+                self.info["score"] = score
+                if mate_score is not None:
+                    self.info["mate"] = mate_score
+                else:
+                    self.info["mate"] = None
+            elif mate_score is not None:
+                self.info["mate"] = mate_score
+            if moves:
+                self.info["pv"] = moves
+                # also keep lines[1] in sync for unified rendering
+                self.info.setdefault("lines", {})[1] = {"score": self.info.get("score", 0), "mate": self.info.get("mate"), "pv": moves}
 
     def quit(self):
         self.running = False
@@ -1913,10 +2034,10 @@ def scroll_theme_list(delta):
 
 
 # --- Engine Settings Page (Sliders) ---
-ENGINE_ROW_KEYS = ["threads", "skill", "hash", "depth"]
-ENGINE_ROW_LABELS = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash", "depth": "Depth Limit"}
-ENGINE_ROW_LIMITS = {"threads": (1, 1024), "skill": (0, 20), "hash": (16, 32768), "depth": (5, 40)}
-ENGINE_PARAM_NAMES = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash"}
+ENGINE_ROW_KEYS = ["threads", "skill", "hash", "depth", "multipv"]
+ENGINE_ROW_LABELS = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash", "depth": "Depth Limit", "multipv": "MultiPV"}
+ENGINE_ROW_LIMITS = {"threads": (1, 1024), "skill": (0, 20), "hash": (16, 32768), "depth": (5, 40), "multipv": (1, 5)}
+ENGINE_PARAM_NAMES = {"threads": "Threads", "skill": "Skill Level", "hash": "Hash", "multipv": "MultiPV"}
 HASH_STEPS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
 ENGINE_ROW_TOP = 120
@@ -1949,14 +2070,14 @@ def get_engine_slider_rects(i, offset_x=0, offset_y=0):
 
 def get_engine_reset_rect(offset_x=0, offset_y=0):
     reset_w, reset_h = 140, 40
-    reset_y = ENGINE_ROW_TOP + 4 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
+    reset_y = ENGINE_ROW_TOP + 5 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
     return pygame.Rect(
         WIDTH // 2 - 150 + offset_x, reset_y, reset_w, reset_h
     )
 
 def get_engine_save_rect(offset_x=0, offset_y=0):
     save_w, save_h = 140, 40
-    save_y = ENGINE_ROW_TOP + 4 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
+    save_y = ENGINE_ROW_TOP + 5 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
     return pygame.Rect(
         WIDTH // 2 + 10 + offset_x, save_y, save_w, save_h
     )
@@ -2607,26 +2728,56 @@ def draw_gui(
             pygame.draw.circle(screen, CAPTURE_MOVE_COLOR, (int(cx), int(cy)), radius)
         pygame.draw.circle(screen, (255, 255, 255, 200), (int(cx), int(cy)), radius, 2)
 
-    # Engine arrow — hidden once the game is over (target update, drawing is over pieces)
-    arrow_visible = False
-    arrow_is_knight = False
-    is_mate_arrow = mate is not None
-    if not game_over and pv and len(pv) > 0:
-        best_move = pv[0]
-        if best_move in board.legal_moves:
-            start_x, start_y = square_center(best_move.from_square)
-            end_x, end_y = square_center(best_move.to_square)
-            anim_mgr.set_arrow_target(
-                (start_x, start_y), (end_x, end_y), True
-            )
-            arrow_visible = True
-            piece = board.piece_at(best_move.from_square)
+    # Engine arrows — MultiPV support: multiple arrows with numbers (#1 best)
+    # Gather lines dict (multipv -> {pv, score, mate})
+    lines = {}
+    with engine_thread.lock:
+        # copy lines to avoid holding lock during board checks
+        _lines_copy = dict(engine_thread.info.get("lines", {}))
+        _pv_copy = list(engine_thread.info.get("pv", []))
+        _mate_copy = engine_thread.info.get("mate")
+        _score_copy = engine_thread.info.get("score", 0)
+    # Fallback if engine hasn't yet populated lines (older parsing or no info yet)
+    if not _lines_copy and _pv_copy:
+        _lines_copy = {1: {"pv": _pv_copy, "mate": _mate_copy, "score": _score_copy}}
+    # Build targets for animation manager
+    multipv_targets = {}
+    multipv_visible = False
+    if not game_over and _lines_copy:
+        for num in sorted(_lines_copy.keys()):
+            ldata = _lines_copy[num]
+            pv_moves = ldata.get("pv", [])
+            if not pv_moves:
+                continue
+            mv = pv_moves[0]
+            # Only display if move is legal in current position (engine may have stale line)
+            if mv not in board.legal_moves:
+                continue
+            start_x, start_y = square_center(mv.from_square)
+            end_x, end_y = square_center(mv.to_square)
+            is_knight = False
+            piece = board.piece_at(mv.from_square)
             if piece and piece.piece_type == chess.KNIGHT:
-                arrow_is_knight = True
-
-    if not arrow_visible or game_over:
+                is_knight = True
+            is_mate_line = ldata.get("mate") is not None
+            multipv_targets[num] = (start_x, start_y, end_x, end_y, is_knight, is_mate_line, True)
+            multipv_visible = True
+        # If we have at least one valid line, use multi-arrow system
+        if multipv_targets:
+            # translate to format expected by set_multipv_arrows: id -> (start,end,is_knight,is_mate,visible)
+            fmt_targets = {}
+            for aid, (sx, sy, ex, ey, ik, im, vis) in multipv_targets.items():
+                fmt_targets[aid] = ((sx, sy), (ex, ey), ik, im, vis)
+            anim_mgr.set_multipv_arrows(fmt_targets)
+            # also keep single-arrow for compat (fade out)
+            anim_mgr.set_arrow_target(None, None, False)
+        else:
+            anim_mgr.set_multipv_arrows({})
+            anim_mgr.set_arrow_target(None, None, False)
+    else:
+        anim_mgr.set_multipv_arrows({})
         anim_mgr.set_arrow_target(None, None, False)
-
+    # Legacy single-arrow fallback not needed when multipv active
     # Check/Checkmate glow, UNDER the pieces
     draw_check_effect_under(screen, check_effect, board_ox, BOARD_OY)
 
@@ -2721,33 +2872,93 @@ def draw_gui(
             curr_y = sy + (ey - sy) * t
             screen.blit(images[pkey], (curr_x, curr_y))
 
-    # Suggestion arrows — render OVER pieces (fixes knight L first-leg layering) — red pulse when mate
-    if (
-        arrow_visible
-        and anim_mgr.arrow_alpha > 1
-        and anim_mgr.arrow_start is not None
-        and anim_mgr.arrow_end is not None
-    ):
-        if arrow_is_knight:
-            draw_knight_arrow(
-                screen,
-                anim_mgr.arrow_start,
-                anim_mgr.arrow_end,
-                ENGINE_ARROW_COLOR,
-                7,
-                anim_mgr.arrow_alpha,
-                is_mate=is_mate_arrow,
-            )
-        else:
-            draw_arrow(
-                screen,
-                anim_mgr.arrow_start,
-                anim_mgr.arrow_end,
-                ENGINE_ARROW_COLOR,
-                7,
-                anim_mgr.arrow_alpha,
-                is_mate=is_mate_arrow,
-            )
+    # Suggestion arrows — MultiPV: render all with numbers #1 best. Falls back to single arrow.
+    def _multipv_colors(num, is_mate):
+        if is_mate:
+            return ARROW_MATE_START, ARROW_MATE_END
+        palette = {
+            1: (ARROW_GRAD_START, ARROW_GRAD_END),  # blue best
+            2: ((80, 200, 200), (0, 120, 120)),  # teal
+            3: ((180, 120, 255), (80, 0, 180)),  # purple
+            4: ((255, 180, 80), (210, 80, 0)),  # orange
+            5: ((120, 220, 120), (0, 120, 0)),  # green
+        }
+        return palette.get(num, palette[1])
+
+    # Prefer MultiPV arrows if any are active
+    has_multi = any(v.get("alpha", 0) > 1 and v.get("start") is not None for v in getattr(anim_mgr, "multi_arrows", {}).values())
+    if has_multi:
+        # Draw in reverse order so #1 is on top
+        for aid in sorted(anim_mgr.multi_arrows.keys(), reverse=True):
+            adata = anim_mgr.multi_arrows[aid]
+            if adata["alpha"] <= 1 or adata["start"] is None or adata["end"] is None:
+                continue
+            c_start, c_end = _multipv_colors(aid, adata.get("is_mate", False))
+            # temporarily override globals for gradient
+            # we pass colors via custom draw that uses gradient override — we monkey-patch globals briefly
+            # instead, we call draw with is_mate flag and custom palette handling inside draw_arrow?
+            # For simplicity, set globals to desired palette for this draw call
+            orig_start, orig_end = ARROW_GRAD_START, ARROW_GRAD_END
+            orig_mate_start, orig_mate_end = ARROW_MATE_START, ARROW_MATE_END
+            try:
+                # if this arrow is mate, it will use mate colors; otherwise use normal
+                # we override normal palette to multipv color
+                globals()["ARROW_GRAD_START"], globals()["ARROW_GRAD_END"] = c_start, c_end
+                # keep mate colors as is (or also override if is_mate)
+                if adata.get("is_knight"):
+                    draw_knight_arrow(screen, adata["start"], adata["end"], ENGINE_ARROW_COLOR, 7, adata["alpha"], is_mate=adata.get("is_mate", False))
+                else:
+                    draw_arrow(screen, adata["start"], adata["end"], ENGINE_ARROW_COLOR, 7, adata["alpha"], is_mate=adata.get("is_mate", False))
+            finally:
+                globals()["ARROW_GRAD_START"], globals()["ARROW_GRAD_END"] = orig_start, orig_end
+                globals()["ARROW_MATE_START"], globals()["ARROW_MATE_END"] = orig_mate_start, orig_mate_end
+            # Number badge at arrow origin (slightly offset)
+            bx, by = int(adata["start"].x), int(adata["start"].y)
+            # badge background
+            badge_r = 11
+            badge_col = (30, 30, 35, 230) if aid != 1 else (25, 60, 160, 240)
+            # outer glow for best
+            if aid == 1:
+                glow = pygame.Surface((badge_r*2+6, badge_r*2+6), pygame.SRCALPHA)
+                pygame.draw.circle(glow, (80, 140, 255, 80), (badge_r+3, badge_r+3), badge_r+3)
+                screen.blit(glow, (bx - badge_r -3, by - badge_r -3))
+            pygame.draw.circle(screen, (20,20,25), (bx, by), badge_r+1)
+            pygame.draw.circle(screen, badge_col[:3], (bx, by), badge_r)
+            pygame.draw.circle(screen, (220,220,240), (bx, by), badge_r, 1)
+            try:
+                pygame.gfxdraw.aacircle(screen, bx, by, badge_r, (220,220,240))
+            except Exception:
+                pass
+            num_txt = font_small.render(f"#{aid}", True, (255,255,255))
+            # use tiny font for badge to fit
+            if num_txt.get_width() > badge_r*2:
+                num_txt = font_tiny.render(f"#{aid}", True, (255,255,255))
+            screen.blit(num_txt, num_txt.get_rect(center=(bx, by)))
+    else:
+        # Fallback single arrow (when MultiPV=1 or engine hasn't sent multipv yet)
+        if (
+            getattr(anim_mgr, "arrow_alpha", 0) > 1
+            and getattr(anim_mgr, "arrow_start", None) is not None
+            and getattr(anim_mgr, "arrow_end", None) is not None
+        ):
+            # need to know if it's knight/mate for single arrow; we approximate via checking if any multi arrows not present
+            # For single arrow mode, we use stored mate status from best line
+            single_is_mate = mate is not None
+            # also check knight status: we can store last arrow knight flag in manager (fallback false)
+            single_is_knight = False
+            # Try to detect knight from current positions: if arrow targets were set for knight, we would have stored
+            # But single arrow path doesn't have that info, so we just check move piece type if we have pv
+            try:
+                if pv and pv[0] in board.legal_moves:
+                    p = board.piece_at(pv[0].from_square)
+                    if p and p.piece_type == chess.KNIGHT:
+                        single_is_knight = True
+            except Exception:
+                pass
+            if single_is_knight:
+                draw_knight_arrow(screen, anim_mgr.arrow_start, anim_mgr.arrow_end, ENGINE_ARROW_COLOR, 7, anim_mgr.arrow_alpha, is_mate=single_is_mate)
+            else:
+                draw_arrow(screen, anim_mgr.arrow_start, anim_mgr.arrow_end, ENGINE_ARROW_COLOR, 7, anim_mgr.arrow_alpha, is_mate=single_is_mate)
 
     # Check/Checkmate brackets, rings, and mate border, OVER the pieces
     draw_check_effect_over(screen, check_effect, board_ox, BOARD_OY)
@@ -2836,6 +3047,47 @@ def draw_gui(
         rec_value = font_small.render(best_move_str, True, TEXT_ACCENT)
         screen.blit(rec_label, (board_ox, rec_y))
         screen.blit(rec_value, (board_ox + rec_label.get_width() + 8, rec_y))
+        # MultiPV list: show #2..#N below rec move when MultiPV>1
+        try:
+            multipv_val = config.get("multipv", 1)
+            if multipv_val > 1 and not game_over:
+                with engine_thread.lock:
+                    lines_copy = dict(engine_thread.info.get("lines", {}))
+                # only show if we have more than 1 line
+                if len(lines_copy) > 1:
+                    # Colors matching arrows
+                    mp_colors = {
+                        2: (80, 200, 200),
+                        3: (180, 120, 255),
+                        4: (255, 180, 80),
+                        5: (120, 220, 120),
+                    }
+                    y_off = rec_y + 22
+                    for idx in range(2, min(multipv_val, 5) + 1):
+                        ldata = lines_copy.get(idx)
+                        if not ldata or not ldata.get("pv"):
+                            continue
+                        mv_str = str(ldata["pv"][0])
+                        # eval string
+                        if ldata.get("mate") is not None:
+                            ev_str = f"M{ldata['mate']}"
+                        elif ldata.get("score") is not None:
+                            ev_str = f"{ldata['score']/100.0:+.2f}"
+                        else:
+                            ev_str = ""
+                        # badge #N
+                        badge_txt = font_tiny.render(f"#{idx}", True, mp_colors.get(idx, TEXT_MUTED))
+                        move_txt = font_tiny.render(mv_str, True, TEXT_COLOR)
+                        eval_txt = font_tiny.render(ev_str, True, TEXT_MUTED)
+                        bx = board_ox + (idx-2)*130
+                        # prevent overflow
+                        if bx + 120 > board_ox + BOARD_WIDTH:
+                            break
+                        screen.blit(badge_txt, (bx, y_off))
+                        screen.blit(move_txt, (bx + badge_txt.get_width() + 6, y_off))
+                        screen.blit(eval_txt, (bx + badge_txt.get_width() + 6 + move_txt.get_width() + 6, y_off))
+        except Exception:
+            pass
 
     # Buttons (top bar) + flip + confirmation + menu overlay
     draw_new_game_button(screen, mouse_pos)
