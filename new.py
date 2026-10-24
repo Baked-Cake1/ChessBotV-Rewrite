@@ -1189,7 +1189,7 @@ def format_nps(nps):
         return str(nps)
 
 
-def draw_arrow(screen, start_pos, end_pos, color, width=8, alpha=255):
+def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     start = pygame.Vector2(start_pos)
     end = pygame.Vector2(end_pos)
 
@@ -1257,7 +1257,7 @@ def _get_knight_corner(start_pos, end_pos):
         return pygame.Vector2(start.x, end.y)
 
 
-def draw_knight_arrow(screen, start_pos, end_pos, color, width=8, alpha=255):
+def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     """L-shaped arrow for knight moves: start -> corner -> end with arrowhead."""
     start = pygame.Vector2(start_pos)
     end = pygame.Vector2(end_pos)
@@ -2266,7 +2266,7 @@ def draw_gui(
                 anim_mgr.arrow_start,
                 anim_mgr.arrow_end,
                 ENGINE_ARROW_COLOR,
-                8,
+                7,
                 anim_mgr.arrow_alpha,
             )
         else:
@@ -2275,7 +2275,7 @@ def draw_gui(
                 anim_mgr.arrow_start,
                 anim_mgr.arrow_end,
                 ENGINE_ARROW_COLOR,
-                8,
+                7,
                 anim_mgr.arrow_alpha,
             )
 
