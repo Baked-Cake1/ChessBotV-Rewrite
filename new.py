@@ -36,6 +36,9 @@ HIGHLIGHT_COLOR = (205, 210, 106, 150)
 LEGAL_MOVE_COLOR = (0, 255, 0, 100)
 CAPTURE_MOVE_COLOR = (255, 0, 0, 120)
 ENGINE_ARROW_COLOR = (0, 100, 255, 180)
+# Gradient arrow colours (blue range) — used for suggestion arrows with 0.4 opacity
+ARROW_GRAD_START = (95, 170, 255)
+ARROW_GRAD_END = (0, 70, 210)
 BG_COLOR = (40, 40, 40)
 TEXT_COLOR = (220, 220, 220)
 TEXT_MUTED = (150, 150, 150)
@@ -199,6 +202,26 @@ def load_images(theme="classic"):
     return images
 
 
+def get_preview_images(theme):
+    """Return 28x28 preview surfaces for theme, cached."""
+    if theme in _theme_preview_cache:
+        return _theme_preview_cache[theme]
+    pieces = ["bb", "bn", "br", "bk", "bq", "bp", "wb", "wn", "wr", "wk", "wq", "wp"]
+    piece_dir = get_piece_dir(theme)
+    prev = {}
+    for p in pieces:
+        path = os.path.join(piece_dir, f"{p}.png")
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            prev[p] = pygame.transform.smoothscale(img, (28, 28))
+        except FileNotFoundError:
+            surf = pygame.Surface((28, 28), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 0, 0) if p.startswith("b") else (0, 255, 0), (14, 14), 9)
+            prev[p] = surf
+    _theme_preview_cache[theme] = prev
+    return prev
+
+
 # Board theme state
 current_theme = "classic"
 available_themes = get_available_themes()
@@ -206,13 +229,19 @@ if available_themes and all(t[0] != current_theme for t in available_themes):
     # Default theme folder missing -> use the first theme found on disk.
     current_theme = available_themes[0][0]
 
-# Board theme menu layout & scrolling
-THEME_LIST_TOP = 120
-THEME_ITEM_HEIGHT = 50
-THEME_ITEM_GAP = 20
+# Pieces Style (board theme) menu layout & scrolling — compact 2-column + preview
+THEME_PREVIEW_H = 92
+THEME_PREVIEW_Y = 88
+THEME_LIST_TOP = 190
+THEME_ITEM_HEIGHT = 36
+THEME_ITEM_GAP = 8
+THEME_ITEM_WIDTH = 190
+THEME_COL_GAP = 12
 THEME_LIST_BOTTOM = HEIGHT - 44
 theme_scroll_offset = 0.0
 theme_scroll_speed = 70.0
+# cache for preview images (theme_id -> {piece_key: surface 28x28})
+_theme_preview_cache = {}
 
 # Settings menu state
 settings_menu_state = "main"
@@ -350,7 +379,8 @@ class AnimationManager:
 
         self.arrow_target_start = new_start
         self.arrow_target_end = new_end
-        self.arrow_target_alpha = 255.0
+        # 0.4 opacity so arrow doesn't disrupt board
+        self.arrow_target_alpha = 255 * 0.4
 
     def add_move(
         self,
@@ -1001,6 +1031,9 @@ def get_piece_key(piece):
 
 def update_opening_name(board):
     global current_opening_name
+    # Hide opening if no moves have been made (avoid "Unknown Opening" at start)
+    if len(board.move_stack) == 0:
+        return ""
     fen_placement = board.fen().split(" ")[0]
     opening_name = openings.get(fen_placement)
 
@@ -1010,6 +1043,11 @@ def update_opening_name(board):
         current_opening_name = "Unknown Opening"
 
     return current_opening_name
+
+
+def reset_opening():
+    global current_opening_name
+    current_opening_name = ""
 
 
 def get_legal_squares(board, selected_sq):
@@ -1189,6 +1227,14 @@ def format_nps(nps):
         return str(nps)
 
 
+def _lerp_color(c1, c2, t):
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
+
+
 def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     start = pygame.Vector2(start_pos)
     end = pygame.Vector2(end_pos)
@@ -1211,16 +1257,12 @@ def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     point2 = end - v_unit * head_length + perp
     point3 = end - v_unit * head_length - perp
 
-    if alpha >= 254:
-        rgb = color[:3]
-        pygame.draw.line(screen, rgb, start, neck, width)
-        pygame.draw.polygon(screen, rgb, [point1, point2, point3])
-        return
-
     a = max(0, min(255, int(alpha)))
     if a <= 1:
         return
 
+    # 0.4 transparency already via alpha, keep as is
+    # Gradient shaft: interpolate from ARROW_GRAD_START to ARROW_GRAD_END
     xs = (start.x, end.x, point1.x, point2.x, point3.x)
     ys = (start.y, end.y, point1.y, point2.y, point3.y)
     pad = width + 4
@@ -1232,12 +1274,24 @@ def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     h = max(1, max_y - min_y)
 
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
-    rgba = (color[0], color[1], color[2], a)
     offset = pygame.Vector2(min_x, min_y)
 
-    pygame.draw.line(surf, rgba, start - offset, neck - offset, width)
+    # Draw gradient shaft as many small segments
+    segs = 20
+    for i in range(segs):
+        t0 = i / segs
+        t1 = (i + 1) / segs
+        c = _lerp_color(ARROW_GRAD_START, ARROW_GRAD_END, t0)
+        rgba = (c[0], c[1], c[2], a)
+        p0 = start + (neck - start) * t0
+        p1 = start + (neck - start) * t1
+        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, width)
+
+    # Arrow head in solid end colour
+    head_c = ARROW_GRAD_END
+    head_rgba = (head_c[0], head_c[1], head_c[2], a)
     pygame.draw.polygon(
-        surf, rgba, [point1 - offset, point2 - offset, point3 - offset]
+        surf, head_rgba, [point1 - offset, point2 - offset, point3 - offset]
     )
     screen.blit(surf, (min_x, min_y))
 
@@ -1279,14 +1333,6 @@ def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     point2 = end - v_unit * head_length + perp
     point3 = end - v_unit * head_length - perp
 
-    if alpha >= 254:
-        rgb = color[:3]
-        # Two straight segments forming the L
-        pygame.draw.line(screen, rgb, start, corner, width)
-        pygame.draw.line(screen, rgb, corner, neck, width)
-        pygame.draw.polygon(screen, rgb, [point1, point2, point3])
-        return
-
     a = max(0, min(255, int(alpha)))
     if a <= 1:
         return
@@ -1302,12 +1348,35 @@ def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255):
     h = max(1, max_y - min_y)
 
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
-    rgba = (color[0], color[1], color[2], a)
     offset = pygame.Vector2(min_x, min_y)
 
-    pygame.draw.line(surf, rgba, start - offset, corner - offset, width)
-    pygame.draw.line(surf, rgba, corner - offset, neck - offset, width)
-    pygame.draw.polygon(surf, rgba, [point1 - offset, point2 - offset, point3 - offset])
+    # Gradient across entire L shape (start->corner->neck)
+    # Compute total length for proper t distribution
+    len1 = (corner - start).length()
+    len2 = (neck - corner).length()
+    total = max(1, len1 + len2)
+    segs = 24
+    for i in range(segs):
+        t0 = i / segs
+        t1 = (i + 1) / segs
+        # Map t to segment on L
+        def point_at(t):
+            if t * total <= len1:
+                # on first leg
+                seg_t = (t * total) / max(1, len1)
+                return start + (corner - start) * seg_t
+            else:
+                seg_t = (t * total - len1) / max(1, len2)
+                return corner + (neck - corner) * seg_t
+        p0 = point_at(t0)
+        p1 = point_at(t1)
+        c = _lerp_color(ARROW_GRAD_START, ARROW_GRAD_END, t0)
+        rgba = (c[0], c[1], c[2], a)
+        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, width)
+
+    head_c = ARROW_GRAD_END
+    head_rgba = (head_c[0], head_c[1], head_c[2], a)
+    pygame.draw.polygon(surf, head_rgba, [point1 - offset, point2 - offset, point3 - offset])
     screen.blit(surf, (min_x, min_y))
 
 
@@ -1546,30 +1615,84 @@ def draw_board_theme_content(screen, offset_x=0):
     mx, my = pygame.mouse.get_pos()
     themes = get_available_themes()
 
-    item_height = THEME_ITEM_HEIGHT
+    # --- Preview panel (reserved section) ---
+    preview_rect = pygame.Rect(WIDTH // 2 - 200 + offset_x, THEME_PREVIEW_Y, 400, THEME_PREVIEW_H)
+    pygame.draw.rect(screen, (45, 45, 50), preview_rect, border_radius=8)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, preview_rect, 2, border_radius=8)
+
+    # Determine hovered theme for preview
+    # Need to compute grid to know hover, but we can first do quick hover check using same grid logic
+    # For preview we need to know hovered theme; we'll compute after we know layout, but preview should be drawn first
+    # So temporarily find hovered by scanning with current scroll (compact grid)
+    item_h = THEME_ITEM_HEIGHT
     gap = THEME_ITEM_GAP
     top = THEME_LIST_TOP
+    cols = 2
+    rows = (len(themes) + cols - 1) // cols
     viewport_h = THEME_LIST_BOTTOM - top
-    total_h = max(1, len(themes) * item_height + (len(themes) - 1) * gap)
+    total_h = max(1, rows * item_h + max(0, rows - 1) * gap)
     max_scroll = max(0, total_h - viewport_h)
     theme_scroll_offset = max(0.0, min(theme_scroll_offset, max_scroll))
-
     viewport = pygame.Rect(WIDTH // 2 - 200 + offset_x, top, 400, viewport_h)
 
+    hovered_theme = None
+    hovered_display = None
+    for i, (tid, dname) in enumerate(themes):
+        row = i // cols
+        col = i % cols
+        x = viewport.x + col * (THEME_ITEM_WIDTH + THEME_COL_GAP)
+        y = top + row * (item_h + gap) - int(theme_scroll_offset)
+        r = pygame.Rect(x, y, THEME_ITEM_WIDTH, item_h)
+        if viewport.collidepoint(mx, my) and r.collidepoint(mx, my) and menu_transition_direction == "none":
+            hovered_theme = tid
+            hovered_display = dname
+            break
+
+    preview_theme = hovered_theme if hovered_theme is not None else current_theme
+    preview_display = hovered_display if hovered_display is not None else next((d for tid, d in themes if tid == current_theme), current_theme)
+    # Title in preview
+    title_s = font_tiny.render("Preview — Hover a style to see pieces", True, TEXT_MUTED)
+    screen.blit(title_s, (preview_rect.centerx - title_s.get_width() // 2, preview_rect.y + 6))
+    name_s = font_small.render(preview_display, True, TEXT_ACCENT if hovered_theme else TEXT_COLOR)
+    screen.blit(name_s, (preview_rect.centerx - name_s.get_width() // 2, preview_rect.y + 22))
+    # Draw 12 pieces in 2 rows of 6
+    prev_imgs = get_preview_images(preview_theme)
+    # order: white K Q R B N P / black K Q R B N P
+    order = ["wk", "wq", "wr", "wb", "wn", "wp", "bk", "bq", "br", "bb", "bn", "bp"]
+    # Layout
+    piece_sz = 28
+    gap_px = 6
+    per_row = 6
+    row_w = per_row * piece_sz + (per_row - 1) * gap_px
+    start_x = preview_rect.centerx - row_w // 2
+    for idx, pkey in enumerate(order):
+        row = idx // per_row
+        col = idx % per_row
+        px = start_x + col * (piece_sz + gap_px)
+        py = preview_rect.y + 44 + row * (piece_sz + gap_px)
+        # small square bg for each piece
+        bg = (60, 60, 60) if (row + col) % 2 == 0 else (70, 70, 70)
+        # alternate light/dark like board for preview
+        pygame.draw.rect(screen, bg, (px, py, piece_sz, piece_sz), border_radius=3)
+        pygame.draw.rect(screen, (90, 90, 90), (px, py, piece_sz, piece_sz), 1, border_radius=3)
+        if pkey in prev_imgs:
+            screen.blit(prev_imgs[pkey], (px, py))
+
+    # --- Compact 2-column grid ---
     screen.set_clip(viewport)
     for i, (theme_id, display_name) in enumerate(themes):
-        theme_rect = pygame.Rect(
-            viewport.x,
-            top + i * (item_height + gap) - int(theme_scroll_offset),
-            400,
-            item_height,
-        )
+        row = i // cols
+        col = i % cols
+        x = viewport.x + col * (THEME_ITEM_WIDTH + THEME_COL_GAP)
+        y = top + row * (item_h + gap) - int(theme_scroll_offset)
+        theme_rect = pygame.Rect(x, y, THEME_ITEM_WIDTH, item_h)
         if theme_rect.bottom < top or theme_rect.top > top + viewport_h:
             continue
 
         is_current = theme_id == current_theme
         is_hovered = (
             theme_rect.collidepoint(mx, my)
+            and viewport.collidepoint(mx, my)
             and menu_transition_direction == "none"
         )
 
@@ -1583,13 +1706,15 @@ def draw_board_theme_content(screen, offset_x=0):
                 bg_color = (80, 80, 80)
 
         pygame.draw.rect(screen, bg_color, theme_rect, border_radius=4)
-        pygame.draw.rect(
-            screen, MENU_BORDER_COLOR, theme_rect, 2, border_radius=4
-        )
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, theme_rect, 1, border_radius=4)
 
-        theme_text = font_large.render(display_name, True, TEXT_COLOR)
+        # Use small font for compact
+        theme_text = font_small.render(display_name, True, TEXT_COLOR)
         theme_text_rect = theme_text.get_rect(center=theme_rect.center)
         screen.blit(theme_text, theme_text_rect)
+        # current indicator dot
+        if is_current:
+            pygame.draw.circle(screen, (120, 200, 120), (theme_rect.right - 10, theme_rect.centery), 4)
     screen.set_clip(None)
 
     # Scrollbar + hint (only when the list overflows the viewport)
@@ -1607,7 +1732,7 @@ def draw_board_theme_content(screen, offset_x=0):
             border_radius=2,
         )
 
-        hint = font_tiny.render("Scroll for more themes", True, TEXT_MUTED)
+        hint = font_tiny.render("Scroll for more styles", True, TEXT_MUTED)
         screen.blit(
             hint, (WIDTH // 2 - hint.get_width() // 2, THEME_LIST_BOTTOM + 6)
         )
@@ -1617,7 +1742,9 @@ def scroll_theme_list(delta):
     """Scroll the board theme list (positive delta scrolls towards the end)."""
     global theme_scroll_offset
     themes = get_available_themes()
-    total_h = len(themes) * THEME_ITEM_HEIGHT + (len(themes) - 1) * THEME_ITEM_GAP
+    cols = 2
+    rows = (len(themes) + cols - 1) // cols
+    total_h = rows * THEME_ITEM_HEIGHT + max(0, rows - 1) * THEME_ITEM_GAP
     viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
     max_scroll = max(0, total_h - viewport_h)
     theme_scroll_offset = max(0.0, min(theme_scroll_offset + delta, max_scroll))
@@ -1801,7 +1928,7 @@ def draw_settings_menu(screen):
 
     page_titles = {
         "main": "Settings",
-        "board_theme": "Board Theme",
+        "board_theme": "Pieces Style",
         "engine_settings": "Engine Settings",
     }
     title_text = font_large.render(
@@ -1842,7 +1969,7 @@ def draw_settings_menu(screen):
     if settings_menu_state == "main":
         menu_items = [
             "Engine Settings",
-            "Board Theme",
+            "Pieces Style",
             "Sound Settings",
             "Game Controls",
             "Analysis Settings",
@@ -1860,7 +1987,7 @@ def draw_settings_menu(screen):
                 item_height,
             )
 
-            is_interactive = item in ("Board Theme", "Engine Settings")
+            is_interactive = item in ("Pieces Style", "Engine Settings")
             is_hovered = (
                 is_interactive
                 and transition_idle
@@ -1948,13 +2075,13 @@ def handle_menu_click(mx, my):
         viewport = pygame.Rect(
             WIDTH // 2 - 200, top, 400, THEME_LIST_BOTTOM - top
         )
+        cols = 2
         for i, (theme_id, _display) in enumerate(themes):
-            theme_rect = pygame.Rect(
-                WIDTH // 2 - 200,
-                top + i * (item_height + gap) - int(theme_scroll_offset),
-                400,
-                item_height,
-            )
+            row = i // cols
+            col = i % cols
+            x = WIDTH // 2 - 200 + col * (THEME_ITEM_WIDTH + THEME_COL_GAP)
+            y = top + row * (item_height + gap) - int(theme_scroll_offset)
+            theme_rect = pygame.Rect(x, y, THEME_ITEM_WIDTH, item_height)
             if (
                 viewport.collidepoint(mx, my)
                 and theme_rect.collidepoint(mx, my)
@@ -1980,7 +2107,7 @@ def handle_menu_click(mx, my):
     elif settings_menu_state == "main":
         menu_items = [
             "Engine Settings",
-            "Board Theme",
+            "Pieces Style",
             "Sound Settings",
             "Game Controls",
             "Analysis Settings",
@@ -1997,7 +2124,7 @@ def handle_menu_click(mx, my):
                 item_height,
             )
             if item_rect.collidepoint(mx, my):
-                if item == "Board Theme":
+                if item == "Pieces Style":
                     theme_scroll_offset = 0.0
                     settings_menu_target = "board_theme"
                     menu_transition_direction = "left_out"
@@ -2307,11 +2434,11 @@ def draw_gui(
         sx = BOARD_OX + (BOARD_WIDTH - status_surf.get_width()) // 2
         screen.blit(status_surf, (sx, info_top + 8))
     else:
-        # Show opening name on left; "Check!" on right when applicable
-        opening_text = font_large.render(
-            update_opening_name(board), True, TEXT_COLOR
-        )
-        screen.blit(opening_text, (BOARD_OX, info_top + 8))
+        # Show opening name on left; hidden if no moves (avoid Unknown Opening)
+        opening_name = update_opening_name(board)
+        if opening_name:
+            opening_text = font_large.render(opening_name, True, TEXT_COLOR)
+            screen.blit(opening_text, (BOARD_OX, info_top + 8))
 
         if status_text:
             status_surf = font_large.render(status_text, True, status_color)
@@ -2357,12 +2484,12 @@ def draw_gui(
     # Bottom row: rec move during play, opening name once game is over
     rec_y = info_top + 88
     if game_over:
-        rec_label = font_small.render("Opening", True, TEXT_MUTED)
-        rec_value = font_small.render(
-            update_opening_name(board), True, TEXT_COLOR
-        )
-        screen.blit(rec_label, (BOARD_OX, rec_y))
-        screen.blit(rec_value, (BOARD_OX + rec_label.get_width() + 8, rec_y))
+        opening_name_go = update_opening_name(board)
+        if opening_name_go:
+            rec_label = font_small.render("Opening", True, TEXT_MUTED)
+            rec_value = font_small.render(opening_name_go, True, TEXT_COLOR)
+            screen.blit(rec_label, (BOARD_OX, rec_y))
+            screen.blit(rec_value, (BOARD_OX + rec_label.get_width() + 8, rec_y))
     else:
         best_move_str = str(pv[0]) if pv else "—"
         rec_label = font_small.render("Rec. Move", True, TEXT_MUTED)
@@ -2463,6 +2590,7 @@ def main():
                         new_board = chess.Board()
                         anim_mgr.add_board_reset(old_board, new_board)
                         board.reset()
+                        reset_opening()
                         selected_sq = None
                         dragging = False
                         drag_sq = None
