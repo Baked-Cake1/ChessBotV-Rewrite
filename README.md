@@ -27,7 +27,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 
 ### Visuals
 - **Lichess-style eval bar** with gradient fill, tick marks (0.25/0.5/0.75), `W/B` labels and glowing marker
-- **Engine suggestion arrows render over pieces:** blue, width 8, fades/morphs smoothly; **L-shaped for knight moves** (long-leg first, correct overlay layering)
+- **Engine suggestion arrows render over pieces:** blue, width 7, fades/morphs smoothly; **L-shaped for knight moves** (long-leg first, correct overlay layering)
 - **Check / Checkmate FX:**
   - Under: soft radial red glow
   - Over: corner brackets, expanding ripple rings, pulsing red border on mate
