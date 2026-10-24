@@ -666,7 +666,7 @@ def update_menu_animation():
 
 
 # --- Stockfish Threading ---
-ANALYSIS_DEPTH = 15
+ANALYSIS_DEPTH = 25
 
 
 class EngineThread:
@@ -810,7 +810,7 @@ class EngineThread:
                 # This exact position was already searched to full depth.
                 # Keep the final depth/nps/score on screen and idle until a
                 # move changes the position - re-searching the same position
-                # made depth climb to 15, drop back to 1 and climb again in
+                # made depth climb to 25, drop back to 1 and climb again in
                 # an endless sawtooth.
                 time.sleep(0.1)
                 continue
