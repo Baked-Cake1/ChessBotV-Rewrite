@@ -14,12 +14,20 @@ if errorlevel 1 (
 )
 
 REM Run main Python script with any command line arguments passed through
+:launch
 echo Initalizing launcher...
 echo Launching ChessBotV Rewrite...
 echo.
 python new.py %*
 
 set PYTHON_EXIT_CODE=%errorlevel%
+
+REM Restart handling (code 42 from in-app Restart button)
+if %PYTHON_EXIT_CODE%==42 (
+    echo Restarting ChessBotV Rewrite...
+    timeout /t 1 >nul
+    goto launch
+)
 
 REM Automatically close when UI closes normally; keep open on error so crash details remain visible
 if %PYTHON_EXIT_CODE% equ 0 (
