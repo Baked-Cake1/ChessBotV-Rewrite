@@ -961,6 +961,86 @@ def get_legal_squares(board, selected_sq):
     return regular_moves, capture_moves
 
 
+# --- Drag & Click Helpers ---
+def get_square_from_pos(pos):
+    """Return chess square for a mouse pos inside the board, else None."""
+    mx, my = pos
+    if not (BOARD_OX <= mx < BOARD_OX + BOARD_WIDTH and BOARD_OY <= my < BOARD_OY + BOARD_WIDTH):
+        return None
+    file = (mx - BOARD_OX) // SQUARE_SIZE
+    rank = 7 - ((my - BOARD_OY) // SQUARE_SIZE)
+    return chess.square(file, rank)
+
+
+def build_move_with_promotion(board, from_sq, to_sq):
+    """Create a Move handling pawn promotion to queen."""
+    move = chess.Move(from_sq, to_sq)
+    piece = board.piece_at(from_sq)
+    if piece and piece.piece_type == chess.PAWN:
+        if chess.square_rank(to_sq) == 0 or chess.square_rank(to_sq) == 7:
+            move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
+    return move
+
+
+def get_castling_info(board, from_sq, to_sq):
+    """Return (is_castling, rook_start, rook_target, rook_piece) for a king move."""
+    piece = board.piece_at(from_sq)
+    if not piece or piece.piece_type != chess.KING:
+        return False, None, None, None
+    if (from_sq == chess.E1 and to_sq == chess.G1) or (from_sq == chess.E8 and to_sq == chess.G8):
+        rook_start = chess.H1 if from_sq == chess.E1 else chess.H8
+        rook_target = chess.F1 if from_sq == chess.E1 else chess.F8
+        return True, rook_start, rook_target, board.piece_at(rook_start)
+    if (from_sq == chess.E1 and to_sq == chess.C1) or (from_sq == chess.E8 and to_sq == chess.C8):
+        rook_start = chess.A1 if from_sq == chess.E1 else chess.A8
+        rook_target = chess.D1 if from_sq == chess.E1 else chess.D8
+        return True, rook_start, rook_target, board.piece_at(rook_start)
+    return False, None, None, None
+
+
+def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=True):
+    """Attempt to push from_sq->to_sq (with promotion/castling/capture).
+    Returns True if the move was legal and executed."""
+    move = build_move_with_promotion(board, from_sq, to_sq)
+    if move not in board.legal_moves:
+        return False
+
+    is_castling, rook_start_sq, rook_target_sq, rook_piece = get_castling_info(board, from_sq, to_sq)
+
+    captured_piece = board.piece_at(to_sq)
+    # Handle en-passant capture (destination empty but diagonal pawn move)
+    if not captured_piece:
+        piece = board.piece_at(from_sq)
+        if piece and piece.piece_type == chess.PAWN:
+            if chess.square_file(from_sq) != chess.square_file(to_sq):
+                # en passant square is behind the destination on the same rank as mover
+                ep_sq = chess.square(chess.square_file(to_sq), chess.square_rank(from_sq))
+                ep_piece = board.piece_at(ep_sq)
+                if ep_piece and ep_piece.piece_type == chess.PAWN:
+                    captured_piece = ep_piece
+                    # Animate capture at the captured pawn's square
+                    anim_mgr.add_capture(captured_piece, ep_sq)
+                    captured_piece = None  # already handled
+
+    if captured_piece:
+        anim_mgr.add_capture(captured_piece, to_sq)
+
+    if animate:
+        anim_mgr.add_move(
+            board.piece_at(from_sq),
+            from_sq,
+            to_sq,
+            is_castling,
+            rook_start_sq,
+            rook_target_sq,
+            rook_piece,
+        )
+
+    board.push(move)
+    engine_thread.update_position(board)
+    return True
+
+
 def format_nps(nps):
     if nps >= 1000000000000:
         return f"{nps / 1000000000000:.1f}T"
@@ -1720,7 +1800,8 @@ def handle_menu_click(mx, my):
 
 
 def draw_gui(
-    screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos
+    screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos,
+    drag_sq=None, drag_offset=None, dragging=False
 ):
     screen.fill(BG_COLOR)
 
@@ -1871,12 +1952,34 @@ def draw_gui(
             ):
                 continue
 
+            # Hide the piece being dragged so it doesn't appear doubled
+            if dragging and sq == drag_sq:
+                continue
+
             if piece:
                 pkey = get_piece_key(piece)
                 x = BOARD_OX + f * SQUARE_SIZE
                 y = BOARD_OY + r * SQUARE_SIZE
                 if pkey in images:
                     screen.blit(images[pkey], (x, y))
+
+    # 3b. Drag highlight for drop square
+    if dragging and drag_sq is not None:
+        drop_sq = get_square_from_pos(mouse_pos)
+        if drop_sq is not None and drop_sq != drag_sq:
+            tmp_move = build_move_with_promotion(board, drag_sq, drop_sq)
+            if tmp_move in board.legal_moves:
+                df = chess.square_file(drop_sq)
+                dr = chess.square_rank(drop_sq)
+                hl_rect = pygame.Rect(
+                    BOARD_OX + df * SQUARE_SIZE,
+                    BOARD_OY + (7 - dr) * SQUARE_SIZE,
+                    SQUARE_SIZE,
+                    SQUARE_SIZE,
+                )
+                s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+                s.fill((255, 255, 100, 80))
+                screen.blit(s, hl_rect.topleft)
 
     # 4. Capture animations
     for anim in anim_mgr.capture_anims:
@@ -1916,6 +2019,18 @@ def draw_gui(
 
     # Check/Checkmate brackets, rings, and mate border, OVER the pieces
     draw_check_effect_over(screen, check_effect, BOARD_OX, BOARD_OY)
+
+    # 5b. Dragged piece — follows cursor on top of everything
+    if dragging and drag_sq is not None and drag_offset is not None:
+        piece = board.piece_at(drag_sq)
+        if piece:
+            pkey = get_piece_key(piece)
+            if pkey in images:
+                mx, my = mouse_pos
+                ox, oy = drag_offset
+                draw_x = mx - ox
+                draw_y = my - oy
+                screen.blit(images[pkey], (draw_x, draw_y))
 
     # 6. Info panel
     info_top = BOARD_OY + BOARD_WIDTH
@@ -2010,6 +2125,10 @@ def main():
     engine_thread = EngineThread(ENGINE_PATH, config)
 
     selected_sq = None
+    # Drag state — dragging is alternative to click-then-click
+    dragging = False
+    drag_sq = None
+    drag_offset = None
     running = True
 
     while running:
@@ -2043,6 +2162,9 @@ def main():
                     if new_game_button_rect.collidepoint(mx, my):
                         board.reset()
                         selected_sq = None
+                        dragging = False
+                        drag_sq = None
+                        drag_offset = None
                         anim_mgr.move_anim = None
                         anim_mgr.rook_anim = None
                         anim_mgr.capture_anims = []
@@ -2057,108 +2179,57 @@ def main():
 
                     elif not (anim_mgr.move_anim or anim_mgr.rook_anim):
                         if not board.is_game_over(claim_draw=True):
-                            if (
-                                BOARD_OX <= mx < BOARD_OX + BOARD_WIDTH
-                                and BOARD_OY <= my < BOARD_OY + BOARD_WIDTH
-                            ):
-                                file = (mx - BOARD_OX) // SQUARE_SIZE
-                                rank = 7 - ((my - BOARD_OY) // SQUARE_SIZE)
-                                sq = chess.square(file, rank)
-
-                                if selected_sq is None:
-                                    if (
-                                        board.piece_at(sq)
-                                        and board.piece_at(sq).color == board.turn
-                                    ):
-                                        selected_sq = sq
+                            sq = get_square_from_pos(event.pos)
+                            if sq is not None:
+                                piece = board.piece_at(sq)
+                                if piece and piece.color == board.turn:
+                                    # Click on own piece — select it and begin drag
+                                    selected_sq = sq
+                                    dragging = True
+                                    drag_sq = sq
+                                    drag_offset = (
+                                        mx - (BOARD_OX + chess.square_file(sq) * SQUARE_SIZE),
+                                        my - (BOARD_OY + (7 - chess.square_rank(sq)) * SQUARE_SIZE),
+                                    )
                                 else:
-                                    move = chess.Move(selected_sq, sq)
-                                    if (
-                                        board.piece_at(selected_sq)
-                                        and board.piece_at(selected_sq).piece_type
-                                        == chess.PAWN
-                                    ):
-                                        if (
-                                            chess.square_rank(sq) == 0
-                                            or chess.square_rank(sq) == 7
-                                        ):
-                                            move = chess.Move(
-                                                selected_sq, sq, promotion=chess.QUEEN
-                                            )
-
-                                    if move in board.legal_moves:
-                                        is_castling = False
-                                        rook_start_sq = None
-                                        rook_target_sq = None
-                                        rook_piece = None
-
-                                        if (
-                                            board.piece_at(selected_sq)
-                                            and board.piece_at(selected_sq).piece_type
-                                            == chess.KING
-                                        ):
-                                            if (
-                                                selected_sq == chess.E1 and sq == chess.G1
-                                            ) or (
-                                                selected_sq == chess.E8 and sq == chess.G8
-                                            ):
-                                                is_castling = True
-                                                rook_start_sq = (
-                                                    chess.H1
-                                                    if selected_sq == chess.E1
-                                                    else chess.H8
-                                                )
-                                                rook_target_sq = (
-                                                    chess.F1
-                                                    if selected_sq == chess.E1
-                                                    else chess.F8
-                                                )
-                                                rook_piece = board.piece_at(rook_start_sq)
-                                            elif (
-                                                selected_sq == chess.E1 and sq == chess.C1
-                                            ) or (
-                                                selected_sq == chess.E8 and sq == chess.C8
-                                            ):
-                                                is_castling = True
-                                                rook_start_sq = (
-                                                    chess.A1
-                                                    if selected_sq == chess.E1
-                                                    else chess.A8
-                                                )
-                                                rook_target_sq = (
-                                                    chess.D1
-                                                    if selected_sq == chess.E1
-                                                    else chess.D8
-                                                )
-                                                rook_piece = board.piece_at(rook_start_sq)
-
-                                        captured_piece = board.piece_at(sq)
-                                        if captured_piece:
-                                            anim_mgr.add_capture(captured_piece, sq)
-
-                                        anim_mgr.add_move(
-                                            board.piece_at(selected_sq),
-                                            selected_sq,
-                                            sq,
-                                            is_castling,
-                                            rook_start_sq,
-                                            rook_target_sq,
-                                            rook_piece,
-                                        )
-
-                                        board.push(move)
-                                        engine_thread.update_position(board)
-                                        selected_sq = None
-                                    else:
-                                        if (
-                                            board.piece_at(sq)
-                                            and board.piece_at(sq).color == board.turn
-                                        ):
-                                            selected_sq = sq
-                                        else:
+                                    # Click on empty/enemy — try click-to-move from selected_sq
+                                    if selected_sq is not None:
+                                        if try_execute_move(board, anim_mgr, engine_thread, selected_sq, sq, animate=True):
                                             selected_sq = None
+                                        else:
+                                            if piece and piece.color == board.turn:
+                                                selected_sq = sq
+                                            else:
+                                                selected_sq = None
+                                        dragging = False
+                                        drag_sq = None
+                                        drag_offset = None
                 else:
                     handle_menu_click(mx, my)
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                mx, my = event.pos
+                menu_active = (
+                    menu_anim_progress > 0
+                    or menu_anim_opening
+                    or menu_anim_closing
+                )
+                if dragging and not menu_active and not (anim_mgr.move_anim or anim_mgr.rook_anim):
+                    drop_sq = get_square_from_pos(event.pos)
+                    if drop_sq is not None and drag_sq is not None and drop_sq != drag_sq:
+                        if try_execute_move(board, anim_mgr, engine_thread, drag_sq, drop_sq, animate=False):
+                            selected_sq = None
+                        else:
+                            piece = board.piece_at(drop_sq)
+                            if piece and piece.color == board.turn:
+                                selected_sq = drop_sq
+                    dragging = False
+                    drag_sq = None
+                    drag_offset = None
+                elif dragging:
+                    dragging = False
+                    drag_sq = None
+                    drag_offset = None
 
             elif event.type == pygame.MOUSEWHEEL:
                 if (
@@ -2267,6 +2338,9 @@ def main():
             check_effect,
             selected_sq,
             mouse_pos,
+            drag_sq=drag_sq,
+            drag_offset=drag_offset,
+            dragging=dragging,
         )
         clock.tick(FPS)
 
