@@ -275,7 +275,8 @@ new_game_button_rect = pygame.Rect(
 menu_anim_progress = 0.0
 menu_anim_opening = False
 menu_anim_closing = False
-menu_anim_speed = 0.07
+menu_anim_speed = 0.09
+menu_anim_close_speed = 0.11
 restart_requested = False
 
 # --- Opening Tracking ---
@@ -746,13 +747,13 @@ def update_menu_animation():
     global theme_scroll_offset
 
     if menu_anim_opening:
-        menu_anim_progress += 0.12
+        menu_anim_progress = min(1.0, menu_anim_progress + menu_anim_speed)
         if menu_anim_progress >= 1.0:
             menu_anim_progress = 1.0
             menu_anim_opening = False
             settings_menu_open = True
     elif menu_anim_closing:
-        menu_anim_progress -= 0.12
+        menu_anim_progress = max(0.0, menu_anim_progress - menu_anim_close_speed)
         if menu_anim_progress <= 0.0:
             menu_anim_progress = 0.0
             menu_anim_closing = False
@@ -1536,55 +1537,26 @@ def draw_new_game_button(screen, mouse_pos):
 
 
 def draw_settings_button(screen, mouse_pos):
-    global menu_anim_progress
-
-    if menu_anim_progress == 0:
-        hovered = settings_button_rect.collidepoint(mouse_pos)
-        color = BUTTON_HOVER_COLOR if hovered else BUTTON_COLOR
-        pygame.draw.rect(screen, color, settings_button_rect, border_radius=4)
-        pygame.draw.rect(
-            screen, MENU_BORDER_COLOR, settings_button_rect, 2, border_radius=4
-        )
-
-        gear_color = GEAR_COLOR_HOVER if hovered else GEAR_COLOR
-        draw_gear_icon(
-            screen,
-            settings_button_rect.centerx,
-            settings_button_rect.centery,
-            9,
-            gear_color,
-            thickness=2,
-        )
-    else:
-        t = cubic_ease_in_out(menu_anim_progress)
-
-        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        overlay.fill((30, 30, 30, int(240 * t)))
-        screen.blit(overlay, (0, 0))
-
-        half_w = int((WIDTH / 2) * t)
-        half_h = int((HEIGHT / 2) * t)
-        border_rect = (
-            WIDTH // 2 - half_w,
-            HEIGHT // 2 - half_h,
-            half_w * 2,
-            half_h * 2,
-        )
-        pygame.draw.rect(screen, MENU_BORDER_COLOR, border_rect, 3)
-
-        if menu_anim_progress < 0.5:
-            alpha = int(255 * (1 - (menu_anim_progress * 2)))
-            gear_surface = pygame.Surface((50, 30), pygame.SRCALPHA)
-            gear_surface.fill((0, 0, 0, 0))
-            draw_gear_icon(
-                gear_surface,
-                25,
-                15,
-                9,
-                (*GEAR_COLOR, alpha),
-                thickness=2,
-            )
-            screen.blit(gear_surface, settings_button_rect.topleft)
+    # Only visible when menu is closed — opening animation is handled entirely
+    # by draw_settings_menu (single backdrop), avoiding a double-fade / double
+    # overlay that previously caused flicker and a competing expanding border.
+    if menu_anim_progress > 0:
+        return
+    hovered = settings_button_rect.collidepoint(mouse_pos)
+    color = BUTTON_HOVER_COLOR if hovered else BUTTON_COLOR
+    pygame.draw.rect(screen, color, settings_button_rect, border_radius=4)
+    pygame.draw.rect(
+        screen, MENU_BORDER_COLOR, settings_button_rect, 2, border_radius=4
+    )
+    gear_color = GEAR_COLOR_HOVER if hovered else GEAR_COLOR
+    draw_gear_icon(
+        screen,
+        settings_button_rect.centerx,
+        settings_button_rect.centery,
+        9,
+        gear_color,
+        thickness=2,
+    )
 
 
 def update_menu_transition():
@@ -1609,14 +1581,14 @@ def update_menu_transition():
                 menu_transition_direction = "none"
 
 
-def draw_board_theme_content(screen, offset_x=0):
+def draw_board_theme_content(screen, offset_x=0, offset_y=0):
     global current_theme, theme_scroll_offset
 
     mx, my = pygame.mouse.get_pos()
     themes = get_available_themes()
 
     # --- Preview panel (reserved section) ---
-    preview_rect = pygame.Rect(WIDTH // 2 - 200 + offset_x, THEME_PREVIEW_Y, 400, THEME_PREVIEW_H)
+    preview_rect = pygame.Rect(WIDTH // 2 - 200 + offset_x, THEME_PREVIEW_Y + offset_y, 400, THEME_PREVIEW_H)
     pygame.draw.rect(screen, (45, 45, 50), preview_rect, border_radius=8)
     pygame.draw.rect(screen, MENU_BORDER_COLOR, preview_rect, 2, border_radius=8)
 
@@ -1626,10 +1598,10 @@ def draw_board_theme_content(screen, offset_x=0):
     # So temporarily find hovered by scanning with current scroll (compact grid)
     item_h = THEME_ITEM_HEIGHT
     gap = THEME_ITEM_GAP
-    top = THEME_LIST_TOP
+    top = THEME_LIST_TOP + offset_y
     cols = 2
     rows = (len(themes) + cols - 1) // cols
-    viewport_h = THEME_LIST_BOTTOM - top
+    viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
     total_h = max(1, rows * item_h + max(0, rows - 1) * gap)
     max_scroll = max(0, total_h - viewport_h)
     theme_scroll_offset = max(0.0, min(theme_scroll_offset, max_scroll))
@@ -1734,7 +1706,7 @@ def draw_board_theme_content(screen, offset_x=0):
 
         hint = font_tiny.render("Scroll for more styles", True, TEXT_MUTED)
         screen.blit(
-            hint, (WIDTH // 2 - hint.get_width() // 2, THEME_LIST_BOTTOM + 6)
+            hint, (WIDTH // 2 - hint.get_width() // 2, THEME_LIST_BOTTOM + offset_y + 6)
         )
 
 
@@ -1768,8 +1740,8 @@ ENGINE_SLIDER_THUMB_R = 10
 engine_slider_dragging = None
 
 
-def get_engine_slider_rects(i, offset_x=0):
-    y = ENGINE_ROW_TOP + i * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP)
+def get_engine_slider_rects(i, offset_x=0, offset_y=0):
+    y = ENGINE_ROW_TOP + i * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + offset_y
     row_rect = pygame.Rect(
         WIDTH // 2 - ENGINE_ROW_WIDTH // 2 + offset_x,
         y,
@@ -1785,9 +1757,9 @@ def get_engine_slider_rects(i, offset_x=0):
     return row_rect, track_rect, value_rect
 
 
-def get_engine_reset_rect(offset_x=0):
+def get_engine_reset_rect(offset_x=0, offset_y=0):
     reset_w, reset_h = 220, 40
-    reset_y = ENGINE_ROW_TOP + 4 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12
+    reset_y = ENGINE_ROW_TOP + 4 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
     return pygame.Rect(
         WIDTH // 2 - reset_w // 2 + offset_x, reset_y, reset_w, reset_h
     )
@@ -1827,11 +1799,11 @@ def reset_engine_settings():
         )
 
 
-def draw_engine_settings_content(screen, offset_x=0):
+def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
 
     for i, key in enumerate(ENGINE_ROW_KEYS):
-        row_rect, track_rect, value_rect = get_engine_slider_rects(i, offset_x)
+        row_rect, track_rect, value_rect = get_engine_slider_rects(i, offset_x, offset_y)
 
         pygame.draw.rect(screen, (55, 55, 55), row_rect, border_radius=6)
         pygame.draw.rect(screen, MENU_BORDER_COLOR, row_rect, 2, border_radius=6)
@@ -1869,7 +1841,7 @@ def draw_engine_settings_content(screen, offset_x=0):
         value_surf = font_small.render(value_text, True, TEXT_ACCENT if thumb_hover or is_dragging else TEXT_COLOR)
         screen.blit(value_surf, (value_rect.centerx - value_surf.get_width() // 2, value_rect.centery - value_surf.get_height() // 2))
 
-    reset_rect = get_engine_reset_rect(offset_x)
+    reset_rect = get_engine_reset_rect(offset_x, offset_y)
     reset_hovered = reset_rect.collidepoint(mx, my)
     pygame.draw.rect(screen, (95, 95, 95) if reset_hovered else (75, 75, 75), reset_rect, border_radius=6)
     pygame.draw.rect(screen, MENU_BORDER_COLOR, reset_rect, 2, border_radius=6)
@@ -1906,15 +1878,15 @@ def draw_settings_menu(screen):
     mx, my = pygame.mouse.get_pos()
     transition_idle = menu_transition_direction == "none" and menu_anim_progress >= 0.99
 
-    # Eased open/close animation — backdrop fade + content slide/scale
+    # --- Unified eased open/close: single backdrop + slide for all content ---
     eased = cubic_ease_in_out(max(0.0, min(1.0, menu_anim_progress)))
-    # Backdrop
-    backdrop_alpha = int(eased * 190)
+    # Backdrop — single source of truth (removed duplicate from draw_settings_button)
+    backdrop_alpha = int(eased * 180)
     overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, backdrop_alpha))
     screen.blit(overlay, (0, 0))
-    # Content entrance offset (slight slide up and scale)
-    open_slide = int((1 - eased) * 24)  # slides up as it opens
+    # Content entrance: slide up + subtle scale via eased offset
+    open_slide = int((1 - eased) * 22)  # 22px slide fully resolves at eased=1
 
     offset_x = 0
     if menu_transition_direction == "left_out":
@@ -1934,10 +1906,10 @@ def draw_settings_menu(screen):
     title_text = font_large.render(
         page_titles.get(settings_menu_state, "Settings"), True, TEXT_COLOR
     )
-    title_rect = title_text.get_rect(center=(WIDTH // 2 + offset_x, 50))
+    title_rect = title_text.get_rect(center=(WIDTH // 2 + offset_x, 50 + open_slide))
     screen.blit(title_text, title_rect)
 
-    close_button_rect = pygame.Rect(WIDTH - 60, 20, 40, 30)
+    close_button_rect = pygame.Rect(WIDTH - 60, 20 + open_slide, 40, 30)
     close_hovered = transition_idle and close_button_rect.collidepoint(mx, my)
     pygame.draw.rect(
         screen,
@@ -1952,7 +1924,7 @@ def draw_settings_menu(screen):
     screen.blit(close_text, close_text.get_rect(center=close_button_rect.center))
 
     if settings_menu_state != "main":
-        back_button_rect = pygame.Rect(20, 20, 40, 30)
+        back_button_rect = pygame.Rect(20, 20 + open_slide, 40, 30)
         back_hovered = transition_idle and back_button_rect.collidepoint(mx, my)
         pygame.draw.rect(
             screen,
@@ -1980,9 +1952,15 @@ def draw_settings_menu(screen):
         start_y = (HEIGHT - total_menu_height) // 2
 
         for i, item in enumerate(menu_items):
+            # Staggered entrance: each item slides in slightly after the previous
+            item_delay = i * 0.06
+            item_eased = max(0.0, min(1.0, (eased - item_delay) / 0.82)) if eased > item_delay else 0.0
+            item_slide = int((1 - (cubic_ease_in_out(item_eased) if item_eased > 0 else 0)) * 14) if eased < 0.99 else 0
+            # Combine global open_slide with per-item stagger for polished cascade
+            y_slide = open_slide + item_slide if eased < 1.0 else 0
             item_rect = pygame.Rect(
                 WIDTH // 2 - 200 + offset_x,
-                start_y + i * (item_height + 20),
+                start_y + i * (item_height + 20) + y_slide,
                 400,
                 item_height,
             )
@@ -2009,7 +1987,7 @@ def draw_settings_menu(screen):
             item_text_rect = item_text.get_rect(center=item_rect.center)
             screen.blit(item_text, item_text_rect)
 
-        about_y = start_y + len(menu_items) * (item_height + 20) + 40
+        about_y = start_y + len(menu_items) * (item_height + 20) + 40 + open_slide
 
         about_title = font_large.render("About", True, TEXT_COLOR)
         about_title_rect = about_title.get_rect(
@@ -2042,10 +2020,10 @@ def draw_settings_menu(screen):
         screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
 
     elif settings_menu_state == "board_theme":
-        draw_board_theme_content(screen, offset_x)
+        draw_board_theme_content(screen, offset_x, open_slide)
 
     elif settings_menu_state == "engine_settings":
-        draw_engine_settings_content(screen, offset_x)
+        draw_engine_settings_content(screen, offset_x, open_slide)
 
 
 def handle_menu_click(mx, my):
