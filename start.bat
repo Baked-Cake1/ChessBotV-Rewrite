@@ -21,16 +21,17 @@ python new.py %*
 
 set PYTHON_EXIT_CODE=%errorlevel%
 
-REM Keep window open regardless of outcome
-echo.
+REM Automatically close when UI closes normally; keep open on error so crash details remain visible
 if %PYTHON_EXIT_CODE% equ 0 (
-    echo ChessBotV Rewrite was closed.
+    exit /b 0
 ) else (
+    echo.
     echo ChessBotV Rewrite closed with error code: %PYTHON_EXIT_CODE%!
     echo.
     echo If you see this message, ChessBotV Rewrite may have crashed.
     echo Check the error messages above ^ for details.
+    echo.
+    echo Press any key to exit the ChessBotV launcher...
+    pause >nul
+    exit /b %PYTHON_EXIT_CODE%
 )
-echo.
-echo Press any key to exit the ChessBotV launcher...
-pause >nul
