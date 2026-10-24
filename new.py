@@ -78,14 +78,138 @@ font_tiny = pygame.font.SysFont("segoeui", 15)
 
 
 # --- Ctypes: Always on Top ---
-def set_always_on_top(enabled=True):
-    """Pin (or unpin) the window above other windows (Windows HWND_TOPMOST)."""
+# NOTE: the Win32 calls below MUST be prototyped with pointer-sized HWND
+# arguments. The previous version passed plain Python ints through
+# ctypes.windll, which marshals them as 32-bit C ints — on 64-bit Windows
+# HWND_TOPMOST ((-1) as a handle) therefore arrived as 0x00000000FFFFFFFF
+# instead of 0xFFFFFFFFFFFFFFFF, SetWindowPos rejected it, and the failure
+# was silently swallowed, so the window never actually became topmost.
+_GWL_EXSTYLE = -20
+_WS_EX_TOPMOST = 0x00000008
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_SWP_FRAMECHANGED = 0x0020
+
+
+def _clear_win_error():
+    fn = getattr(ctypes, "set_last_error", None)
+    if fn is not None:
+        fn(0)
+
+
+def _win_error():
+    fn = getattr(ctypes, "get_last_error", None)
+    return fn() if fn is not None else 0
+
+
+def _user32():
+    """user32 with correctly-typed prototypes, or None off Windows."""
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowW.restype = wintypes.HWND
+    # GetWindowLongPtrW only exists as an export on 64-bit Windows; 32-bit
+    # builds expose the same thing as GetWindowLongW.
+    get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+    set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+    get_long.restype = ctypes.c_ssize_t
+    set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    set_long.restype = ctypes.c_ssize_t
+    user32._get_window_long = get_long
+    user32._set_window_long = set_long
+    return user32
+
+
+def _get_window_hwnd(user32):
+    """The pygame window's HWND as a c_void_p, or None."""
+    hwnd = None
     try:
-        hwnd = pygame.display.get_wm_info()["window"]
-        insert_after = -1 if enabled else -2  # HWND_TOPMOST / HWND_NOTOPMOST
-        ctypes.windll.user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, 3)
-        return True
+        hwnd = pygame.display.get_wm_info().get("window")
     except Exception:
+        hwnd = None
+    if not hwnd and user32 is not None:
+        # Fallback: find our top-level window by its caption.
+        try:
+            caption = pygame.display.get_caption()[0] or "ChessBotV Rewrite"
+        except Exception:
+            caption = "ChessBotV Rewrite"
+        hwnd = user32.FindWindowW(None, caption)
+    if not hwnd:
+        return None
+    return hwnd if isinstance(hwnd, ctypes.c_void_p) else ctypes.c_void_p(hwnd)
+
+
+def _is_window_topmost(user32, hwnd):
+    """True/False from WS_EX_TOPMOST, or None if it cannot be read."""
+    try:
+        _clear_win_error()
+        ex_style = user32._get_window_long(hwnd, _GWL_EXSTYLE)
+        if ex_style == 0 and _win_error() != 0:
+            return None
+        return bool(ex_style & _WS_EX_TOPMOST)
+    except Exception:
+        return None
+
+
+def set_always_on_top(enabled=True):
+    """Pin (or unpin) the window above other windows (Windows HWND_TOPMOST).
+
+    Returns True only if the window really ended up in the requested
+    state (verified via WS_EX_TOPMOST where possible)."""
+    if os.name != "nt":
+        return False
+    try:
+        user32 = _user32()
+        hwnd = _get_window_hwnd(user32)
+        if user32 is None or hwnd is None:
+            print("Always on Top: could not get the window handle (HWND).")
+            return False
+
+        insert_after = ctypes.c_void_p(-1 if enabled else -2)  # HWND_TOPMOST / HWND_NOTOPMOST
+        flags = _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE
+        _clear_win_error()
+        ok = bool(user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags))
+        err = _win_error()
+        state = _is_window_topmost(user32, hwnd)
+        if ok and (state is None or state == bool(enabled)):
+            return True
+
+        # Fallback: flip WS_EX_TOPMOST directly, then re-apply the Z-order.
+        ex_style = user32._get_window_long(hwnd, _GWL_EXSTYLE)
+        new_style = (ex_style | _WS_EX_TOPMOST) if enabled else (ex_style & ~_WS_EX_TOPMOST)
+        _clear_win_error()
+        user32._set_window_long(hwnd, _GWL_EXSTYLE, new_style)
+        style_err = _win_error()
+        _clear_win_error()
+        ok2 = bool(user32.SetWindowPos(
+            hwnd, insert_after, 0, 0, 0, 0, flags | _SWP_FRAMECHANGED
+        ))
+        err2 = _win_error()
+        state = _is_window_topmost(user32, hwnd)
+        if state is not None:
+            if state == bool(enabled):
+                return True
+        elif ok2:
+            return True
+        print(
+            "Always on Top: failed to "
+            f"{'pin' if enabled else 'unpin'} window "
+            f"(SetWindowPos errors {err}/{err2}, style error {style_err}, topmost={state})."
+        )
+        return False
+    except Exception as exc:
+        print(f"Always on Top: {exc!r}")
         return False
 
 
@@ -247,8 +371,13 @@ auto_color_dialog_anim = 0.0
 
 def apply_always_on_top(enabled, persist=False):
     global always_on_top_enabled
-    always_on_top_enabled = bool(enabled)
-    set_always_on_top(always_on_top_enabled)
+    desired = bool(enabled)
+    ok = set_always_on_top(desired)
+    if ok or os.name != "nt":
+        # Off Windows there is no HWND to pin; keep the desired state.
+        always_on_top_enabled = desired
+    # On Windows, if the call really failed the toggle keeps showing the
+    # actual (previous) state instead of pretending it worked.
     config["always_on_top"] = 1 if always_on_top_enabled else 0
     if persist:
         save_config()
@@ -410,8 +539,13 @@ if available_themes and all(t[0] != current_theme for t in available_themes):
 # Board square colours from config ("Classic" unless saved as Chess.com)
 apply_board_theme(config.get("board_theme", "classic"))
 # Window / analysis toggles from config
-always_on_top_enabled = bool(config.get("always_on_top", 1))
-set_always_on_top(always_on_top_enabled)
+_desired_on_top = bool(config.get("always_on_top", 1))
+if _desired_on_top:
+    # Reflect the real result on Windows; elsewhere keep the preference.
+    always_on_top_enabled = set_always_on_top(True) or os.name != "nt"
+else:
+    set_always_on_top(False)
+    always_on_top_enabled = False
 auto_move_enabled = bool(config.get("auto_move", 0))
 auto_move_color = config.get("auto_move_color", "both")
 auto_move_arm_reset = True
@@ -4006,6 +4140,7 @@ def main():
     auto_fired_key = None
     auto_pos_key = None
     auto_pos_frames = 0
+    aot_first_frame_reapplied = False
 
     while running:
         anim_mgr.update()
@@ -4369,6 +4504,13 @@ def main():
             view_ply=len(board.move_stack),
             total_ply=len(board.move_stack) + len(history_redo),
         )
+        # The import-time SetWindowPos can race SDL actually presenting
+        # the native window; assert the saved topmost preference once
+        # more after the first presented frame.
+        if not aot_first_frame_reapplied:
+            aot_first_frame_reapplied = True
+            if config.get("always_on_top", 1):
+                apply_always_on_top(True, persist=False)
         clock.tick(FPS)
 
     engine_thread.quit()
