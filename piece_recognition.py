@@ -8,7 +8,11 @@ import chess
 
 # ---------- CONFIGURATION ----------
 SQUARE_DIR = Path("board_debug")
-PIECE_DIR = Path("pieces")
+
+# Reference sprites come from the same chess.com piece sets the main app
+# uses: pieces/chesscom/<style>/ (change PIECE_STYLE to use another set).
+PIECE_STYLE = "default"
+PIECE_DIR = Path("pieces") / "chesscom" / PIECE_STYLE
 
 # Adjust this if your sprites are unusually large or small.
 PIECE_SCALE = 0.82
@@ -16,19 +20,21 @@ PIECE_SCALE = 0.82
 # Lower = stricter matching. Tune after testing real screenshots.
 MIN_CONFIDENCE = 0.35
 
+# FEN symbol -> sprite file stem in PIECE_DIR: colour letter ('w'/'b')
+# plus piece letter, e.g. "wr" = white rook -> pieces/chesscom/default/wr.png.
 ASSETS = {
-    "K": "white_king.png",
-    "Q": "white_queen.png",
-    "R": "white_rook.png",
-    "B": "white_bishop.png",
-    "N": "white_knight.png",
-    "P": "white_pawn.png",
-    "k": "black_king.png",
-    "q": "black_queen.png",
-    "r": "black_rook.png",
-    "b": "black_bishop.png",
-    "n": "black_knight.png",
-    "p": "black_pawn.png",
+    "K": "wk",
+    "Q": "wq",
+    "R": "wr",
+    "B": "wb",
+    "N": "wn",
+    "P": "wp",
+    "k": "bk",
+    "q": "bq",
+    "r": "br",
+    "b": "bb",
+    "n": "bn",
+    "p": "bp",
 }
 
 
@@ -107,8 +113,8 @@ def difference(actual, template):
 def load_assets():
     sprites = {}
 
-    for symbol, filename in ASSETS.items():
-        path = PIECE_DIR / filename
+    for symbol, code in ASSETS.items():
+        path = PIECE_DIR / f"{code}.png"
         sprites[symbol] = load_sprite(path)
 
     return sprites
