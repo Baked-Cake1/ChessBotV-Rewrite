@@ -9,6 +9,12 @@ import time
 import webbrowser
 
 import chess
+
+# SDL normally discards the mouse click that activates an inactive window.
+# Enable click-through so that first click both focuses this (often topmost)
+# window and interacts with it. This must be set before pygame initializes SDL.
+os.environ["SDL_MOUSE_FOCUS_CLICKTHROUGH"] = "1"
+
 import pygame
 import pygame.gfxdraw
 
