@@ -387,6 +387,7 @@ board_detection_result = None
 board_detection_result_ready = False
 board_detection_last_summary = ""
 _piece_recognition_module = None
+_piece_detection_module = None
 _board_detection_thread = None
 _win32_capture_libs_cache = None
 
@@ -2686,6 +2687,32 @@ def _load_piece_recognition_module():
     return module
 
 
+def _load_piece_detection_module():
+    """Import piece_detection lazily (its picker shares piece_recognition)."""
+    global _piece_detection_module
+    if _piece_detection_module is not None:
+        return _piece_detection_module
+    pr = _load_piece_recognition_module()
+    sys.modules.setdefault("piece_recognition", pr)
+    try:
+        import piece_detection as module
+    except Exception:
+        import importlib.util
+
+        module_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "piece_detection.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "piece_detection", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load piece detection from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _piece_detection_module = module
+    return module
+
+
 def _load_autoplay_dictionary():
     """Load autoplaydictionary.json from the cwd or beside new.py."""
     candidates = []
@@ -2932,7 +2959,36 @@ def _anchor_match_score(ranked, expected_symbol):
     return max(0.0, min(1.0, score))
 
 
-def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_symbol):
+def _classify_square_with_examples(pr, square, sprites, training_examples=None):
+    """Classify with labelled examples, tolerating older classifier APIs."""
+    try:
+        return pr.classify_square(
+            square,
+            sprites or {},
+            training_examples=training_examples,
+        )
+    except TypeError:
+        return pr.classify_square(square, sprites or {})
+
+
+def _piece_display_code(pr, symbol):
+    """Short overlay code for an occupied square; blank squares get ''."""
+    if symbol in (None, "."):
+        return ""
+    if symbol == "?":
+        return "?"
+    code_fn = getattr(pr, "training_code_for_symbol", None)
+    if callable(code_fn):
+        try:
+            code = code_fn(symbol)
+        except Exception:
+            code = None
+        if code:
+            return "" if code == "blank" else code
+    return str(symbol)
+
+
+def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_symbol, training_examples=None):
     left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
     cell = image[top:bottom, left:right]
     centre = ((left + right) // 2, (top + bottom) // 2)
@@ -2950,10 +3006,12 @@ def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_sy
         "score": 0.0,
         "match": None,
     }
-    if not sprites or cell.shape[0] < 8 or cell.shape[1] < 8:
+    if (not sprites and not training_examples) or cell.shape[0] < 8 or cell.shape[1] < 8:
         return info
     try:
-        symbol, confidence, ranked = pr.classify_square(cell, sprites)
+        symbol, confidence, ranked = _classify_square_with_examples(
+            pr, cell, sprites, training_examples=training_examples
+        )
     except Exception:
         return info
     detected = ranked[0][0] if ranked else symbol
@@ -2968,7 +3026,7 @@ def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_sy
     return info
 
 
-def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_anchors):
+def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_anchors, training_examples=None):
     metrics = _board_geometry_score(board_rect, integrals)
     total = metrics["score"]
     anchors = {}
@@ -2979,9 +3037,16 @@ def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_a
     )
     for name, row, col, expected in anchor_specs:
         anchors[name] = _classify_board_anchor(
-            image, board_rect, row, col, sprites, pr, expected
+            image,
+            board_rect,
+            row,
+            col,
+            sprites,
+            pr,
+            expected,
+            training_examples=training_examples,
         )
-    if sprites is not None:
+    if sprites is not None or training_examples:
         total += 1.5 * (
             anchors["top_left"]["score"] + anchors["bottom_right"]["score"]
         ) / 2.0
@@ -2994,7 +3059,251 @@ def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_a
     }
 
 
-def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anchors=None):
+def _classify_board_pieces(image, board_rect, pr, sprites=None,
+                           training_examples=None, existing=None):
+    """Classify every square of a located board.
+
+    Manually answered squares in ``existing`` are preserved, which lets a
+    newly learned example be applied to only the remaining unknown/auto
+    squares during the same detection run.
+    """
+    previous_grid = (existing or {}).get("piece_grid")
+    previous_sources = (existing or {}).get("piece_sources")
+    previous_confidences = (existing or {}).get("piece_confidences")
+    previous_ranked = (existing or {}).get("piece_ranked")
+
+    grid = []
+    sources = []
+    confidences = []
+    ranked_grid = []
+    piece_count = 0
+    blank_count = 0
+    unknown_squares = []
+
+    for row in range(8):
+        grid_row = []
+        source_row = []
+        confidence_row = []
+        ranked_row = []
+        for col in range(8):
+            if (
+                previous_grid and previous_sources
+                and previous_sources[row][col] == "manual"
+            ):
+                symbol = previous_grid[row][col]
+                confidence = 1.0
+                ranked = []
+                if previous_confidences:
+                    confidence = previous_confidences[row][col]
+                if previous_ranked:
+                    ranked = previous_ranked[row][col]
+                source = "manual"
+            else:
+                left, top, right, bottom = _board_cell_bounds(
+                    board_rect, row, col
+                )
+                cell = image[top:bottom, left:right]
+                symbol = "?"
+                confidence = 0.0
+                ranked = []
+                source = "unknown"
+                if (
+                    cell.shape[0] >= 8 and cell.shape[1] >= 8
+                    and bool(sprites or training_examples)
+                ):
+                    try:
+                        symbol, confidence, ranked = _classify_square_with_examples(
+                            pr,
+                            cell,
+                            sprites,
+                            training_examples=training_examples,
+                        )
+                        confidence = float(confidence)
+                        source = "unknown" if symbol == "?" else "auto"
+                    except Exception:
+                        symbol = "?"
+                        confidence = 0.0
+                        ranked = []
+                        source = "unknown"
+
+            grid_row.append(symbol)
+            source_row.append(source)
+            confidence_row.append(confidence)
+            ranked_row.append(ranked)
+            if symbol == ".":
+                blank_count += 1
+            elif symbol == "?":
+                unknown_squares.append((row, col))
+            else:
+                piece_count += 1
+
+        grid.append(grid_row)
+        sources.append(source_row)
+        confidences.append(confidence_row)
+        ranked_grid.append(ranked_row)
+
+    return {
+        "piece_grid": grid,
+        "piece_sources": sources,
+        "piece_confidences": confidences,
+        "piece_ranked": ranked_grid,
+        "piece_count": piece_count,
+        "blank_count": blank_count,
+        "unknown_squares": unknown_squares,
+    }
+
+
+def _board_square_crop(image, board_rect, row, col):
+    left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
+    return image[top:bottom, left:right].copy()
+
+
+def _sync_board_anchor_labels(result, pr):
+    """Keep corner-anchor text in step with the final all-square labels."""
+    grid = result.get("piece_grid") or []
+    confidences = result.get("piece_confidences") or []
+    anchors = result.get("anchors", {})
+    for key, row, col in (("top_left", 0, 0), ("bottom_right", 7, 7)):
+        anchor = anchors.get(key)
+        if not anchor:
+            continue
+        try:
+            symbol = grid[row][col]
+        except Exception:
+            continue
+        if symbol in (None, "?"):
+            continue
+        anchor["detected_symbol"] = symbol
+        anchor["classified_symbol"] = symbol
+        try:
+            anchor["detected_name"] = pr.piece_name(symbol)
+        except Exception:
+            anchor["detected_name"] = str(symbol)
+        anchor["match"] = symbol == anchor.get("expected_symbol")
+        try:
+            anchor["confidence"] = float(confidences[row][col])
+        except Exception:
+            pass
+
+
+def _resolve_unknown_board_pieces(result, pr_module=None, interactive=True):
+    """Ask Piece Detection about unknown squares and learn each answer live.
+
+    This runs on ChessBotV's main thread before the final result window.
+    Each answer is saved as the next training example and appended to the
+    shared in-memory example mapping; the remaining squares are then
+    reclassified immediately, so identical unknown pieces may resolve
+    without another question.
+    """
+    if not interactive or not result:
+        return result
+
+    image = result.get("screenshot")
+    board_rect = result.get("board_rect")
+    grid = result.get("piece_grid")
+    if image is None or board_rect is None or not grid:
+        return result
+
+    pr = pr_module or _load_piece_recognition_module()
+    try:
+        piece_detection = _load_piece_detection_module()
+    except Exception as exc:
+        print(f"Board Detection: Piece Detection unavailable: {exc}")
+        return result
+
+    examples = result.get("training_examples")
+    if examples is None:
+        examples = {}
+        result["training_examples"] = examples
+    sprites = result.get("sprites")
+    learned = result.setdefault("learned_examples", [])
+    skipped = set()
+
+    while True:
+        grid = result.get("piece_grid", [])
+        unknowns = [
+            (row, col)
+            for row in range(8)
+            for col in range(8)
+            if grid[row][col] == "?" and (row, col) not in skipped
+        ]
+        if not unknowns:
+            break
+
+        row, col = unknowns[0]
+        coordinate = f"{'abcdefgh'[col]}{8 - row}"
+        crop = _board_square_crop(image, board_rect, row, col)
+
+        initial = "?"
+        ranked = []
+        confidence = None
+        ranked_grid = result.get("piece_ranked") or []
+        confidence_grid = result.get("piece_confidences") or []
+        try:
+            ranked = ranked_grid[row][col]
+            if ranked and ranked[0][0] in getattr(pr, "PIECE_CHOICES", ()):
+                initial = ranked[0][0]
+        except Exception:
+            ranked = []
+        try:
+            confidence = float(confidence_grid[row][col])
+        except Exception:
+            confidence = None
+
+        try:
+            symbol, saved_path = piece_detection.ask_and_save_training_example(
+                crop,
+                training_examples=examples,
+                row=row,
+                col=col,
+                initial=initial,
+                ranked=ranked,
+                confidence=confidence,
+                detail=(
+                    f"{coordinate}: Board Detection does not know this "
+                    "piece yet. Choose it to teach the detector."
+                ),
+            )
+        except Exception as exc:
+            print(f"Board Detection: Piece Detection failed for {coordinate}: {exc}")
+            break
+
+        if symbol == getattr(pr, "CANCEL_CHOICE", "<cancel>"):
+            print(
+                "Board Detection: Piece Detection cancelled; "
+                "remaining unknown squares stay marked '?'."
+            )
+            break
+        if symbol is None or symbol == "?":
+            print(
+                f"Board Detection: skipped {coordinate}; "
+                "it stays marked '?' for this run."
+            )
+            skipped.add((row, col))
+            continue
+
+        result["piece_grid"][row][col] = symbol
+        result["piece_sources"][row][col] = "manual"
+        result["piece_confidences"][row][col] = 1.0
+        if saved_path:
+            learned.append(str(saved_path))
+            print(f"Board Detection: learned {coordinate} as {symbol}: {saved_path}")
+
+        result.update(_classify_board_pieces(
+            image,
+            board_rect,
+            pr,
+            sprites=sprites,
+            training_examples=examples,
+            existing=result,
+        ))
+
+    _sync_board_anchor_labels(result, pr)
+    result["learned_examples"] = learned
+    return result
+
+
+def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anchors=None, training_examples=None):
     """Find a White-oriented Chess.com board square in a BGR screenshot.
 
     The grid-colour geometry does the locating; the two corner anchors
@@ -3039,12 +3348,26 @@ def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anc
         except Exception as exc:
             print(f"Board Detection: piece sprites unavailable ({exc}); using grid only.")
             sprites = None
-    if not sprites:
-        sprites = None
+    if training_examples is None:
+        try:
+            training_examples = pr.load_training_examples()
+        except Exception as exc:
+            print(f"Board Detection: training examples unavailable ({exc}); using sprites only.")
+            training_examples = {}
+        if training_examples is None:
+            training_examples = {}
     expected = expected_anchors or _expected_anchor_symbols(pr)
 
     scored = [
-        _score_board_candidate(image, rect, integrals, pr, sprites, expected)
+        _score_board_candidate(
+            image,
+            rect,
+            integrals,
+            pr,
+            sprites,
+            expected,
+            training_examples=training_examples,
+        )
         for rect in refined_rects
     ]
     best = max(scored, key=lambda item: item["score"])
@@ -3052,6 +3375,15 @@ def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anc
         return None
     best["expected_anchors"] = expected
     best["image_size"] = (image_w, image_h)
+    best["sprites"] = sprites
+    best["training_examples"] = training_examples
+    best.update(_classify_board_pieces(
+        image,
+        best["board_rect"],
+        pr,
+        sprites=sprites,
+        training_examples=training_examples,
+    ))
     return best
 
 
@@ -3109,6 +3441,7 @@ def annotate_board_detection(image, detection, pr_module=None):
     )
 
     cell = side / 8.0
+    piece_grid = detection.get("piece_grid")
     coord_scale = max(0.32, min(0.62, cell / 105.0))
     coord_thickness = 2 if cell >= 52 else 1
     for row in range(8):
@@ -3138,6 +3471,50 @@ def annotate_board_detection(image, detection, pr_module=None):
         radius = max(7, int(cell * 0.18))
         cv2.circle(annotated, centre, radius, (0, 255, 255), max(2, line_thickness + 1))
         cv2.circle(annotated, centre, 2, (0, 255, 255), -1)
+
+    # Label occupied squares last so their short piece codes stay readable
+    # over the grid/pieces/anchor markers. Blank squares intentionally get
+    # no piece label; unresolved squares show '?' until Piece Detection
+    # has been asked about them.
+    if piece_grid:
+        for row in range(8):
+            for col in range(8):
+                try:
+                    symbol = piece_grid[row][col]
+                except Exception:
+                    continue
+                piece_code = _piece_display_code(pr, symbol)
+                if not piece_code:
+                    continue
+                _left, _top, right, bottom = _board_cell_bounds(
+                    detection["board_rect"], row, col
+                )
+                if (row + col) % 2 == 0:
+                    piece_outline, piece_colour = (255, 255, 255), (0, 0, 0)
+                else:
+                    piece_outline, piece_colour = (0, 0, 0), (255, 255, 255)
+                if piece_code == "?":
+                    piece_outline, piece_colour = (0, 0, 0), (0, 255, 255)
+                piece_scale = max(0.32, min(0.72, cell / 92.0))
+                piece_thickness = 2 if cell >= 46 else 1
+                (piece_w, _piece_h), _baseline = cv2.getTextSize(
+                    piece_code,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    piece_scale,
+                    piece_thickness,
+                )
+                piece_org = (
+                    right - piece_w - max(3, int(cell * 0.07)),
+                    bottom - max(5, int(cell * 0.10)),
+                )
+                cv2.putText(
+                    annotated, piece_code, piece_org, cv2.FONT_HERSHEY_SIMPLEX,
+                    piece_scale, piece_outline, piece_thickness + 2, cv2.LINE_AA,
+                )
+                cv2.putText(
+                    annotated, piece_code, piece_org, cv2.FONT_HERSHEY_SIMPLEX,
+                    piece_scale, piece_colour, piece_thickness, cv2.LINE_AA,
+                )
 
     top_left = anchors.get("top_left")
     if top_left:
@@ -3447,11 +3824,34 @@ def _anchor_summary(anchor):
 def _board_detection_summary(result):
     rect = result.get("board_rect", (0, 0, 0, 0))
     anchors = result.get("anchors", {})
-    return (
+    summary = (
         f"Board found at x={rect[0]}, y={rect[1]}, size={rect[2]}px - "
         f"{_anchor_summary(anchors.get('top_left'))}; "
         f"{_anchor_summary(anchors.get('bottom_right'))}."
     )
+
+    piece_grid = result.get("piece_grid")
+    if piece_grid:
+        flat = [symbol for row in piece_grid for symbol in row]
+        piece_count = result.get(
+            "piece_count",
+            sum(1 for symbol in flat if symbol not in (".", "?", None)),
+        )
+        blank_count = result.get(
+            "blank_count",
+            sum(1 for symbol in flat if symbol == "."),
+        )
+        unknown_count = len(result.get("unknown_squares", []))
+        if "unknown_squares" not in result:
+            unknown_count = sum(1 for symbol in flat if symbol == "?")
+        summary += (
+            f" Pieces: {piece_count}, blanks: {blank_count}, "
+            f"unknown: {unknown_count}."
+        )
+        learned_count = len(result.get("learned_examples", []))
+        if learned_count:
+            summary += f" Learned {learned_count} new example(s)."
+    return summary
 
 
 def _board_detection_worker(window_info):
@@ -3536,14 +3936,38 @@ def start_board_detection(window_info):
 
 
 def show_board_detection_result(result):
-    """Open the annotated screenshot in a separate OpenCV window."""
+    """Resolve unknown pieces live, then open the annotated screenshot."""
     global board_detection_error, board_detection_status
+    global board_detection_last_summary
     try:
         import cv2
 
         annotated = result.get("annotated")
         if annotated is None:
             raise RuntimeError("No annotated screenshot available")
+
+        # Piece Detection must run here on the main thread, not inside the
+        # capture worker. Each saved answer is applied to the shared
+        # training_examples mapping and the board is re-labelled before
+        # this final result window opens.
+        if result.get("screenshot") is not None and result.get("unknown_squares"):
+            try:
+                pr = _load_piece_recognition_module()
+                _resolve_unknown_board_pieces(result, pr_module=pr)
+                result["annotated"] = annotate_board_detection(
+                    result["screenshot"], result, pr
+                )
+                annotated = result["annotated"]
+                annotated_path = result.get("annotated_path") or os.path.join(
+                    "board_debug", "board_detection_annotated.png"
+                )
+                result["annotated_path"] = annotated_path
+                directory = os.path.dirname(annotated_path)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                cv2.imwrite(annotated_path, annotated)
+            except Exception as exc:
+                print(f"Board Detection: live piece learning failed: {exc}")
         title = "Board Detection Result - press Q/Esc to return"
         cv2.namedWindow(title, cv2.WINDOW_NORMAL)
         try:
@@ -3572,11 +3996,13 @@ def show_board_detection_result(result):
                 cv2.destroyWindow(title)
             except Exception:
                 pass
-        board_detection_status = _board_detection_summary(result)
+        board_detection_last_summary = _board_detection_summary(result)
+        board_detection_status = board_detection_last_summary
         return True
     except Exception as exc:
         board_detection_error = f"Board found, but the preview window could not open: {exc}"
-        board_detection_status = _board_detection_summary(result)
+        board_detection_last_summary = _board_detection_summary(result)
+        board_detection_status = board_detection_last_summary
         print(board_detection_error)
         return False
 
