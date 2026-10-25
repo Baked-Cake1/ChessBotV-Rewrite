@@ -374,6 +374,22 @@ auto_move_status_text = ""  # human-readable arming state for the Analysis page
 show_auto_color_dialog = False
 auto_color_dialog_anim = 0.0
 
+# --- Board Detection (Analysis page) ---
+show_board_detection_dialog = False
+board_detection_dialog_anim = 0.0
+board_detection_windows = []
+board_detection_selected = 0
+board_detection_page = 0
+board_detection_running = False
+board_detection_status = ""
+board_detection_error = ""
+board_detection_result = None
+board_detection_result_ready = False
+board_detection_last_summary = ""
+_piece_recognition_module = None
+_board_detection_thread = None
+_win32_capture_libs_cache = None
+
 
 def apply_always_on_top(enabled, persist=False):
     global always_on_top_enabled
@@ -760,6 +776,7 @@ def update_slider_display():
 def update_global_anims():
     global legal_pulse_t, eval_highlight_pulse, confirm_anim, game_over_anim
     global always_on_top_anim, auto_move_anim, auto_color_dialog_anim
+    global board_detection_dialog_anim
     legal_pulse_t += 0.08
     eval_highlight_pulse += 0.06
     if show_newgame_confirm:
@@ -774,6 +791,10 @@ def update_global_anims():
         auto_color_dialog_anim = min(1.0, auto_color_dialog_anim + 0.12)
     else:
         auto_color_dialog_anim = max(0.0, auto_color_dialog_anim - 0.12)
+    if show_board_detection_dialog:
+        board_detection_dialog_anim = min(1.0, board_detection_dialog_anim + 0.12)
+    else:
+        board_detection_dialog_anim = max(0.0, board_detection_dialog_anim - 0.12)
     for name, on in (("always_on_top_anim", always_on_top_enabled), ("auto_move_anim", auto_move_enabled or show_auto_color_dialog)):
         cur = globals()[name]
         target = 1.0 if on else 0.0
@@ -2629,6 +2650,1194 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
             screen.blit(sel, (rect.right - sel.get_width() - 16, rect.y + 20))
 
 
+# --- Board Detection ---
+# The Analysis page can capture another Windows application window, find a
+# Chess.com-coloured chessboard in that screenshot, and display the result
+# with a blue 8x8 overlay. Detection is deliberately scoped to finding the
+# board itself (White orientation: a8 top-left, h1 bottom-right); it does
+# not sync or play moves from the external board yet.
+BOARD_DETECTION_WINDOWS_PER_PAGE = 6
+BOARD_DETECTION_MIN_SIDE = 120
+BOARD_DETECTION_BLUE_BGR = (255, 0, 0)       # blue in OpenCV's BGR order
+BOARD_DETECTION_LINE_BGR = (255, 140, 0)     # lighter blue/cyan in BGR
+
+
+def _load_piece_recognition_module():
+    """Import piece_recognition lazily so OpenCV stays optional at startup."""
+    global _piece_recognition_module
+    if _piece_recognition_module is not None:
+        return _piece_recognition_module
+    try:
+        import piece_recognition as module
+    except Exception:
+        import importlib.util
+
+        module_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "piece_recognition.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "piece_recognition", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load piece recognition from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _piece_recognition_module = module
+    return module
+
+
+def _load_autoplay_dictionary():
+    """Load autoplaydictionary.json from the cwd or beside new.py."""
+    candidates = []
+    for base in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        path = os.path.join(base, "autoplaydictionary.json")
+        if path not in candidates:
+            candidates.append(path)
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            print(f"Board Detection: could not read {path}: {exc}")
+            return {}
+    return {}
+
+
+def _dictionary_symbol(data, image_path, default_symbol, pr):
+    """Resolve one autoplaydictionary entry to a FEN-style piece symbol."""
+    value = data.get(image_path)
+    if isinstance(value, dict):
+        symbol = value.get("symbol")
+        if symbol in getattr(pr, "PIECE_NAMES", {}):
+            return symbol
+        value = value.get("piece") or value.get("label") or value.get("name")
+    if isinstance(value, str):
+        clean = value.strip()
+        if clean in getattr(pr, "PIECE_NAMES", {}):
+            return clean
+        labels = {
+            str(name).strip().lower(): symbol
+            for symbol, name in getattr(pr, "PIECE_NAMES", {}).items()
+        }
+        return labels.get(clean.lower(), default_symbol)
+    return default_symbol
+
+
+def _expected_anchor_symbols(pr):
+    """Expected top-left/bottom-right pieces from autoplaydictionary.json.
+
+    The dictionary entry for r0_c0 describes a8 and r7_c7 describes h1.
+    For the normal White orientation/starting layout these default to the
+    black rook and white rook requested as the two detection anchors.
+    """
+    data = _load_autoplay_dictionary()
+    return (
+        _dictionary_symbol(data, "board_debug/r0_c0.png", "r", pr),
+        _dictionary_symbol(data, "board_debug/r7_c7.png", "R", pr),
+    )
+
+
+def _board_colour_masks(image, pr):
+    """Return (light, dark, combined) Chess.com square-colour masks."""
+    import numpy as np
+
+    if image is None or getattr(image, "ndim", 0) != 3:
+        raise ValueError("Board detection needs a colour screenshot")
+    colours = getattr(pr, "SQUARE_BG_BGR", None)
+    if not colours or len(colours) < 2:
+        colours = ((208, 236, 235), (82, 149, 115))
+    tolerance = int(getattr(pr, "SQUARE_BG_TOLERANCE", 24))
+    bgr = image[:, :, :3].astype(np.int16)
+    light_colour = np.asarray(colours[0], dtype=np.int16)
+    dark_colour = np.asarray(colours[1], dtype=np.int16)
+    light = np.max(np.abs(bgr - light_colour), axis=2) <= tolerance
+    dark = np.max(np.abs(bgr - dark_colour), axis=2) <= tolerance
+    return light, dark, light | dark
+
+
+def _mask_integral(mask):
+    import cv2
+
+    return cv2.integral(mask.astype("uint8"))
+
+
+def _integral_count(integral, x, y, width, height):
+    """Count set pixels in a rectangle using an OpenCV integral image."""
+    max_x = integral.shape[1] - 1
+    max_y = integral.shape[0] - 1
+    x0 = max(0, min(int(x), max_x))
+    y0 = max(0, min(int(y), max_y))
+    x1 = max(x0, min(int(x + width), max_x))
+    y1 = max(y0, min(int(y + height), max_y))
+    return int(
+        integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
+    )
+
+
+def _board_cell_bounds(board_rect, row, col):
+    """Exclusive pixel bounds (left, top, right, bottom) for one board cell."""
+    x, y, width, height = board_rect
+    side = width
+    left = x + round(col * side / 8)
+    right = x + round((col + 1) * side / 8)
+    top = y + round(row * side / 8)
+    bottom = y + round((row + 1) * side / 8)
+    return left, top, right, bottom
+
+
+def _board_geometry_score(board_rect, integrals):
+    """Score how strongly a square looks like an alternating 8x8 board."""
+    x, y, width, height = board_rect
+    side = width
+    if side < 8 or width != height:
+        return {"score": -1.0, "coverage": 0.0, "parity": 0.0}
+    coverage = _integral_count(integrals["bg"], x, y, side, side) / float(side * side)
+
+    parity_total = 0.0
+    parity_cells = 0
+    for row in range(8):
+        for col in range(8):
+            left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
+            cell_w = right - left
+            cell_h = bottom - top
+            light = _integral_count(integrals["light"], left, top, cell_w, cell_h)
+            dark = _integral_count(integrals["dark"], left, top, cell_w, cell_h)
+            total = light + dark
+            if total < max(8, int(cell_w * cell_h * 0.05)):
+                continue
+            correct = light if (row + col) % 2 == 0 else dark
+            parity_total += correct / float(total)
+            parity_cells += 1
+    parity = parity_total / parity_cells if parity_cells else 0.0
+    return {
+        "score": 2.2 * parity + 0.8 * coverage,
+        "coverage": float(coverage),
+        "parity": float(parity),
+    }
+
+
+
+
+def _add_board_candidate(candidates, x, y, side, image_w, image_h):
+    x = int(round(x))
+    y = int(round(y))
+    side = int(round(side))
+    if side < BOARD_DETECTION_MIN_SIDE:
+        return
+    if x < 0 or y < 0 or x + side > image_w or y + side > image_h:
+        return
+    candidates.add((x, y, side, side))
+
+
+def _board_candidate_rects(bg_mask):
+    """Generate plausible square board rectangles from board-colour blobs."""
+    import cv2
+    import numpy as np
+
+    image_h, image_w = bg_mask.shape[:2]
+    candidates = set()
+    mask_u8 = bg_mask.astype("uint8") * 255
+    kernel_size = max(5, min(21, ((min(image_w, image_h) // 80) | 1)))
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < image_w * image_h * 0.003:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if min(w, h) < BOARD_DETECTION_MIN_SIDE:
+            continue
+        aspect = w / float(h)
+        if aspect < 0.5 or aspect > 2.0:
+            continue
+        for side in {min(w, h), max(w, h), round((w + h) / 2)}:
+            positions = {
+                (x, y),
+                (x + w - side, y + h - side),
+                (x + (w - side) // 2, y + (h - side) // 2),
+            }
+            for px, py in positions:
+                _add_board_candidate(candidates, px, py, side, image_w, image_h)
+
+    # Fallback: the bounding box of every board-coloured pixel. This helps
+    # when a board is fragmented by pieces/highlights into several contours.
+    ys, xs = np.where(bg_mask)
+    if len(xs) and len(ys):
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        w, h = x1 - x0, y1 - y0
+        for side in {min(w, h), max(w, h), round((w + h) / 2)}:
+            _add_board_candidate(
+                candidates,
+                x0 + (w - side) // 2,
+                y0 + (h - side) // 2,
+                side,
+                image_w,
+                image_h,
+            )
+    return list(candidates)
+
+
+def _refine_board_rect(board_rect, integrals, image_w, image_h):
+    """Local-search x/y/side to maximise the checkerboard geometry score."""
+    best_rect = board_rect
+    best_metrics = _board_geometry_score(best_rect, integrals)
+    passes = [
+        (range(-24, 25, 4), range(-16, 17, 4)),
+        (range(-3, 4, 1), range(-3, 4, 1)),
+    ]
+    for side_deltas, offsets in passes:
+        base_x, base_y, base_side, _ = best_rect
+        for side_delta in side_deltas:
+            side = base_side + side_delta
+            if side < BOARD_DETECTION_MIN_SIDE:
+                continue
+            for dx in offsets:
+                for dy in offsets:
+                    x = base_x + dx
+                    y = base_y + dy
+                    if x < 0 or y < 0 or x + side > image_w or y + side > image_h:
+                        continue
+                    candidate = (x, y, side, side)
+                    metrics = _board_geometry_score(candidate, integrals)
+                    if metrics["score"] > best_metrics["score"]:
+                        best_rect = candidate
+                        best_metrics = metrics
+    return best_rect
+
+
+def _anchor_match_score(ranked, expected_symbol):
+    """Score a classifier ranking against the expected anchor piece."""
+    if not ranked:
+        return 0.0
+    errors = {symbol: float(error) for symbol, error in ranked}
+    if expected_symbol not in errors:
+        return 0.0
+    expected_error = errors[expected_symbol]
+    score = 0.35 * max(0.0, 1.0 - expected_error * 2.5)
+    if ranked[0][0] == expected_symbol:
+        score += 0.45
+        if len(ranked) > 1:
+            second_error = float(ranked[1][1])
+            separation = (second_error - expected_error) / max(second_error, 1e-6)
+            score += 0.20 * max(0.0, min(1.0, separation))
+    return max(0.0, min(1.0, score))
+
+
+def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_symbol):
+    left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
+    cell = image[top:bottom, left:right]
+    centre = ((left + right) // 2, (top + bottom) // 2)
+    info = {
+        "row": row,
+        "col": col,
+        "coordinate": f"{'abcdefgh'[col]}{8 - row}",
+        "centre": centre,
+        "expected_symbol": expected_symbol,
+        "expected_name": pr.piece_name(expected_symbol),
+        "detected_symbol": None,
+        "classified_symbol": None,
+        "detected_name": None,
+        "confidence": None,
+        "score": 0.0,
+        "match": None,
+    }
+    if not sprites or cell.shape[0] < 8 or cell.shape[1] < 8:
+        return info
+    try:
+        symbol, confidence, ranked = pr.classify_square(cell, sprites)
+    except Exception:
+        return info
+    detected = ranked[0][0] if ranked else symbol
+    info.update({
+        "detected_symbol": detected,
+        "classified_symbol": symbol,
+        "detected_name": pr.piece_name(detected),
+        "confidence": float(confidence),
+        "score": _anchor_match_score(ranked, expected_symbol),
+        "match": detected == expected_symbol,
+    })
+    return info
+
+
+def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_anchors):
+    metrics = _board_geometry_score(board_rect, integrals)
+    total = metrics["score"]
+    anchors = {}
+    expected_tl, expected_br = expected_anchors
+    anchor_specs = (
+        ("top_left", 0, 0, expected_tl),
+        ("bottom_right", 7, 7, expected_br),
+    )
+    for name, row, col, expected in anchor_specs:
+        anchors[name] = _classify_board_anchor(
+            image, board_rect, row, col, sprites, pr, expected
+        )
+    if sprites is not None:
+        total += 1.5 * (
+            anchors["top_left"]["score"] + anchors["bottom_right"]["score"]
+        ) / 2.0
+    return {
+        "board_rect": board_rect,
+        "score": float(total),
+        "coverage": metrics["coverage"],
+        "parity": metrics["parity"],
+        "anchors": anchors,
+    }
+
+
+def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anchors=None):
+    """Find a White-oriented Chess.com board square in a BGR screenshot.
+
+    The grid-colour geometry does the locating; the two corner anchors
+    (dictionary/configured pieces, normally black rook on a8 and white rook
+    on h1) are classified as a verification signal when sprites are present.
+    Returns a detection dict or None.
+    """
+    import cv2
+
+    pr = pr_module or _load_piece_recognition_module()
+    if image is None or getattr(image, "ndim", 0) != 3:
+        return None
+    image_h, image_w = image.shape[:2]
+    light_mask, dark_mask, bg_mask = _board_colour_masks(image, pr)
+    integrals = {
+        "light": _mask_integral(light_mask),
+        "dark": _mask_integral(dark_mask),
+        "bg": _mask_integral(bg_mask),
+    }
+    candidates = _board_candidate_rects(bg_mask)
+    if not candidates:
+        return None
+
+    geometry_scored = []
+    for rect in candidates:
+        metrics = _board_geometry_score(rect, integrals)
+        if metrics["parity"] >= 0.35 and metrics["coverage"] >= 0.15:
+            geometry_scored.append((metrics["score"], rect))
+    if not geometry_scored:
+        return None
+    geometry_scored.sort(key=lambda item: item[0], reverse=True)
+
+    refined_rects = []
+    for _score, rect in geometry_scored[:3]:
+        refined = _refine_board_rect(rect, integrals, image_w, image_h)
+        if refined not in refined_rects:
+            refined_rects.append(refined)
+
+    if sprites is None:
+        try:
+            sprites = pr.load_assets()
+        except Exception as exc:
+            print(f"Board Detection: piece sprites unavailable ({exc}); using grid only.")
+            sprites = None
+    if not sprites:
+        sprites = None
+    expected = expected_anchors or _expected_anchor_symbols(pr)
+
+    scored = [
+        _score_board_candidate(image, rect, integrals, pr, sprites, expected)
+        for rect in refined_rects
+    ]
+    best = max(scored, key=lambda item: item["score"])
+    if best["parity"] < 0.55 or best["coverage"] < 0.30:
+        return None
+    best["expected_anchors"] = expected
+    best["image_size"] = (image_w, image_h)
+    return best
+
+
+def _cv2_label(image, text, origin, scale=0.55, thickness=1):
+    """Draw white text on a fitted black label, clamped inside the image."""
+    import cv2
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x, y = int(origin[0]), int(origin[1])
+    x = max(0, min(x, max(0, image.shape[1] - text_w - 12)))
+    y = max(text_h + 6, min(y, image.shape[0] - baseline - 4))
+    cv2.rectangle(
+        image,
+        (x, y - text_h - 6),
+        (min(image.shape[1] - 1, x + text_w + 12), y + baseline + 4),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(image, text, (x + 6, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return x, y
+
+
+def _anchor_overlay_label(anchor):
+    detected = anchor.get("detected_name")
+    expected = anchor.get("expected_name", "piece")
+    coord = anchor.get("coordinate", "")
+    if detected and anchor.get("detected_symbol") != anchor.get("expected_symbol"):
+        return f"{coord}: expected {expected}, found {detected}"
+    return f"{coord}: {expected}"
+
+
+def annotate_board_detection(image, detection, pr_module=None):
+    """Draw the blue board square, 8x8 grid, coordinates and rook anchors."""
+    import cv2
+
+    pr = pr_module or _load_piece_recognition_module()
+    annotated = image.copy()
+    x, y, width, height = detection["board_rect"]
+    side = width
+    line_thickness = max(1, side // 280)
+    outer_thickness = max(3, side // 140)
+
+    for index in range(1, 8):
+        px = x + round(index * side / 8)
+        py = y + round(index * side / 8)
+        cv2.line(annotated, (px, y), (px, y + side - 1), BOARD_DETECTION_BLUE_BGR, line_thickness)
+        cv2.line(annotated, (x, py), (x + side - 1, py), BOARD_DETECTION_BLUE_BGR, line_thickness)
+    cv2.rectangle(
+        annotated,
+        (x, y),
+        (x + side - 1, y + side - 1),
+        BOARD_DETECTION_BLUE_BGR,
+        outer_thickness,
+    )
+
+    cell = side / 8.0
+    coord_scale = max(0.32, min(0.62, cell / 105.0))
+    coord_thickness = 2 if cell >= 52 else 1
+    for row in range(8):
+        for col in range(8):
+            left, top, _right, _bottom = _board_cell_bounds(detection["board_rect"], row, col)
+            coord = f"{'abcdefgh'[col]}{8 - row}"
+            text_org = (left + max(3, int(cell * 0.07)), top + max(13, int(cell * 0.30)))
+            if (row + col) % 2 == 0:  # light square: dark text reads best
+                outline_colour, text_colour = (255, 255, 255), (0, 0, 0)
+            else:                      # dark square: light text reads best
+                outline_colour, text_colour = (0, 0, 0), (255, 255, 255)
+            cv2.putText(
+                annotated, coord, text_org, cv2.FONT_HERSHEY_SIMPLEX,
+                coord_scale, outline_colour, coord_thickness + 2, cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated, coord, text_org, cv2.FONT_HERSHEY_SIMPLEX,
+                coord_scale, text_colour, coord_thickness, cv2.LINE_AA,
+            )
+
+    anchors = detection.get("anchors", {})
+    for key in ("top_left", "bottom_right"):
+        anchor = anchors.get(key)
+        if not anchor:
+            continue
+        centre = anchor["centre"]
+        radius = max(7, int(cell * 0.18))
+        cv2.circle(annotated, centre, radius, (0, 255, 255), max(2, line_thickness + 1))
+        cv2.circle(annotated, centre, 2, (0, 255, 255), -1)
+
+    top_left = anchors.get("top_left")
+    if top_left:
+        _cv2_label(
+            annotated,
+            _anchor_overlay_label(top_left),
+            (x + 6, y - 10 if y >= 34 else y + 24),
+            scale=max(0.45, min(0.65, cell / 110.0)),
+        )
+    bottom_right = anchors.get("bottom_right")
+    if bottom_right:
+        label = _anchor_overlay_label(bottom_right)
+        scale = max(0.45, min(0.65, cell / 110.0))
+        (text_w, _text_h), _baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1
+        )
+        label_x = x + side - text_w - 18
+        label_y = y + side + 28 if y + side + 34 < annotated.shape[0] else y + side - 10
+        _cv2_label(annotated, label, (label_x, label_y), scale=scale)
+    return annotated
+
+
+
+
+class _WinRect(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _BitmapInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("biSize", ctypes.c_uint32),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", ctypes.c_uint16),
+        ("biBitCount", ctypes.c_uint16),
+        ("biCompression", ctypes.c_uint32),
+        ("biSizeImage", ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", ctypes.c_uint32),
+        ("biClrImportant", ctypes.c_uint32),
+    ]
+
+
+class _BitmapInfo(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", _BitmapInfoHeader),
+        ("bmiColors", ctypes.c_uint32 * 1),
+    ]
+
+
+def _get_win32_capture_libs():
+    """Cached, correctly prototyped user32/gdi32 handles for window capture."""
+    global _win32_capture_libs_cache
+    if _win32_capture_libs_cache is not None:
+        return _win32_capture_libs_cache
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    user32.EnumWindows.argtypes = [enum_proc, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_WinRect)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+    get_long.restype = ctypes.c_ssize_t
+    user32._get_window_long_for_capture = get_long
+    user32.GetWindowDC.argtypes = [wintypes.HWND]
+    user32.GetWindowDC.restype = ctypes.c_void_p
+    user32.ReleaseDC.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.ReleaseDC.restype = ctypes.c_int
+    user32.PrintWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.UINT]
+    user32.PrintWindow.restype = wintypes.BOOL
+
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.BitBlt.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+    ]
+    gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.GetDIBits.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT, wintypes.UINT,
+        ctypes.c_void_p, ctypes.POINTER(_BitmapInfo), wintypes.UINT,
+    ]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.restype = wintypes.BOOL
+
+    _win32_capture_libs_cache = (user32, gdi32, enum_proc)
+    return _win32_capture_libs_cache
+
+
+def _enumerate_capture_windows():
+    """Visible top-level windows suitable for the Board Detection picker."""
+    libs = _get_win32_capture_libs()
+    if libs is None:
+        return []
+    user32, _gdi32, enum_proc = libs
+    own_hwnd = _get_window_hwnd(_user32())
+    own_value = own_hwnd.value if isinstance(own_hwnd, ctypes.c_void_p) else own_hwnd
+    windows = []
+
+    def callback(hwnd, _lparam):
+        try:
+            hwnd_value = hwnd.value if isinstance(hwnd, ctypes.c_void_p) else int(hwnd)
+            if own_value and hwnd_value == int(own_value):
+                return True
+            if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                return True
+            # Skip tool windows (floating palettes, tooltips and the like).
+            try:
+                ex_style = user32._get_window_long_for_capture(hwnd, _GWL_EXSTYLE)
+                if ex_style & 0x00000080:  # WS_EX_TOOLWINDOW
+                    return True
+            except Exception:
+                pass
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            title = buffer.value.strip()
+            if not title or title == "Program Manager":
+                return True
+            rect = _WinRect()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            if width < 240 or height < 180:
+                return True
+            windows.append({
+                "hwnd": hwnd_value,
+                "title": title,
+                "rect": (rect.left, rect.top, rect.right, rect.bottom),
+                "thumbnail": None,
+            })
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(enum_proc(callback), 0)
+    return windows[:12]
+
+
+def _capture_window_bgr(hwnd):
+    """Capture one window as (BGR numpy image, screen rect), or (None, None)."""
+    libs = _get_win32_capture_libs()
+    if libs is None or not hwnd:
+        return None, None
+    try:
+        import numpy as np
+    except Exception:
+        return None, None
+    user32, gdi32, _enum_proc = libs
+    hwnd = ctypes.c_void_p(int(hwnd)) if not isinstance(hwnd, ctypes.c_void_p) else hwnd
+    if not user32.IsWindow(hwnd):
+        return None, None
+    rect = _WinRect()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None, None
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        return None, None
+
+    window_dc = user32.GetWindowDC(hwnd)
+    if not window_dc:
+        return None, None
+    memory_dc = gdi32.CreateCompatibleDC(window_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(window_dc, width, height) if memory_dc else None
+    old_object = gdi32.SelectObject(memory_dc, bitmap) if bitmap else None
+
+    def read_bits():
+        bmi = _BitmapInfo()
+        bmi.bmiHeader.biSize = ctypes.sizeof(_BitmapInfoHeader)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height  # top-down rows
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        bmi.bmiHeader.biSizeImage = width * height * 4
+        buffer = ctypes.create_string_buffer(width * height * 4)
+        rows = gdi32.GetDIBits(
+            memory_dc, bitmap, 0, height, buffer, ctypes.byref(bmi), 0
+        )
+        if rows == 0:
+            return None
+        bgra = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4)).copy()
+        return bgra[:, :, :3].copy()
+
+    try:
+        if not memory_dc or not bitmap:
+            return None, None
+        # PW_RENDERFULLCONTENT helps modern/DirectX windows render off-screen.
+        printed = bool(user32.PrintWindow(hwnd, memory_dc, 2))
+        image = read_bits() if printed else None
+        needs_fallback = image is None
+        if image is not None and float(np.mean(image)) < 2.0 and float(np.std(image)) < 1.0:
+            needs_fallback = True
+        if needs_fallback:
+            SRCCOPY_CAPTUREBLT = 0x00CC0020 | 0x40000000
+            if gdi32.BitBlt(memory_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY_CAPTUREBLT):
+                fallback = read_bits()
+                if fallback is not None:
+                    image = fallback
+        if image is None:
+            return None, None
+        return image, (rect.left, rect.top, rect.right, rect.bottom)
+    finally:
+        if old_object and memory_dc:
+            gdi32.SelectObject(memory_dc, old_object)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory_dc:
+            gdi32.DeleteDC(memory_dc)
+        if window_dc:
+            user32.ReleaseDC(hwnd, window_dc)
+
+
+def _make_thumbnail_surface(image, max_w=276, max_h=92):
+    """Convert a BGR screenshot to a small pygame preview surface."""
+    try:
+        import numpy as np
+
+        if image is None:
+            raise ValueError("no screenshot")
+        rgb = np.ascontiguousarray(image[:, :, :3][:, :, ::-1].transpose((1, 0, 2)))
+        surface = pygame.surfarray.make_surface(rgb)
+        scale = min(max_w / surface.get_width(), max_h / surface.get_height())
+        new_size = (
+            max(1, int(surface.get_width() * scale)),
+            max(1, int(surface.get_height() * scale)),
+        )
+        return pygame.transform.smoothscale(surface, new_size)
+    except Exception:
+        surface = pygame.Surface((max_w, max_h))
+        surface.fill((45, 45, 52))
+        return surface
+
+
+def _refresh_board_detection_windows():
+    global board_detection_windows, board_detection_selected
+    global board_detection_page, board_detection_error
+    windows = _enumerate_capture_windows()
+    for window in windows:
+        try:
+            image, _rect = _capture_window_bgr(window["hwnd"])
+        except Exception:
+            image = None
+        window["thumbnail"] = _make_thumbnail_surface(image)
+    board_detection_windows = windows
+    board_detection_selected = max(
+        0, min(board_detection_selected, len(windows) - 1)
+    ) if windows else 0
+    board_detection_page = board_detection_selected // BOARD_DETECTION_WINDOWS_PER_PAGE
+    if windows:
+        board_detection_error = ""
+    elif os.name != "nt":
+        board_detection_error = "Window capture is available on Windows only."
+    else:
+        board_detection_error = "No suitable visible windows found. Open the chess window and Refresh."
+    return windows
+
+
+def _anchor_summary(anchor):
+    if not anchor:
+        return "not checked"
+    expected = anchor.get("expected_name", "piece")
+    if anchor.get("match") is True:
+        return f"{anchor.get('coordinate', '')} {expected} OK"
+    if anchor.get("detected_name"):
+        return (
+            f"{anchor.get('coordinate', '')} expected {expected}, "
+            f"found {anchor['detected_name']}"
+        )
+    return f"{anchor.get('coordinate', '')} {expected} (grid only)"
+
+
+def _board_detection_summary(result):
+    rect = result.get("board_rect", (0, 0, 0, 0))
+    anchors = result.get("anchors", {})
+    return (
+        f"Board found at x={rect[0]}, y={rect[1]}, size={rect[2]}px - "
+        f"{_anchor_summary(anchors.get('top_left'))}; "
+        f"{_anchor_summary(anchors.get('bottom_right'))}."
+    )
+
+
+def _board_detection_worker(window_info):
+    global board_detection_running, board_detection_result
+    global board_detection_result_ready, board_detection_error
+    global board_detection_status, board_detection_last_summary
+    try:
+        pr = _load_piece_recognition_module()
+        import cv2
+
+        image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
+        if image is None:
+            raise RuntimeError("Could not screenshot the selected window")
+        detection = detect_chessboard_in_image(image, pr_module=pr)
+        if detection is None:
+            board_detection_error = (
+                "No Chess.com-coloured 8x8 board found in that window. "
+                "Make sure the full board is visible and try again."
+            )
+            board_detection_last_summary = board_detection_error
+            return
+
+        board_rect = detection["board_rect"]
+        if window_rect:
+            detection["window_rect"] = window_rect
+            detection["screen_board_rect"] = (
+                window_rect[0] + board_rect[0],
+                window_rect[1] + board_rect[1],
+                board_rect[2],
+                board_rect[3],
+            )
+        detection["window_title"] = window_info.get("title", "Selected window")
+        detection["screenshot"] = image
+        detection["annotated"] = annotate_board_detection(image, detection, pr)
+
+        # Keep debug copies next to the existing board-vision outputs.
+        try:
+            os.makedirs("board_debug", exist_ok=True)
+            detection["screenshot_path"] = os.path.join(
+                "board_debug", "board_detection_screenshot.png"
+            )
+            detection["annotated_path"] = os.path.join(
+                "board_debug", "board_detection_annotated.png"
+            )
+            cv2.imwrite(detection["screenshot_path"], image)
+            cv2.imwrite(detection["annotated_path"], detection["annotated"])
+        except Exception as exc:
+            print(f"Board Detection: could not save debug screenshots: {exc}")
+
+        board_detection_result = detection
+        board_detection_last_summary = _board_detection_summary(detection)
+        board_detection_status = board_detection_last_summary
+        board_detection_error = ""
+        board_detection_result_ready = True
+    except Exception as exc:
+        board_detection_error = f"Board detection failed: {exc}"
+        board_detection_last_summary = board_detection_error
+        print(board_detection_error)
+    finally:
+        board_detection_running = False
+
+
+def start_board_detection(window_info):
+    global show_board_detection_dialog, board_detection_running
+    global board_detection_result, board_detection_result_ready
+    global board_detection_error, board_detection_status, _board_detection_thread
+    if board_detection_running or not window_info:
+        return False
+    show_board_detection_dialog = False
+    board_detection_result = None
+    board_detection_result_ready = False
+    board_detection_error = ""
+    board_detection_status = f"Capturing '{window_info.get('title', 'window')}'..."
+    board_detection_running = True
+    _board_detection_thread = threading.Thread(
+        target=_board_detection_worker,
+        args=(dict(window_info),),
+        daemon=True,
+    )
+    _board_detection_thread.start()
+    return True
+
+
+def show_board_detection_result(result):
+    """Open the annotated screenshot in a separate OpenCV window."""
+    global board_detection_error, board_detection_status
+    try:
+        import cv2
+
+        annotated = result.get("annotated")
+        if annotated is None:
+            raise RuntimeError("No annotated screenshot available")
+        title = "Board Detection Result - press Q/Esc to return"
+        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+        try:
+            info = pygame.display.Info()
+            max_w = max(480, info.current_w - 80)
+            max_h = max(360, info.current_h - 80)
+            scale = min(1.0, max_w / annotated.shape[1], max_h / annotated.shape[0])
+            if scale < 1.0:
+                cv2.resizeWindow(
+                    title,
+                    max(320, int(annotated.shape[1] * scale)),
+                    max(240, int(annotated.shape[0] * scale)),
+                )
+            while True:
+                cv2.imshow(title, annotated)
+                key = cv2.waitKey(50) & 0xFF
+                if key in (27, ord("q"), ord("Q"), 13, 10, 32):
+                    break
+                try:
+                    if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except Exception:
+                    pass
+        finally:
+            try:
+                cv2.destroyWindow(title)
+            except Exception:
+                pass
+        board_detection_status = _board_detection_summary(result)
+        return True
+    except Exception as exc:
+        board_detection_error = f"Board found, but the preview window could not open: {exc}"
+        board_detection_status = _board_detection_summary(result)
+        print(board_detection_error)
+        return False
+
+
+def update_board_detection():
+    """Open a finished worker's result on the main thread."""
+    global board_detection_result_ready
+    if board_detection_result_ready and board_detection_result is not None:
+        board_detection_result_ready = False
+        show_board_detection_result(board_detection_result)
+
+
+
+
+def get_board_detection_button_rect(offset_x=0, offset_y=0):
+    # Sit below the Auto-Move colour/status controls when they are shown;
+    # otherwise keep the Analysis page compact.
+    y = 452 if (auto_move_enabled or show_auto_color_dialog) else 330
+    return pygame.Rect(WIDTH // 2 - 220 + offset_x, y + offset_y, 440, 88)
+
+
+def _elide_text(text, font, max_width):
+    text = str(text)
+    if font.size(text)[0] <= max_width:
+        return text
+    suffix = "..."
+    while text and font.size(text + suffix)[0] > max_width:
+        text = text[:-1]
+    return text + suffix if text else suffix
+
+
+def open_board_detection_dialog():
+    global show_board_detection_dialog, board_detection_dialog_anim
+    global board_detection_status
+    if board_detection_running:
+        return False
+    board_detection_status = "Refreshing window previews..."
+    _refresh_board_detection_windows()
+    board_detection_status = ""
+    show_board_detection_dialog = True
+    board_detection_dialog_anim = 0.0
+    return True
+
+
+def get_board_detection_dialog_rects():
+    e = cubic_ease_in_out(max(0.0, min(1.0, board_detection_dialog_anim)))
+    w, h = 680, 720
+    x = WIDTH // 2 - w // 2
+    y = HEIGHT // 2 - h // 2 - int((1 - e) * 18)
+    panel = pygame.Rect(x, y, w, h)
+
+    cards = []
+    start = board_detection_page * BOARD_DETECTION_WINDOWS_PER_PAGE
+    visible = board_detection_windows[start:start + BOARD_DETECTION_WINDOWS_PER_PAGE]
+    for index, _window in enumerate(visible):
+        card = pygame.Rect(
+            panel.x + 32 + (index % 2) * (300 + 16),
+            panel.y + 108 + (index // 2) * (150 + 14),
+            300,
+            150,
+        )
+        cards.append((start + index, card))
+
+    prev_rect = pygame.Rect(panel.x + 32, panel.y + 66, 74, 30)
+    next_rect = pygame.Rect(panel.x + 114, panel.y + 66, 74, 30)
+    refresh_rect = pygame.Rect(panel.x + 32, panel.bottom - 62, 130, 40)
+    cancel_rect = pygame.Rect(panel.centerx - 65, panel.bottom - 62, 130, 40)
+    detect_rect = pygame.Rect(panel.right - 32 - 170, panel.bottom - 62, 170, 40)
+    return panel, cards, refresh_rect, cancel_rect, detect_rect, prev_rect, next_rect
+
+
+def _draw_board_detection_button(screen, rect, label, enabled=True, primary=False):
+    mx, my = pygame.mouse.get_pos()
+    hovered = enabled and rect.collidepoint(mx, my)
+    if not enabled:
+        bg = (55, 55, 62)
+    elif primary:
+        bg = (74, 158, 96) if hovered else (56, 130, 78)
+    else:
+        bg = (92, 92, 110) if hovered else (70, 70, 82)
+    pygame.draw.rect(screen, bg, rect, border_radius=9)
+    pygame.draw.rect(
+        screen,
+        (140, 230, 160) if hovered and primary else MENU_BORDER_COLOR,
+        rect, 2, border_radius=9,
+    )
+    text = font_small.render(label, True, TEXT_COLOR if enabled else TEXT_MUTED)
+    screen.blit(text, text.get_rect(center=rect.center))
+
+
+def draw_board_detection_dialog(screen):
+    e = cubic_ease_in_out(max(0.0, min(1.0, board_detection_dialog_anim)))
+    panel, cards, refresh_rect, cancel_rect, detect_rect, prev_rect, next_rect = (
+        get_board_detection_dialog_rects()
+    )
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, int(175 * e)))
+    screen.blit(overlay, (0, 0))
+
+    pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
+    pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
+    pygame.draw.rect(screen, (80, 160, 255), panel, 2, border_radius=14)
+
+    title = font_large.render("Board Detection", True, TEXT_COLOR)
+    screen.blit(title, (panel.x + 32, panel.y + 20))
+    subtitle = font_small.render("Choose the window containing the chessboard", True, TEXT_MUTED)
+    screen.blit(subtitle, (panel.x + 32, panel.y + 50))
+
+    page_count = max(
+        1,
+        (len(board_detection_windows) + BOARD_DETECTION_WINDOWS_PER_PAGE - 1)
+        // BOARD_DETECTION_WINDOWS_PER_PAGE,
+    )
+    _draw_board_detection_button(screen, prev_rect, "Prev", enabled=board_detection_page > 0)
+    _draw_board_detection_button(
+        screen, next_rect, "Next", enabled=board_detection_page < page_count - 1
+    )
+    page_text = font_tiny.render(
+        f"Page {board_detection_page + 1} of {page_count}", True, TEXT_MUTED
+    )
+    screen.blit(page_text, (next_rect.right + 14, prev_rect.y + 7))
+
+    mx, my = pygame.mouse.get_pos()
+    if not board_detection_windows:
+        message = board_detection_error or "No windows available."
+        message_s = font_small.render(_elide_text(message, font_small, panel.width - 80), True, TEXT_MUTED)
+        screen.blit(message_s, message_s.get_rect(center=(panel.centerx, panel.centery - 20)))
+        hint = font_tiny.render("Open the chess window, then press Refresh.", True, TEXT_MUTED)
+        screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.centery + 12)))
+    else:
+        for window_index, card in cards:
+            window = board_detection_windows[window_index]
+            selected = window_index == board_detection_selected
+            hovered = card.collidepoint(mx, my)
+            bg = (72, 82, 112) if selected else (64, 64, 76) if hovered else (56, 56, 66)
+            pygame.draw.rect(screen, bg, card, border_radius=10)
+            pygame.draw.rect(
+                screen,
+                (80, 220, 140) if selected else (130, 170, 255) if hovered else MENU_BORDER_COLOR,
+                card, 3 if selected else 2, border_radius=10,
+            )
+            preview_rect = pygame.Rect(card.x + 10, card.y + 8, card.width - 20, 92)
+            pygame.draw.rect(screen, (12, 12, 14), preview_rect, border_radius=6)
+            thumb = window.get("thumbnail")
+            if thumb is not None:
+                screen.blit(thumb, thumb.get_rect(center=preview_rect.center))
+            title_text = _elide_text(window.get("title", "Untitled window"), font_tiny, card.width - 20)
+            title_s = font_tiny.render(title_text, True, TEXT_COLOR)
+            screen.blit(title_s, (card.x + 10, card.y + 108))
+            rect = window.get("rect", (0, 0, 0, 0))
+            dims = f"{rect[2] - rect[0]} x {rect[3] - rect[1]}"
+            dims_s = font_tiny.render(dims, True, TEXT_MUTED)
+            screen.blit(dims_s, (card.x + 10, card.y + 128))
+            if selected:
+                sel_s = font_tiny.render("Selected", True, (140, 230, 160))
+                screen.blit(sel_s, (card.right - sel_s.get_width() - 10, card.y + 128))
+
+    if board_detection_windows:
+        selected_title = board_detection_windows[board_detection_selected].get("title", "")
+        detail = f"Selected: {_elide_text(selected_title, font_tiny, panel.width - 140)}"
+    elif board_detection_error:
+        detail = board_detection_error
+    else:
+        detail = "Select a preview, then Capture & Detect."
+    detail_s = font_tiny.render(_elide_text(detail, font_tiny, panel.width - 64), True, TEXT_MUTED)
+    screen.blit(detail_s, (panel.x + 32, panel.bottom - 92))
+
+    _draw_board_detection_button(screen, refresh_rect, "Refresh")
+    _draw_board_detection_button(screen, cancel_rect, "Cancel")
+    _draw_board_detection_button(
+        screen,
+        detect_rect,
+        "Working..." if board_detection_running else "Capture & Detect",
+        enabled=bool(board_detection_windows) and not board_detection_running,
+        primary=True,
+    )
+
+
+def _board_detection_page_count():
+    return max(
+        1,
+        (len(board_detection_windows) + BOARD_DETECTION_WINDOWS_PER_PAGE - 1)
+        // BOARD_DETECTION_WINDOWS_PER_PAGE,
+    )
+
+
+def move_board_detection_page(delta):
+    global board_detection_page
+    board_detection_page = max(
+        0, min(_board_detection_page_count() - 1, board_detection_page + int(delta))
+    )
+    return board_detection_page
+
+
+def handle_board_detection_click(mx, my):
+    global show_board_detection_dialog, board_detection_selected
+    panel, cards, refresh_rect, cancel_rect, detect_rect, prev_rect, next_rect = (
+        get_board_detection_dialog_rects()
+    )
+    if cancel_rect.collidepoint(mx, my) or not panel.collidepoint(mx, my):
+        show_board_detection_dialog = False
+        return True
+    if refresh_rect.collidepoint(mx, my):
+        _refresh_board_detection_windows()
+        return True
+    if prev_rect.collidepoint(mx, my):
+        move_board_detection_page(-1)
+        return True
+    if next_rect.collidepoint(mx, my):
+        move_board_detection_page(1)
+        return True
+    for window_index, card in cards:
+        if card.collidepoint(mx, my):
+            board_detection_selected = window_index
+            return True
+    if detect_rect.collidepoint(mx, my) and board_detection_windows:
+        start_board_detection(board_detection_windows[board_detection_selected])
+        return True
+    return True
+
+
+def handle_board_detection_key(key):
+    global show_board_detection_dialog, board_detection_selected, board_detection_page
+    if key == pygame.K_ESCAPE:
+        show_board_detection_dialog = False
+        return True
+    if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+        if board_detection_windows:
+            start_board_detection(board_detection_windows[board_detection_selected])
+        return True
+    if key == pygame.K_r:
+        _refresh_board_detection_windows()
+        return True
+    if not board_detection_windows:
+        return True
+    delta = 0
+    if key == pygame.K_RIGHT:
+        delta = 1
+    elif key == pygame.K_LEFT:
+        delta = -1
+    elif key == pygame.K_DOWN:
+        delta = 2
+    elif key == pygame.K_UP:
+        delta = -2
+    elif key == pygame.K_PAGEDOWN:
+        move_board_detection_page(1)
+        return True
+    elif key == pygame.K_PAGEUP:
+        move_board_detection_page(-1)
+        return True
+    if delta:
+        board_detection_selected = max(
+            0,
+            min(len(board_detection_windows) - 1, board_detection_selected + delta),
+        )
+        board_detection_page = (
+            board_detection_selected // BOARD_DETECTION_WINDOWS_PER_PAGE
+        )
+    return True
+
+
 # --- Toggle rows / Analysis page ---
 def draw_toggle_row(screen, rect, label, subtitle, on, anim, hovered):
     """Card row with a sliding on/off pill on the right."""
@@ -2713,6 +3922,49 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
         status = auto_move_status_text or "Active"
         status_s = font_tiny.render(status, True, TEXT_ACCENT)
         screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 398 + offset_y))
+
+    # Board Detection action card (not a toggle): opens the window picker.
+    bd_rect = get_board_detection_button_rect(offset_x, offset_y)
+    bd_hovered = idle and not board_detection_running and bd_rect.collidepoint(mx, my)
+    bd_bg = (62, 72, 104) if bd_hovered else (58, 58, 68)
+    pygame.draw.rect(screen, bd_bg, bd_rect, border_radius=12)
+    pygame.draw.rect(
+        screen,
+        (80, 160, 255) if bd_hovered else MENU_BORDER_COLOR,
+        bd_rect, 2, border_radius=12,
+    )
+    bd_title = font_large.render("Board Detection", True, TEXT_COLOR)
+    screen.blit(bd_title, (bd_rect.x + 18, bd_rect.y + 14))
+    bd_sub = font_tiny.render("Find a chessboard in another window", True, TEXT_MUTED)
+    screen.blit(bd_sub, (bd_rect.x + 18, bd_rect.y + 50))
+    chip_rect = pygame.Rect(bd_rect.right - 136, bd_rect.centery - 18, 118, 36)
+    _draw_board_detection_button(
+        screen,
+        chip_rect,
+        "Working..." if board_detection_running else "Detect",
+        enabled=not board_detection_running,
+        primary=True,
+    )
+
+    if board_detection_running:
+        bd_status = board_detection_status or "Capturing and detecting board..."
+        bd_colour = TEXT_MUTED
+    elif board_detection_error:
+        bd_status = board_detection_error
+        bd_colour = TEXT_STATUS
+    elif board_detection_last_summary:
+        bd_status = board_detection_last_summary
+        bd_colour = TEXT_ACCENT
+    else:
+        bd_status = "Anchors: a8 black rook (top-left) and h1 white rook (bottom-right)."
+        bd_colour = TEXT_MUTED
+    bd_status_s = font_tiny.render(
+        _elide_text(bd_status, font_tiny, 620), True, bd_colour
+    )
+    screen.blit(
+        bd_status_s,
+        (WIDTH // 2 - bd_status_s.get_width() // 2 + offset_x, bd_rect.bottom + 16 + offset_y),
+    )
 
 
 def get_auto_color_dialog_rects():
@@ -3302,6 +4554,10 @@ def handle_menu_click(mx, my):
                     if color != auto_move_color:
                         set_auto_move(True, color=color)
                     return True
+        if get_board_detection_button_rect().collidepoint(mx, my):
+            if not board_detection_running:
+                open_board_detection_dialog()
+            return True
 
     elif settings_menu_state == "board":
         for page, rect in get_board_hub_rects().items():
@@ -4046,6 +5302,10 @@ def draw_gui(
     if show_auto_color_dialog:
         draw_auto_color_dialog(screen)
 
+    # Board Detection window picker (also from the Analysis page).
+    if show_board_detection_dialog:
+        draw_board_detection_dialog(screen)
+
     pygame.display.flip()
 
 
@@ -4153,6 +5413,7 @@ def main():
         update_board_layout_anim()
         update_slider_display()
         update_global_anims()
+        update_board_detection()
 
         is_check = board.is_check()
         is_mate = board.is_checkmate()
@@ -4224,6 +5485,8 @@ def main():
             and not show_newgame_confirm
             and not show_game_over
             and not show_auto_color_dialog
+            and not show_board_detection_dialog
+            and not board_detection_running
             and promotion_pending is None
             and not dragging
             and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims)
@@ -4261,6 +5524,11 @@ def main():
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
+
+                # Board Detection window picker is modal over Settings.
+                if show_board_detection_dialog:
+                    handle_board_detection_click(mx, my)
+                    continue
 
                 # Confirmation dialog has priority over everything
                 if show_newgame_confirm:
@@ -4439,7 +5707,12 @@ def main():
                         engine_slider_dragging = None
 
             elif event.type == pygame.MOUSEWHEEL:
-                if (
+                if show_board_detection_dialog:
+                    if event.y < 0:
+                        move_board_detection_page(1)
+                    elif event.y > 0:
+                        move_board_detection_page(-1)
+                elif (
                     settings_menu_open
                     and settings_menu_state == "pieces_style"
                     and menu_transition_direction == "none"
@@ -4449,6 +5722,9 @@ def main():
                     scroll_theme_list(-event.y * theme_scroll_speed)
 
             elif event.type == pygame.KEYDOWN:
+                if show_board_detection_dialog:
+                    handle_board_detection_key(event.key)
+                    continue
                 if event.key == pygame.K_ESCAPE:
                     if show_newgame_confirm:
                         show_newgame_confirm=False
