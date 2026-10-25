@@ -1,5 +1,7 @@
 
 # piece_recognition.py
+import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -8,6 +10,7 @@ import chess
 
 # ---------- CONFIGURATION ----------
 SQUARE_DIR = Path("board_debug")
+AUTOPLAY_DICTIONARY_PATH = Path("autoplaydictionary.json")
 
 # Reference sprites come from the same chess.com piece sets the main app
 # uses: pieces/chesscom/<style>/ (change PIECE_STYLE to use another set).
@@ -50,6 +53,34 @@ ASSETS = {
     "n": "bn",
     "p": "bp",
 }
+
+# Human-readable labels used by the review UI and autoplaydictionary.json.
+PIECE_NAMES = {
+    ".": "blank square",
+    "K": "white king",
+    "Q": "white queen",
+    "R": "white rook",
+    "B": "white bishop",
+    "N": "white knight",
+    "P": "white pawn",
+    "k": "black king",
+    "q": "black queen",
+    "r": "black rook",
+    "b": "black bishop",
+    "n": "black knight",
+    "p": "black pawn",
+    "?": "unknown",
+}
+PIECE_CHOICES = (".", "K", "Q", "R", "B", "N", "P", "k", "q", "r", "b", "n", "p")
+SOURCE_LABELS = {
+    "auto": "auto review",
+    "manual": "manual review",
+    "unknown": "needs review",
+}
+
+# Internal picker results that are not piece symbols.
+SKIP_CHOICE = "<skip>"
+CANCEL_CHOICE = "<cancel>"
 
 
 def _hex_to_bgr(hex_colour):
@@ -216,43 +247,36 @@ def classify_square(square, sprites):
     return symbol, confidence, ranked
 
 
-def recognize_board():
-    sprites = load_assets()
-    grid = []
-    review = []
+def piece_name(symbol):
+    """Return the human-readable label for a board symbol."""
+    return PIECE_NAMES.get(symbol, "unknown")
 
-    for row in range(8):
-        grid_row = []
 
-        for col in range(8):
-            path = SQUARE_DIR / f"r{row}_c{col}.png"
-            square = cv2.imread(str(path))
+def square_image_path(row, col):
+    """Return the board_debug crop path for one square."""
+    return SQUARE_DIR / f"r{row}_c{col}.png"
 
-            if square is None:
-                raise FileNotFoundError(
-                    f"Cannot load square crop: {path}"
-                )
 
-            symbol, confidence, ranked = classify_square(
-                square, sprites
-            )
-            grid_row.append(symbol)
+def square_coordinate(row, col):
+    """Return algebraic notation assuming row 0 is rank 8, col 0 is file a."""
+    return f"{'abcdefgh'[col]}{8 - row}"
 
-            print(
-                f"row={row} col={col}: "
-                f"{symbol} confidence={confidence:.2f}"
-            )
 
-            if symbol == "?":
-                review.append((row, col, ranked[:3]))
+def square_status_text(row, col, grid, sources, confidences=None):
+    """Describe one square for the verification grid's hover display."""
+    symbol = grid[row][col]
+    source = sources[row][col]
+    text = (
+        f"{square_coordinate(row, col)} (row {row}, col {col}): "
+        f"{piece_name(symbol)} - {SOURCE_LABELS.get(source, source)}"
+    )
+    if confidences is not None and source in ("auto", "unknown"):
+        text += f" (confidence {confidences[row][col]:.2f})"
+    return text
 
-        grid.append(grid_row)
 
-    print("\nRecognized board (rank 8 down to rank 1):")
-    for row in grid:
-        print(" ".join(row))
-
-    # Convert recognized pieces into FEN placement.
+def fen_placement(grid):
+    """Convert a recognized symbol grid into the FEN piece-placement field."""
     fen_rows = []
     for row in grid:
         fen_row = ""
@@ -272,16 +296,516 @@ def recognize_board():
 
         fen_rows.append(fen_row)
 
-    placement = "/".join(fen_rows)
+    return "/".join(fen_rows)
+
+
+def build_autoplay_dictionary(grid):
+    """Map every square-image path to its final human-readable piece label."""
+    return {
+        square_image_path(row, col).as_posix(): piece_name(grid[row][col])
+        for row in range(8)
+        for col in range(8)
+    }
+
+
+def write_autoplay_dictionary(grid, path=AUTOPLAY_DICTIONARY_PATH):
+    """Write the square-image -> piece dictionary as JSON and return it."""
+    data = build_autoplay_dictionary(grid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return data
+
+
+# ---------- REVIEW / VERIFICATION UI ----------
+
+CHOICE_ORIGIN = (425, 118)
+CHOICE_BUTTON_W = 270
+CHOICE_BUTTON_H = 44
+CHOICE_GAP_X = 18
+CHOICE_GAP_Y = 12
+
+GRID_CELL_SIZE = 92
+GRID_HEADER_H = 96
+GRID_WIDTH = GRID_CELL_SIZE * 8
+GRID_HEIGHT = GRID_HEADER_H + GRID_CELL_SIZE * 8
+
+
+def piece_choice_rects(origin=CHOICE_ORIGIN):
+    """Return [(choice, (x, y, w, h)), ...] for the piece-picker buttons."""
+    rects = []
+    choices = PIECE_CHOICES + (SKIP_CHOICE,)
+    for index, choice in enumerate(choices):
+        x = origin[0] + (index % 2) * (CHOICE_BUTTON_W + CHOICE_GAP_X)
+        y = origin[1] + (index // 2) * (CHOICE_BUTTON_H + CHOICE_GAP_Y)
+        rects.append((choice, (x, y, CHOICE_BUTTON_W, CHOICE_BUTTON_H)))
+    return rects
+
+
+def choice_for_point(x, y, rects):
+    """Return the picker choice containing (x, y), or None."""
+    for choice, (rx, ry, rw, rh) in rects:
+        if rx <= x < rx + rw and ry <= y < ry + rh:
+            return choice
+    return None
+
+
+def grid_cell_at(x, y):
+    """Return (row, col) for a point in the verification grid, or None."""
+    if x < 0 or y < GRID_HEADER_H:
+        return None
+    col = int(x // GRID_CELL_SIZE)
+    row = int((y - GRID_HEADER_H) // GRID_CELL_SIZE)
+    if 0 <= row < 8 and 0 <= col < 8:
+        return row, col
+    return None
+
+
+def _draw_text(canvas, text, origin, scale=0.6, colour=(255, 255, 255),
+               thickness=1, outline=False):
+    """Small putText wrapper, optionally with a black outline for contrast."""
+    if outline:
+        cv2.putText(
+            canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+            scale, (0, 0, 0), thickness + 2, cv2.LINE_AA,
+        )
+    cv2.putText(
+        canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+        scale, colour, thickness, cv2.LINE_AA,
+    )
+
+
+def _draw_square_preview(canvas, square, box):
+    """Draw a square crop centred inside box=(x, y, w, h), keeping aspect."""
+    x, y, w, h = box
+    cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), (15, 15, 15), -1)
+
+    image = square[:, :, :3]
+    img_h, img_w = image.shape[:2]
+    scale = min(w / img_w, h / img_h)
+    new_w = max(1, round(img_w * scale))
+    new_h = max(1, round(img_h * scale))
+    interpolation = cv2.INTER_NEAREST if scale >= 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+
+    paste_x = x + (w - new_w) // 2
+    paste_y = y + (h - new_h) // 2
+    canvas[paste_y:paste_y + new_h, paste_x:paste_x + new_w] = resized
+    cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), (180, 180, 180), 1)
+
+
+def _button_label(choice):
+    return "Skip / unsure" if choice == SKIP_CHOICE else piece_name(choice).title()
+
+
+def choose_piece_ui(square, row, col, ranked=None, confidence=None,
+                    current=None, progress=None, mode="review",
+                    title="Piece review"):
+    """Ask the user what piece (or blank) is in one square crop.
+
+    Returns a symbol from PIECE_CHOICES, None to skip/leave unchanged, or
+    CANCEL_CHOICE when the user presses Esc to stop reviewing.
+    """
+    width, height = 1020, 660
+    rects = piece_choice_rects()
+    state = {"mouse": (-1, -1), "selected": None}
+    top_guess = ranked[0][0] if ranked else None
+
+    def on_mouse(event, x, y, flags, param):
+        state["mouse"] = (x, y)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            choice = choice_for_point(x, y, rects)
+            if choice is not None:
+                state["selected"] = choice
+
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    try:
+        cv2.resizeWindow(title, width, height)
+        cv2.setMouseCallback(title, on_mouse)
+
+        while True:
+            selected = state["selected"]
+            if selected is not None:
+                return None if selected == SKIP_CHOICE else selected
+
+            canvas = np.full((height, width, 3), 38, np.uint8)
+            if progress is not None:
+                heading = f"Manual review {progress[0]} of {progress[1]}"
+            elif mode == "edit":
+                heading = "Edit this square"
+            else:
+                heading = "What piece is in this square?"
+            _draw_text(canvas, heading, (24, 34), scale=0.72, thickness=2)
+            _draw_text(
+                canvas,
+                f"{square_image_path(row, col).as_posix()} - "
+                f"{square_coordinate(row, col)} (row {row}, col {col})",
+                (24, 62), scale=0.55,
+            )
+            if ranked:
+                guesses = ", ".join(
+                    f"{piece_name(symbol)} ({error:.3f})"
+                    for symbol, error in ranked[:3]
+                )
+                detail = f"Auto guesses: {guesses}"
+                if confidence is not None:
+                    detail += f" - confidence {confidence:.2f}"
+            elif current is not None:
+                detail = f"Current: {piece_name(current)}"
+            else:
+                detail = "Choose the piece shown, or Blank Square."
+            _draw_text(canvas, detail, (24, 90), scale=0.5, colour=(210, 230, 255))
+
+            _draw_square_preview(canvas, square, (28, 118, 360, 360))
+
+            mouse_x, mouse_y = state["mouse"]
+            for choice, (x, y, w, h) in rects:
+                if choice == SKIP_CHOICE:
+                    fill, text_colour = (90, 80, 130), (255, 255, 255)
+                elif choice == ".":
+                    fill, text_colour = (95, 95, 95), (255, 255, 255)
+                elif choice.isupper():
+                    fill, text_colour = (235, 235, 235), (0, 0, 0)
+                else:
+                    fill, text_colour = (28, 28, 28), (255, 255, 255)
+
+                border, border_width = (165, 165, 165), 1
+                if choice == top_guess:
+                    border, border_width = (40, 220, 40), 3
+                if choice == current:
+                    border, border_width = (255, 255, 0), 3
+                if x <= mouse_x < x + w and y <= mouse_y < y + h:
+                    border, border_width = (0, 255, 255), 3
+
+                cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), fill, -1)
+                cv2.rectangle(
+                    canvas, (x, y), (x + w - 1, y + h - 1), border, border_width
+                )
+                _draw_text(
+                    canvas, _button_label(choice), (x + 14, y + 29),
+                    scale=0.56, colour=text_colour,
+                )
+
+            _draw_text(
+                canvas,
+                "Click a piece, or type K/Q/R/B/N/P: Shift = white, lower-case = black, . = blank.",
+                (24, 608), scale=0.46, colour=(220, 220, 220),
+            )
+            _draw_text(
+                canvas,
+                "Enter accepts the top auto guess/current piece. S skips this square. Esc stops review.",
+                (24, 634), scale=0.46, colour=(220, 220, 220),
+            )
+            cv2.imshow(title, canvas)
+
+            key = cv2.waitKey(20) & 0xFF
+            if key == 27:
+                return CANCEL_CHOICE
+            if key in (13, 10):
+                if top_guess in PIECE_CHOICES:
+                    return top_guess
+                if current in PIECE_CHOICES:
+                    return current
+            if 0 <= key < 128:
+                char = chr(key)
+                if char in ("s", "S"):
+                    return None
+                if char == "0":
+                    return "."
+                if char in PIECE_CHOICES:
+                    return char
+    finally:
+        cv2.destroyWindow(title)
+
+
+def manual_review_squares(grid, sources, squares, review):
+    """Show each uncertain square and ask what piece it contains.
+
+    Mutates grid/sources for answered squares and returns the items that
+    are still unresolved (skipped, or not reached after Esc).
+    """
+    remaining = []
+
+    for index, item in enumerate(review):
+        row, col, ranked = item[0], item[1], item[2]
+        confidence = item[3] if len(item) > 3 else None
+        selected = choose_piece_ui(
+            squares[row][col], row, col,
+            ranked=ranked,
+            confidence=confidence,
+            current=grid[row][col],
+            progress=(index + 1, len(review)),
+            mode="review",
+        )
+
+        if selected == CANCEL_CHOICE:
+            remaining.extend(review[index:])
+            break
+        if selected is None:
+            remaining.append(item)
+            continue
+
+        grid[row][col] = selected
+        sources[row][col] = "manual"
+        print(
+            f"Manual review row={row} col={col}: {piece_name(selected)}"
+        )
+
+    return remaining
+
+
+def verification_grid_ui(grid, sources, squares, confidences=None,
+                         on_change=None, title="Verify recognized board"):
+    """Show the full board; hover explains a square, click edits it."""
+    state = {"mouse": (-1, -1), "clicked": None}
+
+    def on_mouse(event, x, y, flags, param):
+        state["mouse"] = (x, y)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            cell = grid_cell_at(x, y)
+            if cell is not None:
+                state["clicked"] = cell
+
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    try:
+        cv2.resizeWindow(title, GRID_WIDTH, GRID_HEIGHT)
+        cv2.setMouseCallback(title, on_mouse)
+
+        badges = {
+            "auto": ("A", (60, 190, 60)),
+            "manual": ("M", (0, 150, 255)),
+            "unknown": ("?", (60, 60, 230)),
+        }
+
+        while True:
+            if state["clicked"] is not None:
+                row, col = state["clicked"]
+                state["clicked"] = None
+                selected = choose_piece_ui(
+                    squares[row][col], row, col,
+                    current=grid[row][col],
+                    mode="edit",
+                    title="Edit square",
+                )
+                if selected in PIECE_CHOICES:
+                    grid[row][col] = selected
+                    sources[row][col] = "manual"
+                    print(
+                        f"Edited row={row} col={col}: "
+                        f"{piece_name(selected)} (manual review)"
+                    )
+                    if on_change is not None:
+                        on_change()
+
+            hover = grid_cell_at(*state["mouse"])
+            canvas = np.full((GRID_HEIGHT, GRID_WIDTH, 3), 28, np.uint8)
+
+            for row in range(8):
+                for col in range(8):
+                    x = col * GRID_CELL_SIZE
+                    y = GRID_HEADER_H + row * GRID_CELL_SIZE
+                    tile = squares[row][col][:, :, :3]
+                    interpolation = (
+                        cv2.INTER_NEAREST
+                        if max(tile.shape[:2]) < GRID_CELL_SIZE
+                        else cv2.INTER_AREA
+                    )
+                    resized = cv2.resize(
+                        tile, (GRID_CELL_SIZE, GRID_CELL_SIZE),
+                        interpolation=interpolation,
+                    )
+                    canvas[y:y + GRID_CELL_SIZE, x:x + GRID_CELL_SIZE] = resized
+                    cv2.rectangle(
+                        canvas, (x, y),
+                        (x + GRID_CELL_SIZE - 1, y + GRID_CELL_SIZE - 1),
+                        (75, 75, 75), 1,
+                    )
+
+                    symbol = grid[row][col]
+                    code = ASSETS.get(symbol, "blank" if symbol == "." else "?")
+                    (text_w, _), _ = cv2.getTextSize(
+                        code, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
+                    )
+                    cv2.rectangle(
+                        canvas,
+                        (x + 3, y + GRID_CELL_SIZE - 22),
+                        (x + text_w + 9, y + GRID_CELL_SIZE - 3),
+                        (0, 0, 0), -1,
+                    )
+                    _draw_text(
+                        canvas, code, (x + 6, y + GRID_CELL_SIZE - 7),
+                        scale=0.45,
+                    )
+
+                    letter, colour = badges.get(
+                        sources[row][col], ("?", (60, 60, 230))
+                    )
+                    cv2.circle(canvas, (x + 14, y + 14), 11, colour, -1)
+                    _draw_text(
+                        canvas, letter, (x + 9, y + 19),
+                        scale=0.42, colour=(0, 0, 0), thickness=1,
+                    )
+
+            if hover is not None:
+                row, col = hover
+                x = col * GRID_CELL_SIZE
+                y = GRID_HEADER_H + row * GRID_CELL_SIZE
+                cv2.rectangle(
+                    canvas, (x, y),
+                    (x + GRID_CELL_SIZE - 1, y + GRID_CELL_SIZE - 1),
+                    (0, 255, 255), 3,
+                )
+                status = square_status_text(
+                    row, col, grid, sources, confidences
+                )
+            else:
+                status = "Hover a square to see its piece and review source."
+
+            _draw_text(canvas, status, (14, 30), scale=0.58, thickness=1)
+            _draw_text(
+                canvas,
+                "Click any square to edit it. Changes save immediately. S = save, Q/Esc = close.",
+                (14, 58), scale=0.46, colour=(215, 215, 215),
+            )
+            _draw_text(
+                canvas,
+                "A = auto review, M = manual review, ? = needs review.",
+                (14, 82), scale=0.46, colour=(215, 215, 215),
+            )
+            cv2.imshow(title, canvas)
+
+            key = cv2.waitKey(20) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+            if key in (ord("s"), ord("S")) and on_change is not None:
+                on_change()
+    finally:
+        cv2.destroyWindow(title)
+
+    return grid
+
+
+def recognize_board(interactive=True):
+    """Recognize all 64 crops, optionally opening the verification UIs.
+
+    When interactive, uncertain squares are shown one at a time for manual
+    review, then the full board grid is shown for a final hover/click
+    verification pass. The final labels are written to
+    autoplaydictionary.json either way.
+    """
+    sprites = load_assets()
+    grid = []
+    sources = []
+    confidences = []
+    squares = []
+    review = []
+    ranked_by_square = {}
+
+    for row in range(8):
+        grid_row = []
+        source_row = []
+        confidence_row = []
+        square_row = []
+
+        for col in range(8):
+            path = square_image_path(row, col)
+            square = cv2.imread(str(path))
+
+            if square is None:
+                raise FileNotFoundError(
+                    f"Cannot load square crop: {path}"
+                )
+
+            symbol, confidence, ranked = classify_square(
+                square, sprites
+            )
+            grid_row.append(symbol)
+            source_row.append("unknown" if symbol == "?" else "auto")
+            confidence_row.append(confidence)
+            square_row.append(square)
+
+            print(
+                f"row={row} col={col}: "
+                f"{symbol} confidence={confidence:.2f}"
+            )
+
+            if symbol == "?":
+                top_ranked = ranked[:3]
+                review.append((row, col, top_ranked, confidence))
+                ranked_by_square[(row, col)] = top_ranked
+
+        grid.append(grid_row)
+        sources.append(source_row)
+        confidences.append(confidence_row)
+        squares.append(square_row)
+
+    if interactive:
+        if review:
+            print(
+                f"\nOpening manual review for {len(review)} uncertain "
+                "square(s)..."
+            )
+            try:
+                review = manual_review_squares(
+                    grid, sources, squares, review
+                )
+                write_autoplay_dictionary(grid)
+                print(
+                    "Saved manual-review labels to "
+                    f"{AUTOPLAY_DICTIONARY_PATH}"
+                )
+            except cv2.error as exc:
+                print(
+                    "Could not open the manual-review UI; uncertain "
+                    f"squares remain marked '?'. ({exc})"
+                )
+        else:
+            print("\nNo squares need manual review.")
+
+        print(
+            "Opening final board verification: hover a square for its "
+            "piece/source, click it to edit."
+        )
+        try:
+            verification_grid_ui(
+                grid,
+                sources,
+                squares,
+                confidences=confidences,
+                on_change=lambda: write_autoplay_dictionary(grid),
+            )
+        except cv2.error as exc:
+            print(f"Could not open the final verification UI. ({exc})")
+
+    # Always write the final verified labels, including any edits made in
+    # the full-grid verification window.
+    write_autoplay_dictionary(grid)
+    print(f"\nWrote {AUTOPLAY_DICTIONARY_PATH} (64 square labels).")
+
+    print("\nRecognized board (rank 8 down to rank 1):")
+    for row in grid:
+        print(" ".join(row))
+
+    placement = fen_placement(grid)
     print("\nFEN placement:", placement)
 
-    if review:
-        print("\nSquares needing manual review:")
-        for row, col, ranked in review:
-            print(f"  row {row}, col {col}: {ranked}")
+    unresolved = [
+        (row, col)
+        for row in range(8)
+        for col in range(8)
+        if grid[row][col] == "?"
+    ]
+    if unresolved:
+        print("\nSquares still needing manual review:")
+        for row, col in unresolved:
+            ranked = ranked_by_square.get((row, col), [])
+            suffix = f": {ranked}" if ranked else ""
+            print(f"  row {row}, col {col}{suffix}")
 
     return grid, placement
 
 
 if __name__ == "__main__":
-    grid, placement = recognize_board()
+    grid, placement = recognize_board(interactive="--no-ui" not in sys.argv)
