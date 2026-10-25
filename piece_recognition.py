@@ -20,6 +20,20 @@ PIECE_SCALE = 0.82
 # Lower = stricter matching. Tune after testing real screenshots.
 MIN_CONFIDENCE = 0.35
 
+# Chess.com light/dark square colours present in the board_debug crops.
+# Those pixels are background, so they are removed before a crop is scored
+# against a piece template.
+SQUARE_BG_HEX = ("#ebecd0", "#739552")
+# Screenshots rarely reproduce those hex values exactly: browser/display
+# scaling, resampling and anti-aliased square edges shift the shade a
+# little. A pixel therefore counts as square background when every channel
+# is within this tolerance of either target colour.
+SQUARE_BG_TOLERANCE = 24
+# Neither the board nor the piece sprites legitimately contain magenta,
+# so removed background pixels are painted this colour in both the crop
+# and the candidate template; they then contribute no matching error.
+REMOVED_BG_BGR = (255, 0, 255)
+
 # FEN symbol -> sprite file stem in PIECE_DIR: colour letter ('w'/'b')
 # plus piece letter, e.g. "wr" = white rook -> pieces/chesscom/default/wr.png.
 ASSETS = {
@@ -36,6 +50,38 @@ ASSETS = {
     "n": "bn",
     "p": "bp",
 }
+
+
+def _hex_to_bgr(hex_colour):
+    """Convert an RGB hex colour such as '#ebecd0' to OpenCV BGR order."""
+    value = hex_colour.lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"Expected a 6-digit hex colour, got {hex_colour!r}")
+    red, green, blue = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return np.array((blue, green, red), dtype=np.int16)
+
+
+SQUARE_BG_BGR = tuple(_hex_to_bgr(colour) for colour in SQUARE_BG_HEX)
+
+
+def square_background_mask(image):
+    """Return True for pixels matching either square colour (with tolerance)."""
+    bgr = image[:, :, :3].astype(np.int16)
+    mask = np.zeros(image.shape[:2], dtype=bool)
+
+    for colour in SQUARE_BG_BGR:
+        # Chebyshev distance: the largest absolute per-channel difference.
+        channel_difference = np.max(np.abs(bgr - colour), axis=2)
+        mask |= channel_difference <= SQUARE_BG_TOLERANCE
+
+    return mask
+
+
+def remove_square_background(image):
+    """Replace approximate light/dark square-colour pixels with magenta."""
+    cleaned = image.copy()
+    cleaned[square_background_mask(cleaned)] = REMOVED_BG_BGR
+    return cleaned
 
 
 def load_sprite(path):
@@ -99,9 +145,14 @@ def render_template(sprite, square, scale=PIECE_SCALE):
 
 
 def difference(actual, template):
-    """Lower is better; normalize the error to a 0–1 range."""
-    a = actual.astype(np.float32)
-    b = template.astype(np.float32)
+    """Lower is better; normalize the error to a 0–1 range.
+
+    The chess.com square colours are removed from both images first, so
+    harmless shade variation in the screenshot's board background does
+    not count as a piece-matching error.
+    """
+    a = remove_square_background(actual).astype(np.float32)
+    b = remove_square_background(template).astype(np.float32)
 
     # A slight blur reduces sensitivity to tiny rendering differences.
     a = cv2.GaussianBlur(a, (3, 3), 0)
