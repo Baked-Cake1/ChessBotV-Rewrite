@@ -1,14 +1,106 @@
 import math
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-IMAGE_PATH = Path("chess_screenshot.png")
 OUTPUT_DIR = Path("board_debug")
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff",
+}
 
 VIEW_W, VIEW_H = 1152, 864
 PREVIEW_SIZE = 380
+
+
+def _clean_input_path(value):
+    """Clean a path dropped/pasted into a terminal (quotes and whitespace)."""
+    return str(value).strip().strip('"').strip("'").strip()
+
+
+def _expand_image_inputs(values):
+    """Expand dropped files/folders into a flat list of image Paths."""
+    paths = []
+    for value in values:
+        if not value:
+            continue
+        path = Path(_clean_input_path(value)).expanduser()
+        if path.is_dir():
+            paths.extend(
+                sorted(
+                    item for item in path.iterdir()
+                    if item.is_file()
+                    and item.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+                )
+            )
+        else:
+            paths.append(path)
+    return paths
+
+
+def _choose_with_file_dialog():
+    """Open a native file picker for one or more screenshots, if possible."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            selected = filedialog.askopenfilenames(
+                title="Choose a chess screenshot",
+                filetypes=[
+                    ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                    ("All files", "*.*"),
+                ],
+            )
+        finally:
+            root.destroy()
+        return _expand_image_inputs(selected)
+    except Exception:
+        return []
+
+
+def choose_image_paths(argv=None):
+    """Return screenshots supplied by drag-drop/CLI, a file picker, or paste.
+
+    Dragging image files onto this script (or passing them on the command
+    line) supplies ``argv``. With no arguments, a native file picker opens;
+    if that is unavailable/cancelled, the terminal prompt accepts a file
+    dropped or pasted into it.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    supplied = [arg for arg in args if arg and not arg.startswith("-")]
+    if supplied:
+        return _expand_image_inputs(supplied)
+
+    selected = _choose_with_file_dialog()
+    if selected:
+        return selected
+
+    try:
+        raw = input("Drop an image here or paste its path (Enter to cancel): ")
+    except (EOFError, KeyboardInterrupt):
+        return []
+    if not raw.strip():
+        return []
+    return _expand_image_inputs([raw])
+
+
+def load_screenshot(image_path):
+    """Load one dropped/selected screenshot with a clear error if bad."""
+    image_path = Path(image_path)
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not load image: {image_path.resolve()}"
+        )
+    return image
 
 
 class ZoomView:
@@ -273,16 +365,14 @@ def show_grid_debug(board, debug, square_size):
         cv2.destroyAllWindows()
 
 
-def main():
-    image = cv2.imread(str(IMAGE_PATH))
-
-    if image is None:
-        raise FileNotFoundError(
-            f"Could not load screenshot: {IMAGE_PATH.resolve()}"
-        )
+def process_image(image_path):
+    """Select/crop one dropped screenshot and save its 64 board squares."""
+    image_path = Path(image_path)
+    image = load_screenshot(image_path)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    print(f"Loaded image: {image_path}")
     print("Select the OUTER EDGE of the chessboard.")
     print("Drag to select; mouse wheel zooms (right-drag pans) for pixel accuracy.")
     print("Press ENTER or SPACE to confirm; ESC or C to cancel.")
@@ -290,7 +380,7 @@ def main():
     roi = select_board_roi(image)
     if roi is None:
         print("Board selection cancelled.")
-        return
+        return False
     x, y, w, h = roi
 
     # Crop the selected board.
@@ -351,6 +441,27 @@ def main():
           "wheel zooms, right-drag pans, Q/ESC closes.")
 
     show_grid_debug(board, debug, square_size)
+    return True
+
+
+def main(argv=None):
+    """Process each dropped/selected screenshot in turn.
+
+    Every run freshly writes board_debug/r<row>_c<col>.png; labelled
+    training examples from earlier piece_recognition runs are left alone.
+    """
+    image_paths = choose_image_paths(argv)
+    if not image_paths:
+        print("No image selected. Drop an image onto board-vision.py, pass")
+        print("its path on the command line, or choose it in the file picker.")
+        return False
+
+    completed = False
+    for index, image_path in enumerate(image_paths, start=1):
+        if len(image_paths) > 1:
+            print(f"\nImage {index} of {len(image_paths)}: {image_path}")
+        completed = process_image(image_path) or completed
+    return completed
 
 
 if __name__ == "__main__":
