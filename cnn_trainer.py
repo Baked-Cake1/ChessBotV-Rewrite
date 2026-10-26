@@ -1,7 +1,10 @@
 
 from __future__ import annotations
 
+import argparse
+import csv
 import random
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -12,28 +15,34 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from tqdm import tqdm
 
 
 # ============================================================
 # CHESSBOTV CNN TRAINER
-# Flat image dataset; labels inferred from filename prefixes.
-# Designed for Windows + CPU training.
+# Preferred input is board_debug/dataset.csv created by board-vision.py.
+# The CSV contains the manual piece label, light/dark/highlighted square
+# type, and the train/validation/test split. A legacy flat folder whose
+# labels are inferred from filename prefixes is still supported.
 # ============================================================
 
-# EDIT THIS PATH to point to your folder containing the images.
-DATASET_DIR = Path(r"C:\Users\Blake\Documents\ChessBotV Rewrite\board_debug")
-
-OUTPUT_MODEL = Path("chessbotv_cnn.pth")
+BASE_DIR = Path(__file__).resolve().parent
+DATASET_DIR = BASE_DIR / "board_debug"
+DEFAULT_CSV = DATASET_DIR / "dataset.csv"
+OUTPUT_MODEL = BASE_DIR / "chessbotv_cnn.pth"
 
 IMAGE_SIZE = 64
 BATCH_SIZE = 32
 EPOCHS = 25
 LEARNING_RATE = 0.001
-VALIDATION_SPLIT = 0.20
+TRAIN_SPLIT = 0.70
+VALIDATION_SPLIT = 0.15
+TEST_SPLIT = 0.15
+BALANCE_TOLERANCE = 2
 RANDOM_SEED = 42
+NORMALIZE_MEAN = (0.5, 0.5, 0.5)
+NORMALIZE_STD = (0.5, 0.5, 0.5)
 
 # Windows: 0 workers is the simplest reliable starting point.
 NUM_WORKERS = 0
@@ -73,41 +82,66 @@ class ChessImageDataset(Dataset):
     def __init__(self, records, class_to_idx, training=False):
         self.records = records
         self.class_to_idx = class_to_idx
+        self.training = training
 
-        if training:
-            self.transform = transforms.Compose([
-                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-                transforms.RandomRotation(8),
-                transforms.ColorJitter(
-                    brightness=0.08,
-                    contrast=0.08,
-                    saturation=0.04,
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.5, 0.5, 0.5),
-                    std=(0.5, 0.5, 0.5),
-                ),
-            ])
-        else:
-            self.transform = transforms.Compose([
-                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.5, 0.5, 0.5),
-                    std=(0.5, 0.5, 0.5),
-                ),
-            ])
+        self.transform = transforms.Compose([
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.RandomRotation(8),
+            transforms.ColorJitter(
+                brightness=0.08,
+                contrast=0.08,
+                saturation=0.04,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=NORMALIZE_MEAN,
+                std=NORMALIZE_STD,
+            ),
+        ])
+        # Highlighted examples are trained without colour jitter: their
+        # changed square colour is part of what the model must learn to
+        # ignore, rather than another colour to randomly recolour.
+        self.highlighted_transform = transforms.Compose([
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.RandomRotation(8),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=NORMALIZE_MEAN,
+                std=NORMALIZE_STD,
+            ),
+        ])
+        self.eval_transform = transforms.Compose([
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=NORMALIZE_MEAN,
+                std=NORMALIZE_STD,
+            ),
+        ])
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, index):
-        image_path, class_name = self.records[index]
+        record = self.records[index]
+        if isinstance(record, dict):
+            image_path = record["path"]
+            class_name = record["label"]
+            square_type = record.get("square_type")
+        else:  # backwards-compatible tuple records
+            image_path, class_name = record
+            square_type = None
+
+        if not self.training:
+            transform = self.eval_transform
+        elif square_type == "highlighted":
+            transform = self.highlighted_transform
+        else:
+            transform = self.transform
 
         with Image.open(image_path) as image:
             image = image.convert("RGB")
-            image_tensor = self.transform(image)
+            image_tensor = transform(image)
 
         label = self.class_to_idx[class_name]
         return image_tensor, label
@@ -160,11 +194,319 @@ class ChessCNN(nn.Module):
         return self.classifier(x)
 
 
-def discover_images():
-    if not DATASET_DIR.exists():
+def _verify_image(path):
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, UnidentifiedImageError, ValueError):
+        return False
+
+
+def _print_record_summary(records):
+    counts = {}
+    for record in records:
+        label = record["label"] if isinstance(record, dict) else record[1]
+        counts[label] = counts.get(label, 0) + 1
+
+    print("\nClass distribution:")
+    for class_name in sorted(counts):
+        print(f"  {class_name:15s}: {counts[class_name]}")
+
+    missing_classes = sorted(set(PREFIX_TO_CLASS.values()) - set(counts))
+    if missing_classes:
+        print("\nWARNING: No images found for:", ", ".join(missing_classes))
+    return counts
+
+
+def light_dark_balance(records, tolerance=BALANCE_TOLERANCE):
+    """Return classes whose light/dark counts differ by more than tolerance.
+
+    Highlighted records are intentionally excluded from this check.
+    Legacy prefix-only records have no square type and therefore cannot be
+    balance-checked; they simply produce no balance issues here.
+    """
+    counts = {
+        class_name: {"light": 0, "dark": 0, "highlighted": 0}
+        for class_name in PREFIX_TO_CLASS.values()
+    }
+    has_square_types = False
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        label = record.get("label")
+        square_type = record.get("square_type")
+        if label in counts and square_type in counts[label]:
+            counts[label][square_type] += 1
+            has_square_types = True
+
+    if not has_square_types:
+        return counts, {}
+
+    imbalanced = {
+        label: values
+        for label, values in counts.items()
+        if abs(values["light"] - values["dark"]) > tolerance
+    }
+    return counts, imbalanced
+
+
+def _resolve_csv_image_path(value, csv_path, dataset_dir):
+    raw_path = Path(str(value))
+    if raw_path.is_absolute():
+        return raw_path
+    candidates = [
+        csv_path.parent / raw_path,
+        dataset_dir / raw_path.name,
+        BASE_DIR / raw_path,
+        Path.cwd() / raw_path,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
+    """Load board-vision's dataset.csv into trainer records.
+
+    Expected columns include image_path/filename, label/label_code,
+    square_type, and split. The first CSV creation may contain only
+    ``unsplit`` rows; split_records() handles those without changing the
+    CSV on disk.
+    """
+    csv_path = Path(csv_path)
+    dataset_dir = Path(dataset_dir)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Dataset CSV does not exist: {csv_path}")
+
+    records = []
+    skipped_bad = []
+    skipped_unknown = []
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    print(f"Reading {len(rows)} rows from {csv_path}...")
+    for row in tqdm(rows, desc="Reading dataset CSV"):
+        image_value = row.get("image_path") or row.get("filename") or ""
+        if not image_value:
+            skipped_bad.append("<missing image_path>")
+            continue
+
+        label = (row.get("label") or row.get("class") or "").strip()
+        label_code = (row.get("label_code") or "").strip().lower()
+        if not label and label_code in PREFIX_TO_CLASS:
+            label = PREFIX_TO_CLASS[label_code]
+        if label == "blank":
+            label = "empty"
+        if label not in set(PREFIX_TO_CLASS.values()):
+            skipped_unknown.append(f"{image_value}: {label or label_code}")
+            continue
+
+        image_path = _resolve_csv_image_path(image_value, csv_path, dataset_dir)
+        if not image_path.is_file() or not _verify_image(image_path):
+            skipped_bad.append(str(image_path))
+            continue
+
+        square_type = (row.get("square_type") or "").strip().lower()
+        if square_type not in ("light", "dark", "highlighted"):
+            square_type = None
+
+        split = (row.get("split") or "unsplit").strip().lower()
+        if split in ("val", "valid"):
+            split = "validation"
+        if split not in ("train", "validation", "test"):
+            split = "unsplit"
+
+        records.append({
+            "path": image_path,
+            "label": label,
+            "label_code": label_code,
+            "square_type": square_type,
+            "split": split,
+        })
+
+    print(f"\nUsable CSV images: {len(records)}")
+    print(f"Unknown CSV labels: {len(skipped_unknown)}")
+    print(f"Missing/unreadable CSV images: {len(skipped_bad)}")
+    if skipped_unknown:
+        print("Unknown label examples:", skipped_unknown[:10])
+    if skipped_bad:
+        print("Missing/unreadable examples:", skipped_bad[:10])
+    if not records:
+        raise RuntimeError(f"No usable images found in {csv_path}")
+
+    _print_record_summary(records)
+
+    square_counts = defaultdict(int)
+    split_counts = defaultdict(int)
+    for record in records:
+        square_counts[record.get("square_type") or "unknown"] += 1
+        split_counts[record.get("split") or "unsplit"] += 1
+    print("\nSquare types:", dict(sorted(square_counts.items())))
+    print("CSV splits:", dict(sorted(split_counts.items())))
+    return records
+
+
+def _split_target_counts(total):
+    """Exact integer 70/15/15 target counts for a temporary split."""
+    quotas = [
+        ("train", total * TRAIN_SPLIT),
+        ("validation", total * VALIDATION_SPLIT),
+        ("test", total * TEST_SPLIT),
+    ]
+    counts = {name: int(quota) for name, quota in quotas}
+    remaining = total - sum(counts.values())
+    for name, quota in sorted(
+        quotas, key=lambda item: item[1] - int(item[1]), reverse=True
+    ):
+        if remaining <= 0:
+            break
+        counts[name] += 1
+        remaining -= 1
+    return counts
+
+
+def _internal_stratified_split(records):
+    """Temporary exact-count 70/15/15 split for unsplit/legacy records.
+
+    Allocations start from each (label, square_type) group's proportional
+    floor, then remainders are assigned so the global train/validation/test
+    totals hit the requested percentages as exactly as integer counts allow.
+    """
+    groups = defaultdict(list)
+    for record in records:
+        if isinstance(record, dict):
+            key = (record["label"], record.get("square_type") or "")
+        else:
+            key = (record[1], "")
+        groups[key].append(record)
+
+    split_names = ("train", "validation", "test")
+    fractions = {
+        "train": TRAIN_SPLIT,
+        "validation": VALIDATION_SPLIT,
+        "test": TEST_SPLIT,
+    }
+    targets = _split_target_counts(len(records))
+    allocations = {}
+    remainders = {}
+    fraction_parts = {}
+    current = {name: 0 for name in split_names}
+
+    for key, group in groups.items():
+        allocations[key] = {}
+        fraction_parts[key] = {}
+        used = 0
+        for name in split_names:
+            quota = len(group) * fractions[name]
+            count = int(quota)
+            allocations[key][name] = count
+            fraction_parts[key][name] = quota - count
+            current[name] += count
+            used += count
+        remainders[key] = len(group) - used
+
+    for name in split_names:
+        needed = targets[name] - current[name]
+        while needed > 0:
+            candidates = sorted(
+                (key for key in groups if remainders[key] > 0),
+                key=lambda key: (-fraction_parts[key][name], -remainders[key], key),
+            )
+            if not candidates:
+                break
+            progressed = False
+            for key in candidates:
+                if needed <= 0:
+                    break
+                allocations[key][name] += 1
+                remainders[key] -= 1
+                needed -= 1
+                progressed = True
+            if not progressed:
+                break
+
+    for key, count in remainders.items():
+        if count:
+            allocations[key]["test"] += count
+
+    split_records_by_name = {name: [] for name in split_names}
+    rng = random.Random(RANDOM_SEED)
+    for key in sorted(groups):
+        group = list(groups[key])
+        random.Random(f"{RANDOM_SEED}:{key[0]}:{key[1]}").shuffle(group)
+        cursor = 0
+        for name in split_names:
+            count = allocations[key][name]
+            split_records_by_name[name].extend(group[cursor:cursor + count])
+            cursor += count
+
+    for split in split_records_by_name.values():
+        rng.shuffle(split)
+    return (
+        split_records_by_name["train"],
+        split_records_by_name["validation"],
+        split_records_by_name["test"],
+    )
+
+
+def split_records(records):
+    """Use CSV splits when present; otherwise create a temporary split."""
+    assigned = {"train": [], "validation": [], "test": []}
+    unsplit = []
+    for record in records:
+        split = record.get("split") if isinstance(record, dict) else None
+        if split in assigned:
+            assigned[split].append(record)
+        else:
+            unsplit.append(record)
+
+    if unsplit:
+        extra_train, extra_val, extra_test = _internal_stratified_split(unsplit)
+        assigned["train"].extend(extra_train)
+        assigned["validation"].extend(extra_val)
+        assigned["test"].extend(extra_test)
+        print(
+            "Some/all rows were 'unsplit'; using a temporary stratified "
+            "70/15/15 split for this training run without changing the CSV."
+        )
+
+    if not assigned["train"]:
+        raise RuntimeError("No training images after applying dataset splits")
+    if not assigned["validation"] or not assigned["test"]:
+        print("CSV split had an empty validation/test set; re-splitting temporarily.")
+        return _internal_stratified_split(records)
+    return assigned["train"], assigned["validation"], assigned["test"]
+
+
+def filter_highlighted_records(records, highlighted_mode="include"):
+    if highlighted_mode == "include":
+        return records
+    highlighted = [
+        record for record in records
+        if isinstance(record, dict) and record.get("square_type") == "highlighted"
+    ]
+    if highlighted_mode == "only":
+        return highlighted
+    if highlighted_mode == "exclude":
+        return [
+            record for record in records
+            if not (
+                isinstance(record, dict)
+                and record.get("square_type") == "highlighted"
+            )
+        ]
+    raise ValueError(f"Unsupported highlighted mode: {highlighted_mode}")
+
+
+def discover_images(dataset_dir=DATASET_DIR):
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.exists():
         raise FileNotFoundError(
-            f"Dataset folder does not exist: {DATASET_DIR}\n"
-            "Edit DATASET_DIR near the top of this script."
+            f"Dataset folder does not exist: {dataset_dir}\n"
+            "Pass --dataset-dir or edit DATASET_DIR near the top of this script."
         )
 
     records = []
@@ -172,7 +514,7 @@ def discover_images():
     skipped_bad = []
 
     files = sorted(
-        p for p in DATASET_DIR.iterdir()
+        p for p in dataset_dir.iterdir()
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
     )
 
@@ -186,14 +528,21 @@ def discover_images():
             skipped_unknown.append(path.name)
             continue
 
-        try:
-            with Image.open(path) as image:
-                image.verify()
-        except (OSError, UnidentifiedImageError, ValueError):
+        if not _verify_image(path):
             skipped_bad.append(path.name)
             continue
 
-        records.append((path, PREFIX_TO_CLASS[prefix]))
+        parts = path.stem.lower().split("_")
+        square_type = parts[1] if len(parts) > 1 and parts[1] in (
+            "light", "dark", "highlighted"
+        ) else None
+        records.append({
+            "path": path,
+            "label": PREFIX_TO_CLASS[prefix],
+            "label_code": prefix,
+            "square_type": square_type,
+            "split": "unsplit",
+        })
 
     print(f"\nUsable images: {len(records)}")
     print(f"Unknown filename prefixes: {len(skipped_unknown)}")
@@ -211,21 +560,9 @@ def discover_images():
             "and PREFIX_TO_CLASS."
         )
 
-    counts = {}
-    for _, class_name in records:
-        counts[class_name] = counts.get(class_name, 0) + 1
+    counts = _print_record_summary(records)
 
-    print("\nClass distribution:")
-    for class_name in sorted(counts):
-        print(f"  {class_name:15s}: {counts[class_name]}")
-
-    missing_classes = sorted(
-        set(PREFIX_TO_CLASS.values()) - set(counts)
-    )
-    if missing_classes:
-        print("\nWARNING: No images found for:", ", ".join(missing_classes))
-
-    # A stratified split needs at least two examples in each class.
+    # The temporary split needs at least two examples in each present class.
     too_small = {
         name: count for name, count in counts.items() if count < 2
     }
@@ -270,7 +607,40 @@ def evaluate(model, loader, device, criterion):
     return average_loss, accuracy, all_labels, all_predictions
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train the ChessBotV square CNN")
+    parser.add_argument(
+        "--dataset-dir", type=Path, default=DATASET_DIR,
+        help="Folder containing labelled square images",
+    )
+    parser.add_argument(
+        "--csv", type=Path, default=None,
+        help="board-vision dataset.csv (default: <dataset-dir>/dataset.csv if present)",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=OUTPUT_MODEL,
+        help="Output .pth model path",
+    )
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument(
+        "--highlighted-mode",
+        choices=("include", "exclude", "only"),
+        default="include",
+        help="How highlighted-square examples participate in this run",
+    )
+    parser.add_argument(
+        "--allow-imbalance", action="store_true",
+        help="Train even if a class light/dark counts differ by more than 2",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    dataset_dir = Path(args.dataset_dir)
+    output_model = Path(args.output)
+    epochs = max(1, int(args.epochs))
+
     set_seed(RANDOM_SEED)
 
     # Avoid excessive CPU thread contention on smaller systems.
@@ -281,16 +651,37 @@ def main():
     if device.type == "cpu":
         print("CPU training enabled. This is expected on your current setup.")
 
-    records = discover_images()
+    csv_path = Path(args.csv) if args.csv is not None else dataset_dir / "dataset.csv"
+    if csv_path.is_file():
+        records = load_csv_records(csv_path, dataset_dir)
+    elif args.csv is not None:
+        raise FileNotFoundError(f"Dataset CSV does not exist: {csv_path}")
+    else:
+        print("No dataset.csv found; falling back to filename-prefix discovery.")
+        records = discover_images(dataset_dir)
 
-    labels = [class_name for _, class_name in records]
+    _balance_counts, imbalanced = light_dark_balance(records)
+    if imbalanced:
+        details = "; ".join(
+            f"{label}: light={values['light']}, dark={values['dark']}"
+            for label, values in sorted(imbalanced.items())
+        )
+        message = (
+            "Light/dark counts for each class must differ by at most "
+            f"{BALANCE_TOLERANCE} (highlighted excluded). Imbalanced: {details}"
+        )
+        if not args.allow_imbalance:
+            raise RuntimeError(message)
+        print("WARNING:", message)
 
-    train_records, val_records = train_test_split(
-        records,
-        test_size=VALIDATION_SPLIT,
-        random_state=RANDOM_SEED,
-        stratify=labels,
-    )
+    records = filter_highlighted_records(records, args.highlighted_mode)
+    if not records:
+        raise RuntimeError(
+            f"No records remain with --highlighted-mode={args.highlighted_mode}"
+        )
+
+    labels = [record["label"] for record in records]
+    train_records, val_records, test_records = split_records(records)
 
     class_names = sorted(set(labels))
     class_to_idx = {
@@ -300,6 +691,7 @@ def main():
 
     print(f"\nTraining images:   {len(train_records)}")
     print(f"Validation images: {len(val_records)}")
+    print(f"Test images:       {len(test_records)}")
     print(f"Classes: {len(class_names)}")
 
     train_dataset = ChessImageDataset(
@@ -307,6 +699,9 @@ def main():
     )
     val_dataset = ChessImageDataset(
         val_records, class_to_idx, training=False
+    )
+    test_dataset = ChessImageDataset(
+        test_records, class_to_idx, training=False
     )
 
     train_loader = DataLoader(
@@ -319,6 +714,14 @@ def main():
 
     val_loader = DataLoader(
         val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
@@ -344,7 +747,7 @@ def main():
 
     print("\nStarting training...\n")
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
         correct = 0
@@ -352,7 +755,7 @@ def main():
 
         progress = tqdm(
             train_loader,
-            desc=f"Epoch {epoch:02d}/{EPOCHS}",
+            desc=f"Epoch {epoch:02d}/{epochs}",
             leave=True,
         )
 
@@ -400,6 +803,7 @@ def main():
         if val_accuracy > best_accuracy:
             best_accuracy = val_accuracy
 
+            output_model.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -407,20 +811,24 @@ def main():
                     "class_names": class_names,
                     "image_size": IMAGE_SIZE,
                     "model_name": "ChessCNN",
+                    "mean": list(NORMALIZE_MEAN),
+                    "std": list(NORMALIZE_STD),
+                    "square_types": ["light", "dark", "highlighted"],
+                    "highlighted_mode": args.highlighted_mode,
                 },
-                OUTPUT_MODEL,
+                output_model,
             )
 
-            print(f"  Saved new best model: {OUTPUT_MODEL}")
+            print(f"  Saved new best model: {output_model}")
 
-    # Evaluate the best saved checkpoint rather than the final epoch.
+    # Evaluate the best validation checkpoint on the held-out test split.
     checkpoint = torch.load(
-        OUTPUT_MODEL, map_location=device, weights_only=True
+        output_model, map_location=device, weights_only=True
     )
     model.load_state_dict(checkpoint["model_state_dict"])
 
     _, final_accuracy, true_labels, predicted_labels = evaluate(
-        model, val_loader, device, criterion
+        model, test_loader, device, criterion
     )
 
     idx_to_class = {
@@ -432,11 +840,12 @@ def main():
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
-    print(f"Best validation accuracy: {final_accuracy:.2%}")
-    print(f"Model saved to: {OUTPUT_MODEL.resolve()}")
+    print(f"Best validation accuracy during training: {best_accuracy:.2%}")
+    print(f"Held-out test accuracy: {final_accuracy:.2%}")
+    print(f"Model saved to: {output_model.resolve()}")
     print("=" * 60)
 
-    print("\nPer-class validation report:")
+    print("\nPer-class test report:")
     print(
         classification_report(
             true_labels,

@@ -128,11 +128,37 @@ depth=25
 
 ---
 
+## CNN Dataset Creation & Training
+
+`board-vision.py` builds the square-recognition dataset used by `cnn_trainer.py`:
+
+1. Run `python board-vision.py` (or drag a screenshot onto it).
+2. Select the outer edge of the chessboard exactly as before; it is cropped and split into the 64 squares.
+3. Manually review every square — there is no auto-review. First choose the piece (or Blank / Empty), then choose **Light square**, **Dark square**, or **Highlighted square**. This second choice is also required for blank squares.
+4. The labelled tiles are saved with unique names such as `wp_light_000001.png`, `blank_dark_000002.png`, and `bq_highlighted_000003.png`, and their rows are appended to `board_debug/dataset.csv` (`image_path`, `label`, `label_code`, `square_type`, `split`, row/column, and source-board details).
+5. At the end of the board, answer whether to create the CNN model now:
+   - **Yes** runs `cnn_trainer.py` against `dataset.csv` and writes `chessbotv_cnn.pth`.
+   - **No** returns to the terminal and waits for Enter before opening the next file picker, so you can prepare another screenshot first. Answering with another board appends to the CSV rather than overwriting earlier rows/images.
+6. The first creation of `dataset.csv` leaves every row as `unsplit`. On every later CSV change, splits are recalculated as **70% train / 15% validation / 15% test** (for example, 6,400 images → 4,480 / 960 / 960) and `train.csv`, `validation.csv`, and `test.csv` are refreshed beside the master CSV.
+7. For every class, light-square and dark-square counts must differ by at most **2** before training. Highlighted-square images are excluded from that balance check; `cnn_trainer.py` trains them without colour jitter and also supports `--highlighted-mode exclude|only` for separate experiments.
+
+You can also train directly:
+
+```bash
+python cnn_trainer.py --dataset-dir board_debug --csv board_debug/dataset.csv
+```
+
+The trainer still falls back to the older filename-prefix scan when no `dataset.csv` is present.
+
+---
+
 ## Project Structure
 
 ```
 ChessBotV-Rewrite/
 ├── new.py              # Main GUI + engine thread (60 FPS, 640x640 board)
+├── board-vision.py      # Screenshot → 64 manually labelled CNN dataset squares
+├── cnn_trainer.py       # Trains chessbotv_cnn.pth from board_debug/dataset.csv
 ├── start.bat            # Windows launcher (auto-close + restart loop on exit 42)
 ├── configuration.cfg    # Engine settings (hash/threads/skill/depth)
 ├── openings.json        # FEN placement → opening name (~370k entries)
