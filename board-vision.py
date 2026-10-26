@@ -4,6 +4,7 @@ import random
 import re
 import subprocess
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -68,6 +69,21 @@ LABEL_OPTIONS = (
 LABEL_BY_CODE = {code: label for code, label, _display in LABEL_OPTIONS}
 LABEL_OPTION_BY_CODE = {option[0]: option for option in LABEL_OPTIONS}
 LABEL_OPTION_BY_LABEL = {option[1]: option for option in LABEL_OPTIONS}
+FEN_SYMBOL_BY_CODE = {
+    "wk": "K",
+    "wq": "Q",
+    "wr": "R",
+    "wb": "B",
+    "wn": "N",
+    "wp": "P",
+    "bk": "k",
+    "bq": "q",
+    "br": "r",
+    "bb": "b",
+    "bn": "n",
+    "bp": "p",
+    "blank": ".",
+}
 SQUARE_TYPE_OPTIONS = (
     ("light", "Light square"),
     ("dark", "Dark square"),
@@ -85,6 +101,7 @@ CSV_FIELDS = (
     "col",
     "source_image",
     "board_id",
+    "game_id",
 )
 SPLIT_FRACTIONS = (
     ("train", 0.70),
@@ -193,6 +210,119 @@ def _path_for_csv(path):
         return str(path)
 
 
+def create_game_id():
+    """Create the game ID assigned to one uploaded board and its 64 tiles."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"game_{stamp}_{uuid.uuid4().hex[:6]}"
+
+
+def record_game_id(record):
+    """Game ID for a dataset row, with legacy board/source fallbacks."""
+    for field in ("game_id", "board_id", "source_image", "image_path", "filename"):
+        value = str(record.get(field, "") or "").strip()
+        if value:
+            return value
+    return "unknown-game"
+
+
+def _normalise_game_ids(records):
+    """Fill game_id on legacy rows from their original board grouping."""
+    for record in records:
+        record["game_id"] = record_game_id(record)
+    return records
+
+
+def dataset_game_counts(records):
+    """Return {split: set(game_id)} after applying legacy game fallbacks."""
+    games = {}
+    for record in records:
+        split = record.get("split") or "unsplit"
+        games.setdefault(split, set()).add(record_game_id(record))
+    return games
+
+
+def _fen_castling_rights(board_grid):
+    """Best-effort FEN castling field from home king/rook squares."""
+    rights = ""
+    if board_grid[7][4] == "K" and board_grid[7][7] == "R":
+        rights += "K"
+    if board_grid[7][4] == "K" and board_grid[7][0] == "R":
+        rights += "Q"
+    if board_grid[0][4] == "k" and board_grid[0][7] == "r":
+        rights += "k"
+    if board_grid[0][4] == "k" and board_grid[0][0] == "r":
+        rights += "q"
+    return rights or "-"
+
+
+def fen_from_answers(tile_entries, answers, flipped=False):
+    """Generate a FEN from the 64 reviewed classifications.
+
+    ``tile_entries`` are in screenshot order: row 0 is the top of the
+    uploaded board and column 0 is its left edge. A normal board is treated
+    as White's perspective (rank 8 at the top, file a at the left). A
+    flipped board is rotated 180 degrees before generating the FEN.
+
+    Only the piece placement can be known with certainty from one image.
+    For the remaining FEN fields, the side to move follows the board
+    orientation (White for a normal board, Black for a flipped board,
+    except that the exact starting position is always White to move),
+    castling is inferred from home king/rook squares, and en passant and
+    the clocks use ``- 0 1``.
+    """
+    if len(tile_entries) != len(answers):
+        raise ValueError("Every tile must have a classification before FEN generation")
+
+    visual_grid = [["."] * 8 for _ in range(8)]
+    for (row, col, _tile), (label_option, _square_type) in zip(tile_entries, answers):
+        if not (0 <= row < 8 and 0 <= col < 8):
+            continue
+        symbol = FEN_SYMBOL_BY_CODE.get(label_option[0], ".")
+        visual_grid[row][col] = symbol
+
+    if flipped:
+        board_grid = [["."] * 8 for _ in range(8)]
+        for row in range(8):
+            for col in range(8):
+                board_grid[7 - row][7 - col] = visual_grid[row][col]
+    else:
+        board_grid = visual_grid
+
+    ranks = []
+    for row in board_grid:
+        text = ""
+        empty = 0
+        for symbol in row:
+            if symbol == ".":
+                empty += 1
+            else:
+                if empty:
+                    text += str(empty)
+                    empty = 0
+                text += symbol
+        if empty:
+            text += str(empty)
+        ranks.append(text)
+    placement = "/".join(ranks)
+
+    starting_placement = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+    side_to_move = "w" if placement == starting_placement or not flipped else "b"
+    return (
+        f"{placement} {side_to_move} "
+        f"{_fen_castling_rights(board_grid)} - 0 1"
+    )
+
+
+def save_fen_file(fen, game_id, output_dir=OUTPUT_DIR):
+    """Save one generated FEN beside the board's CNN-dataset output."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_game_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(game_id))
+    fen_path = output_dir / f"fen_{safe_game_id}.txt"
+    fen_path.write_text(fen + "\n", encoding="utf-8")
+    return fen_path
+
+
 def load_dataset_records(csv_path=DATASET_CSV):
     """Load the master dataset CSV, returning [] when it does not exist."""
     csv_path = Path(csv_path)
@@ -205,7 +335,7 @@ def load_dataset_records(csv_path=DATASET_CSV):
         record = {field: str(row.get(field, "") or "") for field in CSV_FIELDS}
         if record["image_path"] or record["filename"]:
             records.append(record)
-    return records
+    return _normalise_game_ids(records)
 
 
 def write_dataset_csv(records, csv_path=DATASET_CSV):
@@ -237,7 +367,7 @@ def write_split_csvs(records, output_dir=OUTPUT_DIR):
 
 
 def _split_targets(total):
-    """Exact 70/15/15 counts (for example, 6400 -> 4480/960/960)."""
+    """Largest-remainder 70/15/15 integer counts for a total."""
     quotas = [
         (name, total * fraction) for name, fraction in SPLIT_FRACTIONS
     ]
@@ -257,80 +387,60 @@ def quota_fraction(value):
     return value - math.floor(value)
 
 
-def recalculate_splits(records, seed=SPLIT_SEED):
-    """Recalculate stratified 70/15/15 splits for every dataset row.
+def _game_split_targets(total_games):
+    """Train/validation/test game counts, approximating 70/15/15 by game.
 
-    Stratification is by (label, square_type), including highlighted
-    squares. Highlighted squares are therefore represented in every split
-    where their group is large enough, while the light/dark balance check
-    below deliberately excludes them.
+    Whole games cannot be divided, so very small datasets are adjusted to
+    populate as many splits as possible: 2 games -> 1/1/0, 3 -> 1/1/1,
+    and the requested 4 -> 2/1/1. Larger totals use 70/15/15 rounding.
+    """
+    counts = _split_targets(max(0, int(total_games)))
+    if total_games >= 2 and counts["validation"] == 0 and counts["train"] > 1:
+        counts["train"] -= 1
+        counts["validation"] += 1
+    if total_games >= 3 and counts["test"] == 0:
+        donor = "train" if counts["train"] > 1 else "validation"
+        if counts[donor] > 1:
+            counts[donor] -= 1
+            counts["test"] += 1
+    return counts
+
+
+def recalculate_splits(records, seed=SPLIT_SEED):
+    """Recalculate train/validation/test splits by whole game ID.
+
+    Every image with the same ``game_id`` receives the same split, so one
+    uploaded board/game can never leak across training and evaluation.
+    Legacy rows without a game_id are grouped by their old board_id (then
+    source image). Game counts approximate 70/15/15, with 4 games split
+    2 train / 1 validation / 1 test.
     """
     if not records:
         return records
 
-    targets = _split_targets(len(records))
-    groups = {}
+    _normalise_game_ids(records)
+    games = {}
     for record in records:
-        key = (record.get("label", ""), record.get("square_type", ""))
-        groups.setdefault(key, []).append(record)
+        games.setdefault(record_game_id(record), []).append(record)
 
-    allocations = {}
-    unassigned = {}
-    fractions = {}
-    current = {name: 0 for name, _fraction in SPLIT_FRACTIONS}
-    for key, group in groups.items():
-        allocations[key] = {}
-        fractions[key] = {}
-        used = 0
-        for split_name, fraction in SPLIT_FRACTIONS:
-            quota = len(group) * fraction
-            count = int(math.floor(quota))
-            allocations[key][split_name] = count
-            fractions[key][split_name] = quota_fraction(quota)
-            current[split_name] += count
-            used += count
-        unassigned[key] = len(group) - used
+    # A per-game deterministic random key keeps the assignment reproducible
+    # without making it depend on upload order.
+    ordered_game_ids = sorted(
+        games,
+        key=lambda game_id: (
+            random.Random(f"{seed}:{game_id}").random(),
+            game_id,
+        ),
+    )
+    targets = _game_split_targets(len(ordered_game_ids))
 
-    # Distribute the few stratified remainders so the global counts match
-    # the requested percentages exactly (subject only to integer totals).
+    cursor = 0
     for split_name, _fraction in SPLIT_FRACTIONS:
-        needed = targets[split_name] - current[split_name]
-        while needed > 0:
-            candidates = sorted(
-                (key for key in groups if unassigned[key] > 0),
-                key=lambda key: (
-                    -fractions[key][split_name],
-                    -unassigned[key],
-                    key,
-                ),
-            )
-            if not candidates:
-                break
-            progressed = False
-            for key in candidates:
-                if needed <= 0:
-                    break
-                allocations[key][split_name] += 1
-                unassigned[key] -= 1
-                needed -= 1
-                progressed = True
-            if not progressed:
-                break
-
-    # Any defensive leftovers go to test; normally there are none.
-    for key, count in unassigned.items():
-        if count:
-            allocations[key]["test"] += count
-
-    for (label, square_type), group in groups.items():
-        shuffled = list(group)
-        random.Random(f"{seed}:{label}:{square_type}").shuffle(shuffled)
-        cursor = 0
-        for split_name, _fraction in SPLIT_FRACTIONS:
-            count = allocations[(label, square_type)][split_name]
-            for record in shuffled[cursor:cursor + count]:
+        count = targets[split_name]
+        for game_id in ordered_game_ids[cursor:cursor + count]:
+            for record in games[game_id]:
                 record["split"] = split_name
-            cursor += count
+        cursor += count
     return records
 
 
@@ -338,8 +448,8 @@ def append_dataset_records(new_records, csv_path=DATASET_CSV):
     """Append one reviewed board to dataset.csv without losing old rows.
 
     The first creation is deliberately left as ``unsplit``. Every later
-    change recalculates all splits and refreshes train/validation/test.csv.
-    Returns ``(all_records, csv_already_existed)``.
+    change recalculates all whole-game splits and refreshes
+    train/validation/test.csv. Returns ``(all_records, csv_already_existed)``.
     """
     csv_path = Path(csv_path)
     csv_existed = csv_path.is_file()
@@ -358,7 +468,7 @@ def append_dataset_records(new_records, csv_path=DATASET_CSV):
             + ", ".join(duplicate_paths[:5])
         )
 
-    all_records = existing + list(new_records)
+    all_records = _normalise_game_ids(existing + list(new_records))
     if csv_existed:
         recalculate_splits(all_records)
         write_dataset_csv(all_records, csv_path)
@@ -400,17 +510,24 @@ def print_dataset_report(records, splits_recalculated=False):
         split = record.get("split") or "unsplit"
         split_counts[split] = split_counts.get(split, 0) + 1
 
+    game_counts = dataset_game_counts(records)
+    total_games = len({record_game_id(record) for record in records})
+
     print(f"\nDataset CSV: {DATASET_CSV}")
     print(f"Total labelled images: {len(records)}")
+    print(f"Total game IDs: {total_games}")
     if splits_recalculated:
         print(
-            "Split recalculated: "
-            f"train={split_counts.get('train', 0)}, "
-            f"validation={split_counts.get('validation', 0)}, "
-            f"test={split_counts.get('test', 0)}"
+            "Game split recalculated: "
+            f"train={len(game_counts.get('train', ()))} game(s)/"
+            f"{split_counts.get('train', 0)} image(s), "
+            f"validation={len(game_counts.get('validation', ()))} game(s)/"
+            f"{split_counts.get('validation', 0)} image(s), "
+            f"test={len(game_counts.get('test', ()))} game(s)/"
+            f"{split_counts.get('test', 0)} image(s)"
         )
     else:
-        print("Split: not calculated on first CSV creation (all rows are 'unsplit').")
+        print("Game split: not calculated on first CSV creation (all rows are 'unsplit').")
 
     counts, imbalanced = dataset_balance(records)
     print("\nPer-class square counts (highlighted is excluded from balance):")
@@ -452,7 +569,7 @@ def _next_dataset_sequence(existing_records, output_dir=OUTPUT_DIR):
     return highest + 1
 
 
-def save_labelled_tiles(tile_entries, answers, source_image, board_id):
+def save_labelled_tiles(tile_entries, answers, source_image, board_id, game_id=None):
     """Save manually reviewed tiles under unique trainer-linked names."""
     if len(tile_entries) != len(answers):
         raise ValueError("Every tile must have a manual label and square type")
@@ -483,6 +600,7 @@ def save_labelled_tiles(tile_entries, answers, source_image, board_id):
             "col": str(col),
             "source_image": _path_for_csv(source_image),
             "board_id": board_id,
+            "game_id": game_id or board_id,
         })
     return records
 
@@ -1699,12 +1817,14 @@ def show_grid_debug(board, debug, square_size):
         cv2.destroyAllWindows()
 
 
-def process_image(image_path, semi_auto_enabled=True):
+def process_image(image_path, semi_auto_enabled=True, game_id=None):
     """Crop one screenshot, review its 64 squares, and append CSV rows.
 
-    Semi-auto suggestions are enabled by default: OpenCV proposes the piece
-    and square type from previously confirmed examples, while the user makes
-    every final choice. Returns the full CNN dataset record list after this
+    A new game ID is created for this upload unless one is supplied; all
+    64 saved tiles share it in the CSV. Semi-auto suggestions are enabled
+    by default: OpenCV proposes the piece and square type from previously
+    confirmed examples, while the user makes every final choice. Returns
+    the full CNN dataset record list after this
     board is appended, or None if board selection/review was cancelled. No
     CNN-dataset tile/CSV row or persistent semi-auto example from this board
     is saved when review is cancelled.
@@ -1714,7 +1834,11 @@ def process_image(image_path, semi_auto_enabled=True):
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    game_id = game_id or create_game_id()
+    board_id = game_id
+
     print(f"Loaded image: {image_path}")
+    print(f"Game ID for this upload: {game_id}")
     print("Select the OUTER EDGE of the chessboard.")
     print("Drag to select; mouse wheel zooms (right-drag pans) for pixel accuracy.")
     print("Press ENTER or SPACE to confirm; ESC or C to cancel.")
@@ -1813,19 +1937,26 @@ def process_image(image_path, semi_auto_enabled=True):
         )
         return None
 
-    board_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    board_flipped = _ask_yes_no(
+        "\nIs this board flipped (viewed from Black's side)? [y/N]: "
+    )
+    fen = fen_from_answers(tile_entries, answers, flipped=board_flipped)
+    print(f"Generated FEN ({'flipped' if board_flipped else 'normal'} board): {fen}")
+
     board_path = OUTPUT_DIR / f"board_{board_id}.png"
     grid_path = OUTPUT_DIR / f"grid_debug_{board_id}.png"
     cv2.imwrite(str(board_path), board)
     cv2.imwrite(str(grid_path), debug)
+    fen_path = save_fen_file(fen, game_id, OUTPUT_DIR)
 
     new_records = save_labelled_tiles(
-        tile_entries, answers, image_path, board_id
+        tile_entries, answers, image_path, board_id, game_id=game_id
     )
     all_records, csv_existed = append_dataset_records(new_records)
 
     print(f"Saved board crop: {board_path}")
     print(f"Saved grid debug: {grid_path}")
+    print(f"Saved FEN: {fen_path}")
     print(f"Saved {len(new_records)} reviewed square images to: {OUTPUT_DIR.resolve()}")
     if csv_existed:
         print("Appended these rows to the existing dataset.csv and recalculated its splits.")
@@ -1889,7 +2020,8 @@ def main(argv=None):
     through cnn_trainer.py or add another screenshot. When they choose
     another, the terminal waits for Enter before any next supplied image is
     used or the Tk file picker is opened. Existing dataset rows/images are
-    kept; new boards are appended and then the split is recalculated.
+    kept; new boards/games are appended and then whole-game splits are
+    recalculated.
     """
     args = list(sys.argv[1:] if argv is None else argv)
     manual_only_flags = {"--manual-only", "--no-semi-auto"}

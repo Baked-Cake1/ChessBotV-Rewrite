@@ -132,15 +132,17 @@ depth=25
 
 `board-vision.py` builds the square-recognition dataset used by `cnn_trainer.py`:
 
-1. Run `python board-vision.py` (or drag a screenshot onto it).
+1. Run `python board-vision.py` (or drag a screenshot onto it). Each uploaded board is assigned a new `game_id` at upload time, and all 64 tiles from that upload share it.
 2. Select the outer edge of the chessboard exactly as before; it is cropped and split into the 64 squares.
-3. Review every square. Semi-auto OpenCV help is on by default: its suggested piece and then suggested **Light square**, **Dark square**, or **Highlighted square** are highlighted in cyan, but you make the final choice for every square (including blanks). Press **A** or **Enter** to use a suggestion, click another answer to correct it, or press **S** to toggle suggestions during a board. Use `python board-vision.py --manual-only` to disable semi-auto suggestions and learning completely.
-4. The labelled tiles are saved with unique names such as `wp_light_000001.png`, `blank_dark_000002.png`, and `bq_highlighted_000003.png`, and their rows are appended to `board_debug/dataset.csv` (`image_path`, `label`, `label_code`, `square_type`, `split`, row/column, and source-board details).
+3. Review every square. Semi-auto OpenCV help is on by default: its suggested piece and then suggested **Light square**, **Dark square**, or **Highlighted square** are highlighted in cyan, but you make the final choice for every square (including blanks). Press **A** or **Enter** to use a suggestion, click another answer to correct it, or press **S** to toggle suggestions during a board. Use `python board-vision.py --manual-only` to disable semi-auto suggestions and learning completely. After recognition, the terminal asks **“Is this board flipped?”**; the classifications are rotated when needed and the generated FEN is printed and saved as `board_debug/fen_<game_id>.txt`.
+4. The labelled tiles are saved with unique names such as `wp_light_000001.png`, `blank_dark_000002.png`, and `bq_highlighted_000003.png`, and their rows are appended to `board_debug/dataset.csv` (`image_path`, `label`, `label_code`, `square_type`, `split`, row/column, source-board details, and `game_id`).
 5. At the end of the board, answer whether to create the CNN model now:
    - **Yes** runs `cnn_trainer.py` against `dataset.csv` and writes `chessbotv_cnn.pth`.
    - **No** returns to the terminal and waits for Enter before opening the next file picker, so you can prepare another screenshot first. Answering with another board appends to the CSV rather than overwriting earlier rows/images.
-6. The first creation of `dataset.csv` leaves every row as `unsplit`. On every later CSV change, splits are recalculated as **70% train / 15% validation / 15% test** (for example, 6,400 images → 4,480 / 960 / 960) and `train.csv`, `validation.csv`, and `test.csv` are refreshed beside the master CSV.
+6. The first creation of `dataset.csv` leaves every row as `unsplit`. On every later CSV change, splits are recalculated by **whole game ID**, never by individual square image: every tile from one game stays in the same split. Game counts approximate **70% train / 15% validation / 15% test**—for example, 4 games → 2 train / 1 validation / 1 test, and 20 games → 14 / 3 / 3—and `train.csv`, `validation.csv`, and `test.csv` are refreshed beside the master CSV.
 7. For every class, light-square and dark-square counts must differ by at most **2** before training. Highlighted-square images are excluded from that balance check; `cnn_trainer.py` trains them without colour jitter and also supports `--highlighted-mode exclude|only` for separate experiments.
+
+The generated FEN's piece placement comes directly from the reviewed squares. Because one still image cannot prove every remaining FEN field, side-to-move follows the normal/flipped answer (with the exact starting position always White to move), castling is inferred from home king/rook squares, and en passant/clocks are `- 0 1`.
 
 ### Semi-auto assistant learning folder
 
