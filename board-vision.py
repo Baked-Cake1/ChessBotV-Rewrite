@@ -448,7 +448,7 @@ def main(argv=None):
     """Process each dropped/selected screenshot in turn.
 
     Every run freshly writes board_debug/r<row>_c<col>.png; labelled
-    training examples from earlier piece_recognition runs are left alone.
+    CNN training examples from earlier runs are left alone.
     """
     image_paths = choose_image_paths(argv)
     if not image_paths:

@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
 
 import chess
 
@@ -387,17 +386,15 @@ board_detection_error = ""
 board_detection_result = None
 board_detection_result_ready = False
 board_detection_last_summary = ""
-_piece_recognition_module = None
-_piece_detection_module = None
 _board_detection_thread = None
 _win32_capture_libs_cache = None
 board_detection_picker_purpose = "detect"  # "detect" | "autoplay"
 
 # --- Auto-play (Analysis page) ---
 # One mutable session dict keeps the external-window sync state together:
-# the chosen window/side, the located board rectangle, cached classifiers,
-# the last accepted board-only screenshot/grid, and any move awaiting
-# verification after a real mouse drag.
+# the chosen window/side, the located board rectangle, the last accepted
+# board-only screenshot/grid, and any move awaiting verification after a
+# real mouse drag.
 AUTOPLAY_DEPTH = 20
 AUTOPLAY_POLL_SECONDS = 0.4
 AUTOPLAY_DRAG_SECONDS = 0.38
@@ -419,9 +416,6 @@ _autoplay = {
     "scan_running": False,
     "scan_ready": False,
     "scan_result": None,
-    "pr": None,
-    "sprites": None,
-    "training_examples": None,
     "board_rect": None,
     "window_rect": None,
     "window_size": None,
@@ -2790,151 +2784,492 @@ BOARD_DETECTION_MIN_SIDE = 120
 BOARD_DETECTION_BLUE_BGR = (255, 0, 0)       # blue in OpenCV's BGR order
 BOARD_DETECTION_LINE_BGR = (255, 140, 0)     # lighter blue/cyan in BGR
 
-# OpenCV image assets are expensive to decode/prepare (especially a large
-# accumulated training set), so they are loaded once into RAM at startup
-# and shared by Board Detection and Auto-play. Six workers are used both
-# for OpenCV's internal parallel backend and for multi-square Auto-play
-# classification.
-OPENCV_WORKERS = 6
-_vision_cache_lock = threading.Lock()
-_vision_sprites_cache = None
-_vision_training_examples_cache = None
-_vision_cache_ready = False
-_vision_preload_thread = None
+# Piece/empty-square recognition is handled by the trained PyTorch CNN in
+# chessbotv_cnn.pth. The model is loaded lazily the first time Board
+# Detection or Auto-play needs it; no sprite/template dataset is loaded into
+# memory. The checkpoint's class metadata is used when present, with the
+# known ChessBotV class order as the fallback.
+CNN_MODEL_FILENAME = "chessbotv_cnn.pth"
+CNN_MODEL_ENV_VAR = "CHESSBOTV_CNN_MODEL"
+CNN_DEFAULT_IMAGE_SIZE = 64
+CNN_CLASS_NAMES = (
+    "black_bishop",
+    "black_king",
+    "black_knight",
+    "black_pawn",
+    "black_queen",
+    "black_rook",
+    "empty",
+    "white_bishop",
+    "white_king",
+    "white_knight",
+    "white_pawn",
+    "white_queen",
+    "white_rook",
+)
+CNN_CLASS_TO_SYMBOL = {
+    "black_bishop": "b",
+    "black_king": "k",
+    "black_knight": "n",
+    "black_pawn": "p",
+    "black_queen": "q",
+    "black_rook": "r",
+    "empty": ".",
+    "blank": ".",
+    "white_bishop": "B",
+    "white_king": "K",
+    "white_knight": "N",
+    "white_pawn": "P",
+    "white_queen": "Q",
+    "white_rook": "R",
+}
+PIECE_NAMES = {
+    ".": "empty square",
+    "K": "white king",
+    "Q": "white queen",
+    "R": "white rook",
+    "B": "white bishop",
+    "N": "white knight",
+    "P": "white pawn",
+    "k": "black king",
+    "q": "black queen",
+    "r": "black rook",
+    "b": "black bishop",
+    "n": "black knight",
+    "p": "black pawn",
+    "?": "unknown",
+}
+PIECE_CODES = {
+    "K": "wk",
+    "Q": "wq",
+    "R": "wr",
+    "B": "wb",
+    "N": "wn",
+    "P": "wp",
+    "k": "bk",
+    "q": "bq",
+    "r": "br",
+    "b": "bb",
+    "n": "bn",
+    "p": "bp",
+    ".": "blank",
+}
+SQUARE_BG_BGR = ((208, 236, 235), (82, 149, 115))  # #ebecd0 / #739552
+SQUARE_BG_TOLERANCE = 24
+_cnn_classifier_cache = None
+_cnn_classifier_lock = threading.Lock()
+_cnn_inference_lock = threading.Lock()
 
 
-def _configure_opencv_threads(workers=OPENCV_WORKERS):
-    """Ask OpenCV to use up to six internal worker threads."""
+def _piece_name(symbol):
+    """Human-readable name for a FEN-style piece symbol."""
+    return PIECE_NAMES.get(symbol, str(symbol))
+
+
+def _cnn_symbol_for_class_name(class_name):
+    """Map one CNN class label to ChessBotV's FEN-style symbol."""
+    if class_name in PIECE_NAMES and len(str(class_name)) == 1:
+        return str(class_name)
+    normalized = (
+        str(class_name)
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if normalized in CNN_CLASS_TO_SYMBOL:
+        return CNN_CLASS_TO_SYMBOL[normalized]
+    for symbol, code in PIECE_CODES.items():
+        if normalized == code:
+            return symbol
+    return "?"
+
+
+def _find_cnn_model_path():
+    """Find chessbotv_cnn.pth beside new.py, in the cwd, or from the env."""
+    candidates = []
+    env_path = os.environ.get(CNN_MODEL_ENV_VAR)
+    if env_path:
+        candidates.append(env_path)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for base in (script_dir, os.getcwd()):
+        path = os.path.join(base, CNN_MODEL_FILENAME)
+        if path not in candidates:
+            candidates.append(path)
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    searched = ", ".join(candidates)
+    raise FileNotFoundError(
+        f"Could not find {CNN_MODEL_FILENAME}. Searched: {searched}"
+    )
+
+
+def _cnn_checkpoint_value(checkpoint, names, default=None):
+    if not isinstance(checkpoint, dict):
+        return default
+    for name in names:
+        if name in checkpoint:
+            return checkpoint[name]
+    return default
+
+
+def _cnn_state_dict_from_checkpoint(checkpoint):
+    """Extract a model state dict from the common checkpoint layouts."""
+    if not isinstance(checkpoint, dict):
+        return None
+    for name in ("model_state_dict", "state_dict", "model"):
+        value = checkpoint.get(name)
+        if isinstance(value, dict):
+            return value
+    if any(str(key).startswith(("features.", "classifier.", "module.")) for key in checkpoint):
+        return checkpoint
+    return None
+
+
+def _cnn_symbols_from_checkpoint(checkpoint, num_classes):
+    """Class-index -> FEN-symbol mapping stored in (or implied by) the model."""
+    class_names = _cnn_checkpoint_value(
+        checkpoint, ("class_names", "classes", "labels")
+    )
+    if not class_names:
+        class_to_idx = _cnn_checkpoint_value(
+            checkpoint, ("class_to_idx", "label_to_idx")
+        )
+        if isinstance(class_to_idx, dict) and class_to_idx:
+            class_names = [
+                name
+                for name, _index in sorted(
+                    class_to_idx.items(), key=lambda item: int(item[1])
+                )
+            ]
+    if not class_names:
+        class_names = list(CNN_CLASS_NAMES)
+    class_names = [str(name) for name in class_names]
+    if len(class_names) != int(num_classes):
+        raise ValueError(
+            f"CNN has {num_classes} outputs but {len(class_names)} class labels"
+        )
+    symbols = [_cnn_symbol_for_class_name(name) for name in class_names]
+    if "?" in symbols:
+        unknown = class_names[symbols.index("?")]
+        raise ValueError(f"Unsupported CNN class label: {unknown!r}")
+    return class_names, symbols
+
+
+def _cnn_image_size_from_checkpoint(checkpoint):
+    value = _cnn_checkpoint_value(
+        checkpoint,
+        ("image_size", "input_size", "img_size", "image_shape", "input_shape"),
+        CNN_DEFAULT_IMAGE_SIZE,
+    )
     try:
-        import cv2
-
-        cv2.setNumThreads(max(1, int(workers)))
-        cv2.setUseOptimized(True)
-        return int(cv2.getNumThreads())
+        if isinstance(value, (list, tuple)):
+            numbers = [int(item) for item in value if int(item) > 0]
+            if len(numbers) >= 2:
+                return numbers[-2], numbers[-1]
+            if numbers:
+                return numbers[0], numbers[0]
+        size = int(value)
+        if size > 0:
+            return size, size
     except Exception:
-        return 0
+        pass
+    return CNN_DEFAULT_IMAGE_SIZE, CNN_DEFAULT_IMAGE_SIZE
 
 
-def _get_vision_sprites(pr):
-    """Return cached piece sprites, decoding them from disk only once."""
-    global _vision_sprites_cache
-    with _vision_cache_lock:
-        if _vision_sprites_cache is None:
-            try:
-                _vision_sprites_cache = pr.load_assets() or {}
-            except Exception as exc:
-                print(f"Vision cache: piece sprites unavailable ({exc}).")
-                _vision_sprites_cache = {}
-        return _vision_sprites_cache
+def _cnn_normalization_from_checkpoint(checkpoint):
+    """Optional per-channel mean/std saved with a future checkpoint."""
+    mean = _cnn_checkpoint_value(
+        checkpoint, ("mean", "input_mean", "normalize_mean", "image_mean")
+    )
+    std = _cnn_checkpoint_value(
+        checkpoint, ("std", "input_std", "normalize_std", "image_std")
+    )
+
+    def as_rgb_tuple(value):
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (list, tuple)):
+                numbers = [float(item) for item in value]
+            else:
+                numbers = [float(value)]
+        except Exception:
+            return None
+        if len(numbers) == 1:
+            return tuple(numbers * 3)
+        if len(numbers) >= 3:
+            return tuple(numbers[:3])
+        return None
+
+    mean_tuple = as_rgb_tuple(mean)
+    std_tuple = as_rgb_tuple(std)
+    if std_tuple is not None and any(abs(value) < 1e-12 for value in std_tuple):
+        std_tuple = None
+    return mean_tuple, std_tuple
 
 
-def _get_vision_training_examples(pr):
-    """Return the shared in-memory labelled-example mapping.
+def _build_chess_cnn_model(torch, state_dict):
+    """Build the ChessCNN architecture described by chessbotv_cnn.pth."""
+    nn = torch.nn
 
-    The same dict object is returned every time, so examples learned live
-    through Piece Detection are immediately part of the startup cache.
+    def shape(name):
+        tensor = state_dict.get(name)
+        if tensor is None or not hasattr(tensor, "shape"):
+            raise ValueError(f"CNN checkpoint is missing tensor {name!r}")
+        return tuple(int(value) for value in tensor.shape)
+
+    conv1 = shape("features.0.weight")
+    conv2 = shape("features.4.weight")
+    conv3 = shape("features.8.weight")
+    conv4 = shape("features.12.weight")
+    hidden = shape("classifier.2.weight")
+    output = shape("classifier.5.weight")
+    if len(conv1) != 4 or len(conv2) != 4 or len(conv3) != 4 or len(conv4) != 4:
+        raise ValueError("CNN checkpoint has unexpected convolution shapes")
+    if len(hidden) != 2 or len(output) != 2:
+        raise ValueError("CNN checkpoint has unexpected classifier shapes")
+
+    def conv_block(in_channels, out_channels, kernel_size, pool=True):
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+        if pool:
+            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        return layers
+
+    class ChessCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.features = nn.Sequential(
+                *conv_block(conv1[1], conv1[0], conv1[-1]),
+                *conv_block(conv2[1], conv2[0], conv2[-1]),
+                *conv_block(conv3[1], conv3[0], conv3[-1]),
+                *conv_block(conv4[1], conv4[0], conv4[-1], pool=False),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.classifier = nn.Sequential(
+                nn.Flatten(),
+                nn.Dropout(p=0.3),
+                nn.Linear(hidden[1], hidden[0]),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.3),
+                nn.Linear(output[1], output[0]),
+            )
+
+        def forward(self, x):
+            return self.classifier(self.features(x))
+
+    return ChessCNN(), int(output[0])
+
+
+def _torch_load_checkpoint(torch, path, device):
+    """Load the repository's trusted CNN checkpoint across torch versions."""
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+    except Exception:
+        # Older/custom checkpoint metadata can be rejected by the restricted
+        # loader. This file is the model shipped with ChessBotV itself.
+        return torch.load(path, map_location=device, weights_only=False)
+
+
+def _load_cnn_classifier():
+    """Load chessbotv_cnn.pth once and return its cached runtime details."""
+    global _cnn_classifier_cache
+    if _cnn_classifier_cache is not None:
+        return _cnn_classifier_cache
+    with _cnn_classifier_lock:
+        if _cnn_classifier_cache is not None:
+            return _cnn_classifier_cache
+
+        import torch
+
+        path = _find_cnn_model_path()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint = _torch_load_checkpoint(torch, path, device)
+
+        if hasattr(checkpoint, "state_dict") and callable(checkpoint):
+            model = checkpoint
+            output_shape = None
+            for name, tensor in model.state_dict().items():
+                if name.endswith("classifier.5.weight"):
+                    output_shape = tuple(tensor.shape)
+                    break
+            num_classes = int(output_shape[0]) if output_shape else len(CNN_CLASS_NAMES)
+            class_names, symbols = _cnn_symbols_from_checkpoint({}, num_classes)
+            image_size = (CNN_DEFAULT_IMAGE_SIZE, CNN_DEFAULT_IMAGE_SIZE)
+            mean, std = None, None
+        else:
+            state_dict = _cnn_state_dict_from_checkpoint(checkpoint)
+            if state_dict is None:
+                raise ValueError(f"Unsupported CNN checkpoint format in {path}")
+            if state_dict and all(
+                str(key).startswith("module.") for key in state_dict
+            ):
+                state_dict = {
+                    str(key)[len("module."):]: value
+                    for key, value in state_dict.items()
+                }
+            model, num_classes = _build_chess_cnn_model(torch, state_dict)
+            model.load_state_dict(state_dict, strict=True)
+            class_names, symbols = _cnn_symbols_from_checkpoint(
+                checkpoint, num_classes
+            )
+            image_size = _cnn_image_size_from_checkpoint(checkpoint)
+            mean, std = _cnn_normalization_from_checkpoint(checkpoint)
+
+        model.to(device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+
+        _cnn_classifier_cache = {
+            "torch": torch,
+            "model": model,
+            "device": device,
+            "path": path,
+            "class_names": class_names,
+            "symbols": symbols,
+            "image_size": image_size,
+            "mean": mean,
+            "std": std,
+        }
+        print(
+            f"CNN vision model loaded: {path} "
+            f"({len(class_names)} classes, input {image_size[1]}x{image_size[0]}, {device})."
+        )
+        return _cnn_classifier_cache
+
+
+def _get_cnn_classifier():
+    return _load_cnn_classifier()
+
+
+def _prepare_cnn_square(square, classifier):
+    """Convert one BGR/BGRA/grey square crop to a CNN input tensor."""
+    import numpy as np
+
+    torch = classifier["torch"]
+    functional = torch.nn.functional
+    array = np.asarray(square)
+    if array.ndim == 2:
+        array = np.stack((array, array, array), axis=2)
+    elif array.ndim == 3:
+        if array.shape[2] == 1:
+            array = np.repeat(array, 3, axis=2)
+        elif array.shape[2] >= 3:
+            # Window captures and board crops are BGR; the CNN dataset/PIL
+            # convention is RGB.
+            array = array[:, :, :3][:, :, ::-1]
+        else:
+            raise ValueError("CNN square needs at least one colour channel")
+    else:
+        raise ValueError("CNN square must be a 2D or 3D image")
+
+    if array.dtype != np.uint8:
+        if np.issubdtype(array.dtype, np.floating) and array.size:
+            if float(np.nanmax(array)) <= 1.0:
+                array = array * 255.0
+        array = np.clip(array, 0, 255).astype(np.uint8)
+
+    tensor = (
+        torch.from_numpy(np.ascontiguousarray(array))
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+        .div(255.0)
+    )
+    target_h, target_w = classifier["image_size"]
+    if tensor.shape[-2:] != (target_h, target_w):
+        try:
+            tensor = functional.interpolate(
+                tensor,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+        except TypeError:
+            tensor = functional.interpolate(
+                tensor,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+    mean = classifier.get("mean")
+    std = classifier.get("std")
+    if mean is not None:
+        mean_tensor = torch.tensor(mean, dtype=tensor.dtype).view(1, 3, 1, 1)
+        tensor = tensor - mean_tensor
+    if std is not None:
+        std_tensor = torch.tensor(std, dtype=tensor.dtype).view(1, 3, 1, 1)
+        tensor = tensor / std_tensor
+    return tensor[0]
+
+
+def _classify_squares_with_cnn(squares, classifier=None):
+    """Classify square crops in one CNN batch.
+
+    Returns the same ``(symbol, confidence, ranked)`` shape the board code
+    already uses. ``ranked`` is sorted by descending probability, stored as
+    ``(symbol, 1 - probability)`` so existing ranking consumers continue to
+    see their preferred value first.
     """
-    global _vision_training_examples_cache
-    with _vision_cache_lock:
-        if _vision_training_examples_cache is None:
-            try:
-                loaded = pr.load_training_examples()
-            except Exception as exc:
-                print(f"Vision cache: training examples unavailable ({exc}).")
-                loaded = {}
-            _vision_training_examples_cache = loaded if loaded is not None else {}
-        return _vision_training_examples_cache
+    squares = list(squares)
+    results = [("?", 0.0, []) for _ in squares]
+    if not squares:
+        return results
+
+    classifier = classifier or _get_cnn_classifier()
+    torch = classifier["torch"]
+    valid_indexes = []
+    tensors = []
+    for index, square in enumerate(squares):
+        try:
+            if square is None or getattr(square, "size", 0) == 0:
+                continue
+            if getattr(square, "ndim", 0) >= 2 and min(square.shape[:2]) < 2:
+                continue
+            tensors.append(_prepare_cnn_square(square, classifier))
+            valid_indexes.append(index)
+        except Exception:
+            continue
+    if not tensors:
+        return results
+
+    batch = torch.stack(tensors).to(classifier["device"])
+    with _cnn_inference_lock:
+        inference_mode = getattr(torch, "inference_mode", torch.no_grad)
+        with inference_mode():
+            logits = classifier["model"](batch)
+            probabilities = torch.softmax(logits, dim=1).detach().cpu()
+
+    symbols = classifier["symbols"]
+    for result_index, probability_row in zip(valid_indexes, probabilities):
+        values = [float(value) for value in probability_row.tolist()]
+        order = sorted(range(len(values)), key=lambda item: values[item], reverse=True)
+        ranked = [
+            (symbols[item], max(0.0, min(1.0, 1.0 - values[item])))
+            for item in order
+        ]
+        best = order[0]
+        results[result_index] = (symbols[best], float(values[best]), ranked)
+    return results
 
 
-def _load_vision_cache(pr=None):
-    """Load/configure all OpenCV assets used by detection and Auto-play."""
-    global _vision_cache_ready
-    pr = pr or _load_piece_recognition_module()
-    threads = _configure_opencv_threads(OPENCV_WORKERS)
-    sprites = _get_vision_sprites(pr)
-    examples = _get_vision_training_examples(pr)
-    _vision_cache_ready = True
-    example_count = sum(len(items) for items in examples.values())
-    print(
-        "Vision cache ready: "
-        f"{len(sprites)} sprite(s), {example_count} training example(s), "
-        f"OpenCV threads={threads or OPENCV_WORKERS}."
-    )
-    return sprites, examples
-
-
-def _preload_vision_cache_worker():
-    try:
-        _load_vision_cache()
-    except Exception as exc:
-        print(f"Vision cache preload failed; detection will retry on demand. ({exc})")
-
-
-def preload_vision_cache_async():
-    """Start the one-time background OpenCV asset preload used at startup."""
-    global _vision_preload_thread
-    if _vision_cache_ready:
-        return True
-    if _vision_preload_thread is not None and _vision_preload_thread.is_alive():
-        return True
-    _vision_preload_thread = threading.Thread(
-        target=_preload_vision_cache_worker,
-        name="vision-cache-preload",
-        daemon=True,
-    )
-    _vision_preload_thread.start()
-    return True
-
-
-def _load_piece_recognition_module():
-    """Import piece_recognition lazily so OpenCV stays optional at startup."""
-    global _piece_recognition_module
-    if _piece_recognition_module is not None:
-        return _piece_recognition_module
-    try:
-        import piece_recognition as module
-    except Exception:
-        import importlib.util
-
-        module_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "piece_recognition.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "piece_recognition", module_path
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load piece recognition from {module_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    _piece_recognition_module = module
-    _configure_opencv_threads(OPENCV_WORKERS)
-    return module
-
-
-def _load_piece_detection_module():
-    """Import piece_detection lazily (its picker shares piece_recognition)."""
-    global _piece_detection_module
-    if _piece_detection_module is not None:
-        return _piece_detection_module
-    pr = _load_piece_recognition_module()
-    sys.modules.setdefault("piece_recognition", pr)
-    try:
-        import piece_detection as module
-    except Exception:
-        import importlib.util
-
-        module_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "piece_detection.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "piece_detection", module_path
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load piece detection from {module_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    _piece_detection_module = module
-    return module
+def _classify_square_with_cnn(square, classifier=None):
+    return _classify_squares_with_cnn([square], classifier=classifier)[0]
 
 
 def _load_autoplay_dictionary():
@@ -2958,27 +3293,30 @@ def _load_autoplay_dictionary():
     return {}
 
 
-def _dictionary_symbol(data, image_path, default_symbol, pr):
+def _dictionary_symbol(data, image_path, default_symbol):
     """Resolve one autoplaydictionary entry to a FEN-style piece symbol."""
     value = data.get(image_path)
     if isinstance(value, dict):
         symbol = value.get("symbol")
-        if symbol in getattr(pr, "PIECE_NAMES", {}):
+        if symbol in PIECE_NAMES:
             return symbol
         value = value.get("piece") or value.get("label") or value.get("name")
     if isinstance(value, str):
         clean = value.strip()
-        if clean in getattr(pr, "PIECE_NAMES", {}):
+        if clean in PIECE_NAMES:
             return clean
+        cnn_symbol = _cnn_symbol_for_class_name(clean)
+        if cnn_symbol != "?":
+            return cnn_symbol
         labels = {
             str(name).strip().lower(): symbol
-            for symbol, name in getattr(pr, "PIECE_NAMES", {}).items()
+            for symbol, name in PIECE_NAMES.items()
         }
         return labels.get(clean.lower(), default_symbol)
     return default_symbol
 
 
-def _expected_anchor_symbols(pr):
+def _expected_anchor_symbols():
     """Expected top-left/bottom-right pieces from autoplaydictionary.json.
 
     The dictionary entry for r0_c0 describes a8 and r7_c7 describes h1.
@@ -2987,21 +3325,19 @@ def _expected_anchor_symbols(pr):
     """
     data = _load_autoplay_dictionary()
     return (
-        _dictionary_symbol(data, "board_debug/r0_c0.png", "r", pr),
-        _dictionary_symbol(data, "board_debug/r7_c7.png", "R", pr),
+        _dictionary_symbol(data, "board_debug/r0_c0.png", "r"),
+        _dictionary_symbol(data, "board_debug/r7_c7.png", "R"),
     )
 
 
-def _board_colour_masks(image, pr):
+def _board_colour_masks(image):
     """Return (light, dark, combined) Chess.com square-colour masks."""
     import numpy as np
 
     if image is None or getattr(image, "ndim", 0) != 3:
         raise ValueError("Board detection needs a colour screenshot")
-    colours = getattr(pr, "SQUARE_BG_BGR", None)
-    if not colours or len(colours) < 2:
-        colours = ((208, 236, 235), (82, 149, 115))
-    tolerance = int(getattr(pr, "SQUARE_BG_TOLERANCE", 24))
+    colours = SQUARE_BG_BGR
+    tolerance = SQUARE_BG_TOLERANCE
     bgr = image[:, :, :3].astype(np.int16)
     light_colour = np.asarray(colours[0], dtype=np.int16)
     dark_colour = np.asarray(colours[1], dtype=np.int16)
@@ -3166,53 +3502,30 @@ def _refine_board_rect(board_rect, integrals, image_w, image_h):
 
 
 def _anchor_match_score(ranked, expected_symbol):
-    """Score a classifier ranking against the expected anchor piece."""
+    """Score a CNN ranking against the expected anchor piece."""
     if not ranked:
         return 0.0
-    errors = {symbol: float(error) for symbol, error in ranked}
-    if expected_symbol not in errors:
-        return 0.0
-    expected_error = errors[expected_symbol]
-    score = 0.35 * max(0.0, 1.0 - expected_error * 2.5)
+    probabilities = {
+        symbol: max(0.0, min(1.0, 1.0 - float(error)))
+        for symbol, error in ranked
+    }
+    expected_probability = probabilities.get(expected_symbol, 0.0)
+    score = 0.65 * expected_probability
     if ranked[0][0] == expected_symbol:
-        score += 0.45
-        if len(ranked) > 1:
-            second_error = float(ranked[1][1])
-            separation = (second_error - expected_error) / max(second_error, 1e-6)
-            score += 0.20 * max(0.0, min(1.0, separation))
+        score += 0.35
     return max(0.0, min(1.0, score))
 
 
-def _classify_square_with_examples(pr, square, sprites, training_examples=None):
-    """Classify with labelled examples, tolerating older classifier APIs."""
-    try:
-        return pr.classify_square(
-            square,
-            sprites or {},
-            training_examples=training_examples,
-        )
-    except TypeError:
-        return pr.classify_square(square, sprites or {})
-
-
-def _piece_display_code(pr, symbol):
+def _piece_display_code(symbol):
     """Short overlay code for an occupied square; blank squares get ''."""
     if symbol in (None, "."):
         return ""
     if symbol == "?":
         return "?"
-    code_fn = getattr(pr, "training_code_for_symbol", None)
-    if callable(code_fn):
-        try:
-            code = code_fn(symbol)
-        except Exception:
-            code = None
-        if code:
-            return "" if code == "blank" else code
-    return str(symbol)
+    return PIECE_CODES.get(symbol, str(symbol))
 
 
-def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_symbol, training_examples=None):
+def _classify_board_anchor(image, board_rect, row, col, expected_symbol):
     left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
     cell = image[top:bottom, left:right]
     centre = ((left + right) // 2, (top + bottom) // 2)
@@ -3222,7 +3535,7 @@ def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_sy
         "coordinate": f"{'abcdefgh'[col]}{8 - row}",
         "centre": centre,
         "expected_symbol": expected_symbol,
-        "expected_name": pr.piece_name(expected_symbol),
+        "expected_name": _piece_name(expected_symbol),
         "detected_symbol": None,
         "classified_symbol": None,
         "detected_name": None,
@@ -3230,19 +3543,17 @@ def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_sy
         "score": 0.0,
         "match": None,
     }
-    if (not sprites and not training_examples) or cell.shape[0] < 8 or cell.shape[1] < 8:
+    if cell.shape[0] < 8 or cell.shape[1] < 8:
         return info
     try:
-        symbol, confidence, ranked = _classify_square_with_examples(
-            pr, cell, sprites, training_examples=training_examples
-        )
+        symbol, confidence, ranked = _classify_square_with_cnn(cell)
     except Exception:
         return info
     detected = ranked[0][0] if ranked else symbol
     info.update({
         "detected_symbol": detected,
         "classified_symbol": symbol,
-        "detected_name": pr.piece_name(detected),
+        "detected_name": _piece_name(detected),
         "confidence": float(confidence),
         "score": _anchor_match_score(ranked, expected_symbol),
         "match": detected == expected_symbol,
@@ -3250,7 +3561,7 @@ def _classify_board_anchor(image, board_rect, row, col, sprites, pr, expected_sy
     return info
 
 
-def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_anchors, training_examples=None):
+def _score_board_candidate(image, board_rect, integrals, expected_anchors):
     metrics = _board_geometry_score(board_rect, integrals)
     total = metrics["score"]
     anchors = {}
@@ -3265,15 +3576,11 @@ def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_a
             board_rect,
             row,
             col,
-            sprites,
-            pr,
             expected,
-            training_examples=training_examples,
         )
-    if sprites is not None or training_examples:
-        total += 1.5 * (
-            anchors["top_left"]["score"] + anchors["bottom_right"]["score"]
-        ) / 2.0
+    total += 1.5 * (
+        anchors["top_left"]["score"] + anchors["bottom_right"]["score"]
+    ) / 2.0
     return {
         "board_rect": board_rect,
         "score": float(total),
@@ -3283,76 +3590,21 @@ def _score_board_candidate(image, board_rect, integrals, pr, sprites, expected_a
     }
 
 
-def _classify_board_pieces(image, board_rect, pr, sprites=None,
-                           training_examples=None, existing=None,
-                           max_workers=1):
-    """Classify every square of a located board.
-
-    Manually answered squares in ``existing`` are preserved, which lets a
-    newly learned example be applied to only the remaining unknown/auto
-    squares during the same detection run.
-    """
-    previous_grid = (existing or {}).get("piece_grid")
-    previous_sources = (existing or {}).get("piece_sources")
-    previous_confidences = (existing or {}).get("piece_confidences")
-    previous_ranked = (existing or {}).get("piece_ranked")
-
-    # Auto-play's first scan can classify the 64 independent cells across
-    # six workers. Board Detection keeps the original sequential default.
-    precomputed = {}
-    workers = max(1, int(max_workers or 1))
-    if workers > 1 and bool(sprites or training_examples):
-        tasks = []
-        for row in range(8):
-            for col in range(8):
-                if (
-                    previous_grid and previous_sources
-                    and previous_sources[row][col] == "manual"
-                ):
-                    continue
-                left, top, right, bottom = _board_cell_bounds(
-                    board_rect, row, col
-                )
-                cell = image[top:bottom, left:right]
-                if cell.shape[0] >= 8 and cell.shape[1] >= 8:
-                    tasks.append((row, col, cell.copy()))
-
-        def classify_task(task):
-            task_row, task_col, task_cell = task
-            try:
-                task_symbol, task_confidence, task_ranked = (
-                    _classify_square_with_examples(
-                        pr,
-                        task_cell,
-                        sprites,
-                        training_examples=training_examples,
-                    )
-                )
-                return (
-                    task_row,
-                    task_col,
-                    task_symbol,
-                    float(task_confidence),
-                    task_ranked,
-                )
-            except Exception:
-                return task_row, task_col, "?", 0.0, []
-
-        if len(tasks) > 1:
-            with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
-                for task_row, task_col, task_symbol, task_confidence, task_ranked in executor.map(classify_task, tasks):
-                    precomputed[(task_row, task_col)] = (
-                        task_symbol,
-                        task_confidence,
-                        task_ranked,
-                    )
-        elif tasks:
-            task_row, task_col, task_symbol, task_confidence, task_ranked = classify_task(tasks[0])
-            precomputed[(task_row, task_col)] = (
-                task_symbol,
-                task_confidence,
-                task_ranked,
-            )
+def _classify_board_pieces(image, board_rect):
+    """Classify every square of a located board with one CNN batch."""
+    tasks = []
+    positions = []
+    for row in range(8):
+        for col in range(8):
+            left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
+            cell = image[top:bottom, left:right]
+            if cell.shape[0] >= 8 and cell.shape[1] >= 8:
+                positions.append((row, col))
+                tasks.append(cell.copy())
+    classified = _classify_squares_with_cnn(tasks)
+    precomputed = {
+        position: result for position, result in zip(positions, classified)
+    }
 
     grid = []
     sources = []
@@ -3368,48 +3620,11 @@ def _classify_board_pieces(image, board_rect, pr, sprites=None,
         confidence_row = []
         ranked_row = []
         for col in range(8):
-            if (
-                previous_grid and previous_sources
-                and previous_sources[row][col] == "manual"
-            ):
-                symbol = previous_grid[row][col]
-                confidence = 1.0
-                ranked = []
-                if previous_confidences:
-                    confidence = previous_confidences[row][col]
-                if previous_ranked:
-                    ranked = previous_ranked[row][col]
-                source = "manual"
-            else:
-                left, top, right, bottom = _board_cell_bounds(
-                    board_rect, row, col
-                )
-                cell = image[top:bottom, left:right]
-                symbol = "?"
-                confidence = 0.0
-                ranked = []
-                source = "unknown"
-                if (row, col) in precomputed:
-                    symbol, confidence, ranked = precomputed[(row, col)]
-                    source = "unknown" if symbol == "?" else "auto"
-                elif (
-                    cell.shape[0] >= 8 and cell.shape[1] >= 8
-                    and bool(sprites or training_examples)
-                ):
-                    try:
-                        symbol, confidence, ranked = _classify_square_with_examples(
-                            pr,
-                            cell,
-                            sprites,
-                            training_examples=training_examples,
-                        )
-                        confidence = float(confidence)
-                        source = "unknown" if symbol == "?" else "auto"
-                    except Exception:
-                        symbol = "?"
-                        confidence = 0.0
-                        ranked = []
-                        source = "unknown"
+            symbol, confidence, ranked = precomputed.get(
+                (row, col), ("?", 0.0, [])
+            )
+            confidence = float(confidence)
+            source = "unknown" if symbol == "?" else "cnn"
 
             grid_row.append(symbol)
             source_row.append(source)
@@ -3443,7 +3658,7 @@ def _board_square_crop(image, board_rect, row, col):
     return image[top:bottom, left:right].copy()
 
 
-def _sync_board_anchor_labels(result, pr):
+def _sync_board_anchor_labels(result):
     """Keep corner-anchor text in step with the final all-square labels."""
     grid = result.get("piece_grid") or []
     confidences = result.get("piece_confidences") or []
@@ -3460,10 +3675,7 @@ def _sync_board_anchor_labels(result, pr):
             continue
         anchor["detected_symbol"] = symbol
         anchor["classified_symbol"] = symbol
-        try:
-            anchor["detected_name"] = pr.piece_name(symbol)
-        except Exception:
-            anchor["detected_name"] = str(symbol)
+        anchor["detected_name"] = _piece_name(symbol)
         anchor["match"] = symbol == anchor.get("expected_symbol")
         try:
             anchor["confidence"] = float(confidences[row][col])
@@ -3471,147 +3683,19 @@ def _sync_board_anchor_labels(result, pr):
             pass
 
 
-def _resolve_unknown_board_pieces(result, pr_module=None, interactive=True,
-                                  orientation="white"):
-    """Ask Piece Detection about unknown squares and learn each answer live.
-
-    This runs on ChessBotV's main thread before the final result window.
-    Each answer is saved as the next training example and appended to the
-    shared in-memory example mapping; the remaining squares are then
-    reclassified immediately, so identical unknown pieces may resolve
-    without another question.
-    """
-    if not interactive or not result:
-        return result
-
-    image = result.get("screenshot")
-    board_rect = result.get("board_rect")
-    grid = result.get("piece_grid")
-    if image is None or board_rect is None or not grid:
-        return result
-
-    pr = pr_module or _load_piece_recognition_module()
-    try:
-        piece_detection = _load_piece_detection_module()
-    except Exception as exc:
-        print(f"Board Detection: Piece Detection unavailable: {exc}")
-        return result
-
-    examples = result.get("training_examples")
-    if examples is None:
-        examples = {}
-        result["training_examples"] = examples
-    sprites = result.get("sprites")
-    learned = result.setdefault("learned_examples", [])
-    skipped = set()
-
-    while True:
-        grid = result.get("piece_grid", [])
-        unknowns = [
-            (row, col)
-            for row in range(8)
-            for col in range(8)
-            if grid[row][col] == "?" and (row, col) not in skipped
-        ]
-        if not unknowns:
-            break
-
-        row, col = unknowns[0]
-        if str(orientation).lower() == "black":
-            # The picker labels row 0 as rank 8 / col 0 as file a. Feed it
-            # board-oriented display coordinates while result indexes stay
-            # in screenshot/visual order.
-            display_row, display_col = 7 - row, 7 - col
-            coordinate = f"{'abcdefgh'[7 - col]}{row + 1}"
-        else:
-            display_row, display_col = row, col
-            coordinate = f"{'abcdefgh'[col]}{8 - row}"
-        crop = _board_square_crop(image, board_rect, row, col)
-
-        initial = "?"
-        ranked = []
-        confidence = None
-        ranked_grid = result.get("piece_ranked") or []
-        confidence_grid = result.get("piece_confidences") or []
-        try:
-            ranked = ranked_grid[row][col]
-            if ranked and ranked[0][0] in getattr(pr, "PIECE_CHOICES", ()):
-                initial = ranked[0][0]
-        except Exception:
-            ranked = []
-        try:
-            confidence = float(confidence_grid[row][col])
-        except Exception:
-            confidence = None
-
-        try:
-            symbol, saved_path = piece_detection.ask_and_save_training_example(
-                crop,
-                training_examples=examples,
-                row=display_row,
-                col=display_col,
-                initial=initial,
-                ranked=ranked,
-                confidence=confidence,
-                detail=(
-                    f"{coordinate}: Board Detection does not know this "
-                    "piece yet. Choose it to teach the detector."
-                ),
-            )
-        except Exception as exc:
-            print(f"Board Detection: Piece Detection failed for {coordinate}: {exc}")
-            break
-
-        if symbol == getattr(pr, "CANCEL_CHOICE", "<cancel>"):
-            print(
-                "Board Detection: Piece Detection cancelled; "
-                "remaining unknown squares stay marked '?'."
-            )
-            break
-        if symbol is None or symbol == "?":
-            print(
-                f"Board Detection: skipped {coordinate}; "
-                "it stays marked '?' for this run."
-            )
-            skipped.add((row, col))
-            continue
-
-        result["piece_grid"][row][col] = symbol
-        result["piece_sources"][row][col] = "manual"
-        result["piece_confidences"][row][col] = 1.0
-        if saved_path:
-            learned.append(str(saved_path))
-            print(f"Board Detection: learned {coordinate} as {symbol}: {saved_path}")
-
-        result.update(_classify_board_pieces(
-            image,
-            board_rect,
-            pr,
-            sprites=sprites,
-            training_examples=examples,
-            existing=result,
-        ))
-
-    _sync_board_anchor_labels(result, pr)
-    result["learned_examples"] = learned
-    return result
-
-
-def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anchors=None, training_examples=None, classify_workers=1):
+def detect_chessboard_in_image(image, expected_anchors=None):
     """Find a White-oriented Chess.com board square in a BGR screenshot.
 
-    The grid-colour geometry does the locating; the two corner anchors
-    (dictionary/configured pieces, normally black rook on a8 and white rook
-    on h1) are classified as a verification signal when sprites are present.
-    Returns a detection dict or None.
+    The grid-colour geometry does the locating; the CNN classifies the two
+    corner anchors (normally black rook on a8 and white rook on h1) as a
+    verification signal and then classifies all 64 squares. Returns a
+    detection dict or None.
     """
-    import cv2
-
-    pr = pr_module or _load_piece_recognition_module()
     if image is None or getattr(image, "ndim", 0) != 3:
         return None
+    classifier = _get_cnn_classifier()
     image_h, image_w = image.shape[:2]
-    light_mask, dark_mask, bg_mask = _board_colour_masks(image, pr)
+    light_mask, dark_mask, bg_mask = _board_colour_masks(image)
     integrals = {
         "light": _mask_integral(light_mask),
         "dark": _mask_integral(dark_mask),
@@ -3636,33 +3720,14 @@ def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anc
         if refined not in refined_rects:
             refined_rects.append(refined)
 
-    if sprites is None:
-        try:
-            sprites = _get_vision_sprites(pr)
-        except Exception as exc:
-            print(f"Board Detection: piece sprites unavailable ({exc}); using grid only.")
-            sprites = None
-        if not sprites:
-            sprites = None
-    if training_examples is None:
-        try:
-            training_examples = _get_vision_training_examples(pr)
-        except Exception as exc:
-            print(f"Board Detection: training examples unavailable ({exc}); using sprites only.")
-            training_examples = {}
-        if training_examples is None:
-            training_examples = {}
-    expected = expected_anchors or _expected_anchor_symbols(pr)
+    expected = expected_anchors or _expected_anchor_symbols()
 
     scored = [
         _score_board_candidate(
             image,
             rect,
             integrals,
-            pr,
-            sprites,
             expected,
-            training_examples=training_examples,
         )
         for rect in refined_rects
     ]
@@ -3671,16 +3736,10 @@ def detect_chessboard_in_image(image, pr_module=None, sprites=None, expected_anc
         return None
     best["expected_anchors"] = expected
     best["image_size"] = (image_w, image_h)
-    best["sprites"] = sprites
-    best["training_examples"] = training_examples
-    best.update(_classify_board_pieces(
-        image,
-        best["board_rect"],
-        pr,
-        sprites=sprites,
-        training_examples=training_examples,
-        max_workers=classify_workers,
-    ))
+    best["cnn_model_path"] = classifier["path"]
+    best["cnn_class_names"] = list(classifier["class_names"])
+    best.update(_classify_board_pieces(image, best["board_rect"]))
+    _sync_board_anchor_labels(best)
     return best
 
 
@@ -3853,44 +3912,25 @@ def _autoplay_changed_visual_squares(previous, current,
     return changed
 
 
-def _autoplay_classify_visual_squares(board_crop, visual_squares, pr,
-                                      sprites=None, training_examples=None,
-                                      max_workers=OPENCV_WORKERS):
+def _autoplay_classify_visual_squares(board_crop, visual_squares):
     """Classify only the requested visual cells of a board-only crop."""
-    results = {}
+    visual_squares = list(visual_squares)
     if board_crop is None or getattr(board_crop, "ndim", 0) != 3:
         return {(row, col): "?" for row, col in visual_squares}
     board_rect = (0, 0, board_crop.shape[1], board_crop.shape[0])
-    tasks = [
-        (row, col, _board_square_crop(board_crop, board_rect, row, col))
+    cells = [
+        _board_square_crop(board_crop, board_rect, row, col)
         for row, col in visual_squares
     ]
-
-    def classify_task(task):
-        row, col, cell = task
-        if cell.shape[0] < 8 or cell.shape[1] < 8 or not (sprites or training_examples):
-            return row, col, "?"
-        try:
-            symbol, _confidence, _ranked = _classify_square_with_examples(
-                pr,
-                cell,
-                sprites,
-                training_examples=training_examples,
-            )
-            return row, col, symbol
-        except Exception:
-            return row, col, "?"
-
-    workers = max(1, int(max_workers or 1))
-    if workers > 1 and len(tasks) > 1:
-        with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
-            for row, col, symbol in executor.map(classify_task, tasks):
-                results[(row, col)] = symbol
-    else:
-        for task in tasks:
-            row, col, symbol = classify_task(task)
-            results[(row, col)] = symbol
-    return results
+    try:
+        classified = _classify_squares_with_cnn(cells)
+    except Exception as exc:
+        print(f"Auto-play: CNN changed-square classification failed: {exc}")
+        return {(row, col): "?" for row, col in visual_squares}
+    return {
+        position: result[0]
+        for position, result in zip(visual_squares, classified)
+    }
 
 
 def _autoplay_candidate_grid(base_board_grid, classified_visual, side):
@@ -3949,11 +3989,10 @@ def _anchor_overlay_label(anchor):
     return f"{coord}: {expected}"
 
 
-def annotate_board_detection(image, detection, pr_module=None):
+def annotate_board_detection(image, detection):
     """Draw the blue board square, 8x8 grid, coordinates and rook anchors."""
     import cv2
 
-    pr = pr_module or _load_piece_recognition_module()
     annotated = image.copy()
     x, y, width, height = detection["board_rect"]
     side = width
@@ -4007,8 +4046,7 @@ def annotate_board_detection(image, detection, pr_module=None):
 
     # Label occupied squares last so their short piece codes stay readable
     # over the grid/pieces/anchor markers. Blank squares intentionally get
-    # no piece label; unresolved squares show '?' until Piece Detection
-    # has been asked about them.
+    # no piece label; a square the CNN could not process shows '?'.
     if piece_grid:
         for row in range(8):
             for col in range(8):
@@ -4016,7 +4054,7 @@ def annotate_board_detection(image, detection, pr_module=None):
                     symbol = piece_grid[row][col]
                 except Exception:
                     continue
-                piece_code = _piece_display_code(pr, symbol)
+                piece_code = _piece_display_code(symbol)
                 if not piece_code:
                     continue
                 _left, _top, right, bottom = _board_cell_bounds(
@@ -4389,8 +4427,7 @@ def _autoplay_drag_screen_points(start, end, duration=AUTOPLAY_DRAG_SECONDS):
                 pass
 
 
-def _autoplay_drag_move(move, screen_board_rect, side, hwnd=None,
-                        pr=None, sprites=None, training_examples=None):
+def _autoplay_drag_move(move, screen_board_rect, side, hwnd=None):
     """Focus the target and drag one chess move on its real board."""
     if screen_board_rect is None or move is None:
         return False
@@ -4416,38 +4453,27 @@ def _autoplay_drag_move(move, screen_board_rect, side, hwnd=None,
         choice_row = max(0, min(7, dest_row + direction * choice_index))
 
         if move.promotion != chess.QUEEN:
-            pr = pr or _autoplay.get("pr")
-            sprites = _autoplay.get("sprites") if sprites is None else sprites
-            training_examples = (
-                _autoplay.get("training_examples")
-                if training_examples is None else training_examples
-            )
-            if pr is not None and (sprites or training_examples):
-                try:
-                    crop = _autoplay_capture_board_crop()
-                except Exception:
-                    crop = None
-                if crop is not None and _autoplay.get("enabled", True):
-                    choice_cells = [
-                        (max(0, min(7, dest_row + direction * index)), dest_col)
-                        for index in range(4)
-                    ]
-                    classified = _autoplay_classify_visual_squares(
-                        crop,
-                        choice_cells,
-                        pr,
-                        sprites=sprites,
-                        training_examples=training_examples,
-                        max_workers=OPENCV_WORKERS,
-                    )
-                    desired = chess.Piece(
-                        move.promotion,
-                        chess.WHITE if _autoplay_side_name(side) == "white" else chess.BLACK,
-                    ).symbol()
-                    for cell in choice_cells:
-                        if classified.get(cell) == desired:
-                            choice_row = cell[0]
-                            break
+            try:
+                crop = _autoplay_capture_board_crop()
+            except Exception:
+                crop = None
+            if crop is not None and _autoplay.get("enabled", True):
+                choice_cells = [
+                    (max(0, min(7, dest_row + direction * index)), dest_col)
+                    for index in range(4)
+                ]
+                classified = _autoplay_classify_visual_squares(
+                    crop,
+                    choice_cells,
+                )
+                desired = chess.Piece(
+                    move.promotion,
+                    chess.WHITE if _autoplay_side_name(side) == "white" else chess.BLACK,
+                ).symbol()
+                for cell in choice_cells:
+                    if classified.get(cell) == desired:
+                        choice_row = cell[0]
+                        break
 
         left, top, right, bottom = _board_cell_bounds(
             screen_board_rect, choice_row, dest_col
@@ -4553,9 +4579,8 @@ def _board_detection_summary(result):
             f" Pieces: {piece_count}, blanks: {blank_count}, "
             f"unknown: {unknown_count}."
         )
-        learned_count = len(result.get("learned_examples", []))
-        if learned_count:
-            summary += f" Learned {learned_count} new example(s)."
+        if result.get("cnn_model_path"):
+            summary += f" CNN: {os.path.basename(result['cnn_model_path'])}."
     return summary
 
 
@@ -4564,13 +4589,13 @@ def _board_detection_worker(window_info):
     global board_detection_result_ready, board_detection_error
     global board_detection_status, board_detection_last_summary
     try:
-        pr = _load_piece_recognition_module()
         import cv2
 
+        _get_cnn_classifier()
         image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
         if image is None:
             raise RuntimeError("Could not screenshot the selected window")
-        detection = detect_chessboard_in_image(image, pr_module=pr)
+        detection = detect_chessboard_in_image(image)
         if detection is None:
             board_detection_error = (
                 "No Chess.com-coloured 8x8 board found in that window. "
@@ -4590,7 +4615,7 @@ def _board_detection_worker(window_info):
             )
         detection["window_title"] = window_info.get("title", "Selected window")
         detection["screenshot"] = image
-        detection["annotated"] = annotate_board_detection(image, detection, pr)
+        detection["annotated"] = annotate_board_detection(image, detection)
 
         # Keep debug copies next to the existing board-vision outputs.
         try:
@@ -4643,7 +4668,7 @@ def start_board_detection(window_info):
 
 
 def show_board_detection_result(result):
-    """Resolve unknown pieces live, then open the annotated screenshot."""
+    """Open the CNN-annotated Board Detection screenshot."""
     global board_detection_error, board_detection_status
     global board_detection_last_summary
     try:
@@ -4653,28 +4678,6 @@ def show_board_detection_result(result):
         if annotated is None:
             raise RuntimeError("No annotated screenshot available")
 
-        # Piece Detection must run here on the main thread, not inside the
-        # capture worker. Each saved answer is applied to the shared
-        # training_examples mapping and the board is re-labelled before
-        # this final result window opens.
-        if result.get("screenshot") is not None and result.get("unknown_squares"):
-            try:
-                pr = _load_piece_recognition_module()
-                _resolve_unknown_board_pieces(result, pr_module=pr)
-                result["annotated"] = annotate_board_detection(
-                    result["screenshot"], result, pr
-                )
-                annotated = result["annotated"]
-                annotated_path = result.get("annotated_path") or os.path.join(
-                    "board_debug", "board_detection_annotated.png"
-                )
-                result["annotated_path"] = annotated_path
-                directory = os.path.dirname(annotated_path)
-                if directory:
-                    os.makedirs(directory, exist_ok=True)
-                cv2.imwrite(annotated_path, annotated)
-            except Exception as exc:
-                print(f"Board Detection: live piece learning failed: {exc}")
         title = "Board Detection Result - press Q/Esc to return"
         cv2.namedWindow(title, cv2.WINDOW_NORMAL)
         try:
@@ -4811,21 +4814,14 @@ def _autoplay_window_selected(window_info):
 def _autoplay_scan_worker(window_info, side, scan_id):
     """Capture the target and run the one full-board Auto-play scan."""
     try:
-        pr = _load_piece_recognition_module()
-        _configure_opencv_threads(OPENCV_WORKERS)
-        sprites = _get_vision_sprites(pr)
-        examples = _get_vision_training_examples(pr)
+        _get_cnn_classifier()
         image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
         if image is None:
             raise RuntimeError("Could not screenshot the selected window")
         expected_anchors = ("R", "r") if _autoplay_side_name(side) == "black" else None
         detection = detect_chessboard_in_image(
             image,
-            pr_module=pr,
-            sprites=sprites,
-            training_examples=examples,
             expected_anchors=expected_anchors,
-            classify_workers=OPENCV_WORKERS,
         )
         if detection is None:
             raise RuntimeError(
@@ -4837,7 +4833,6 @@ def _autoplay_scan_worker(window_info, side, scan_id):
         detection["window_title"] = window_info.get("title", "Selected window")
         detection["side"] = _autoplay_side_name(side)
         detection["screenshot"] = image
-        detection["pr"] = pr
         if window_rect:
             detection["window_rect"] = window_rect
             detection["window_size"] = (
@@ -6909,11 +6904,10 @@ def main():
     check_effect = CheckEffect()
     engine_thread = EngineThread(ENGINE_PATH, config)
 
-    # First-start memory warm-up: decode every GUI piece set on the main
-    # thread, then load OpenCV sprites/training examples in the
-    # background so Board Detection and Auto-play can use them instantly.
+    # Decode the GUI piece sets once at startup. The CNN vision model is
+    # loaded lazily when Board Detection or Auto-play first needs it, so no
+    # recognition dataset is held in memory.
     preload_piece_images()
-    preload_vision_cache_async()
 
     selected_sq = None
     dragging = False
@@ -7046,11 +7040,7 @@ def main():
         global board_flipped, promotion_pending, show_game_over, game_over_seen_key
         global show_autoplay_gameover_dialog
         side = _autoplay_side_name(result.get("side", _autoplay.get("side")))
-        pr = result.get("pr") or _load_piece_recognition_module()
 
-        if result.get("unknown_squares"):
-            _autoplay_set_status("Auto-play scan needs help identifying a piece...")
-            _resolve_unknown_board_pieces(result, pr_module=pr, orientation=side)
         if not _autoplay.get("enabled"):
             return False
         unknown = [
@@ -7103,9 +7093,6 @@ def main():
 
         _autoplay.update({
             "running": True,
-            "pr": pr,
-            "sprites": result.get("sprites"),
-            "training_examples": result.get("training_examples"),
             "board_rect": result.get("board_rect"),
             "window_rect": result.get("window_rect"),
             "window_size": result.get("window_size"),
@@ -7151,14 +7138,7 @@ def main():
         changed = _autoplay_changed_visual_squares(baseline_image, crop)
         if not changed:
             return crop, None, []
-        classified = _autoplay_classify_visual_squares(
-            crop,
-            changed,
-            _autoplay.get("pr") or _load_piece_recognition_module(),
-            sprites=_autoplay.get("sprites"),
-            training_examples=_autoplay.get("training_examples"),
-            max_workers=OPENCV_WORKERS,
-        )
+        classified = _autoplay_classify_visual_squares(crop, changed)
         candidate = _autoplay_candidate_grid(
             base_grid, classified, _autoplay.get("side", "white")
         )
@@ -7239,14 +7219,7 @@ def main():
             if crop is not None and _autoplay.get("last_image") is not None:
                 changed = _autoplay_changed_visual_squares(_autoplay["last_image"], crop)
                 if changed:
-                    classified = _autoplay_classify_visual_squares(
-                        crop,
-                        changed,
-                        _autoplay.get("pr") or _load_piece_recognition_module(),
-                        sprites=_autoplay.get("sprites"),
-                        training_examples=_autoplay.get("training_examples"),
-                        max_workers=OPENCV_WORKERS,
-                    )
+                    classified = _autoplay_classify_visual_squares(crop, changed)
                     candidate = _autoplay_candidate_grid(
                         _autoplay_board_grid_from_board(board), classified, side
                     )
