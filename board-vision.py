@@ -19,6 +19,26 @@ SPLIT_CSV_PATHS = {
     "test": OUTPUT_DIR / "test.csv",
 }
 CNN_TRAINER_PATH = BASE_DIR / "cnn_trainer.py"
+
+# Semi-auto review has its own learning library. It is deliberately kept
+# outside board_debug/ so assistant reference images can never be mixed
+# into the CNN model dataset or its train/validation/test CSVs.
+SEMI_AUTO_DIR = BASE_DIR / "board_vision_assistant"
+SEMI_AUTO_EXAMPLES_DIR = SEMI_AUTO_DIR / "examples"
+SEMI_AUTO_CSV = SEMI_AUTO_DIR / "examples.csv"
+SEMI_AUTO_FIELDS = (
+    "image_path",
+    "filename",
+    "label",
+    "label_code",
+    "square_type",
+    "source_image",
+    "board_id",
+)
+SEMI_AUTO_MAX_PER_GROUP = 16
+SEMI_AUTO_MAX_NEW_PER_BOARD_GROUP = 4
+SEMI_AUTO_FEATURE_K = 3
+
 SUPPORTED_IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff",
 }
@@ -46,11 +66,14 @@ LABEL_OPTIONS = (
     ("blank", "empty", "Blank / Empty"),
 )
 LABEL_BY_CODE = {code: label for code, label, _display in LABEL_OPTIONS}
+LABEL_OPTION_BY_CODE = {option[0]: option for option in LABEL_OPTIONS}
+LABEL_OPTION_BY_LABEL = {option[1]: option for option in LABEL_OPTIONS}
 SQUARE_TYPE_OPTIONS = (
     ("light", "Light square"),
     ("dark", "Dark square"),
     ("highlighted", "Highlighted square"),
 )
+SQUARE_TYPE_DISPLAY = dict(SQUARE_TYPE_OPTIONS)
 CSV_FIELDS = (
     "image_path",
     "filename",
@@ -496,6 +519,539 @@ def run_cnn_trainer(records):
     return True
 
 
+def _resolve_local_path(value):
+    """Resolve a board-vision CSV path relative to this script's folder."""
+    path = Path(str(value))
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def _semi_auto_feature(tile):
+    """Build an OpenCV feature vector for one board square.
+
+    The vector intentionally combines a centre-weighted colour grid,
+    Canny edges, a foreground mask (pixels unlike the corner-estimated
+    square colour), an HSV histogram, and the four corner colours. That
+    gives the assistant information about both the piece shape/colour and
+    whether the underlying square looks light, dark, or highlighted.
+    """
+    try:
+        if tile is None or getattr(tile, "size", 0) == 0:
+            return None
+        image = np.asarray(tile)
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        elif image.ndim != 3 or image.shape[2] != 3:
+            return None
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+
+        interpolation = (
+            cv2.INTER_AREA if max(image.shape[:2]) > 64 else cv2.INTER_LINEAR
+        )
+        resized = cv2.resize(image, (64, 64), interpolation=interpolation)
+
+        axis = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
+        xx, yy = np.meshgrid(axis, axis)
+        centre_weight = 0.7 + 0.8 * np.exp(-(xx * xx + yy * yy) / 0.75)
+
+        colour_grid = cv2.resize(
+            resized, (16, 16), interpolation=cv2.INTER_AREA
+        ).astype(np.float32) / 255.0
+        colour_grid *= centre_weight[:, :, None]
+
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_grid = cv2.resize(
+            edges, (16, 16), interpolation=cv2.INTER_AREA
+        ).astype(np.float32) / 255.0
+        edge_grid *= centre_weight
+
+        patch = 9
+        corner_pixels = np.concatenate(
+            [
+                resized[:patch, :patch].reshape(-1, 3),
+                resized[:patch, -patch:].reshape(-1, 3),
+                resized[-patch:, :patch].reshape(-1, 3),
+                resized[-patch:, -patch:].reshape(-1, 3),
+            ],
+            axis=0,
+        )
+        background = np.median(corner_pixels, axis=0)
+        colour_difference = np.linalg.norm(
+            resized.astype(np.float32) - background, axis=2
+        )
+        foreground = (colour_difference > 42).astype(np.uint8) * 255
+        foreground_grid = cv2.resize(
+            foreground, (16, 16), interpolation=cv2.INTER_AREA
+        ).astype(np.float32) / 255.0
+        foreground_grid *= centre_weight
+
+        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+        histogram = cv2.calcHist(
+            [hsv], [0, 1, 2], None, [12, 4, 4],
+            [0, 180, 0, 256, 0, 256],
+        )
+        cv2.normalize(histogram, histogram, alpha=1.0, norm_type=cv2.NORM_L1)
+
+        corner_patch = 12
+        corner_colours = np.concatenate(
+            [
+                resized[:corner_patch, :corner_patch].reshape(-1, 3).mean(axis=0),
+                resized[:corner_patch, -corner_patch:].reshape(-1, 3).mean(axis=0),
+                resized[-corner_patch:, :corner_patch].reshape(-1, 3).mean(axis=0),
+                resized[-corner_patch:, -corner_patch:].reshape(-1, 3).mean(axis=0),
+            ]
+        ).astype(np.float32) / 255.0
+
+        return np.concatenate(
+            [
+                colour_grid.ravel(),
+                edge_grid.ravel() * 0.8,
+                foreground_grid.ravel() * 0.65,
+                np.sqrt(histogram.astype(np.float32).ravel()) * 0.45,
+                corner_colours * 0.8,
+            ]
+        ).astype(np.float32)
+    except Exception:
+        return None
+
+
+def _semi_auto_distance(first, second):
+    """Root-mean-square distance between two semi-auto feature vectors."""
+    if first is None or second is None:
+        return math.inf
+    first = np.asarray(first, dtype=np.float32)
+    second = np.asarray(second, dtype=np.float32)
+    if first.shape != second.shape:
+        return math.inf
+    return float(np.sqrt(np.mean((first - second) ** 2)))
+
+
+def _match_confidence(best, second=None):
+    """Small display confidence from match quality and best/second margin."""
+    if not math.isfinite(best):
+        return 0.0
+    similarity = math.exp(-max(float(best), 0.0) / 0.18)
+    if second is None or not math.isfinite(second):
+        return similarity * 0.75
+    margin = (float(second) - float(best)) / max(float(second), 1e-9)
+    margin = min(1.0, max(0.0, margin * 2.0))
+    return math.sqrt(similarity * margin)
+
+
+def _make_semi_auto_example(tile, label_option, square_type, feature=None):
+    if feature is None:
+        feature = _semi_auto_feature(tile)
+    if feature is None:
+        return None
+    return {
+        "label_option": label_option,
+        "square_type": square_type,
+        "feature": np.asarray(feature, dtype=np.float32),
+        "path": None,
+    }
+
+
+def load_semi_auto_records(csv_path=SEMI_AUTO_CSV):
+    """Load the separate semi-auto assistant examples.csv."""
+    csv_path = Path(csv_path)
+    if not csv_path.is_file():
+        return []
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    records = []
+    for row in rows:
+        record = {
+            field: str(row.get(field, "") or "") for field in SEMI_AUTO_FIELDS
+        }
+        if (
+            record["image_path"]
+            and record["label_code"] in LABEL_OPTION_BY_CODE
+            and record["square_type"] in SQUARE_TYPE_DISPLAY
+        ):
+            records.append(record)
+    return records
+
+
+def write_semi_auto_records(records, csv_path=SEMI_AUTO_CSV):
+    """Write the semi-auto learning index (kept outside board_debug/)."""
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SEMI_AUTO_FIELDS)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {field: record.get(field, "") for field in SEMI_AUTO_FIELDS}
+            )
+    temporary.replace(csv_path)
+    return csv_path
+
+
+def _scan_semi_auto_records(examples_dir=SEMI_AUTO_EXAMPLES_DIR):
+    """Fallback records for manually seeded examples/<code>/<square>/ files."""
+    examples_dir = Path(examples_dir)
+    records = []
+    if not examples_dir.is_dir():
+        return records
+    for path in sorted(examples_dir.rglob("*")):
+        if (
+            not path.is_file()
+            or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS
+        ):
+            continue
+        parts = path.relative_to(examples_dir).parts
+        if len(parts) < 3:
+            continue
+        label_code, square_type = parts[-3], parts[-2]
+        option = LABEL_OPTION_BY_CODE.get(label_code)
+        if option is None or square_type not in SQUARE_TYPE_DISPLAY:
+            continue
+        records.append(
+            {
+                "image_path": _path_for_csv(path.resolve()),
+                "filename": path.name,
+                "label": option[1],
+                "label_code": label_code,
+                "square_type": square_type,
+                "source_image": "",
+                "board_id": "",
+            }
+        )
+    return records
+
+
+def _next_semi_auto_sequence(records, examples_dir=SEMI_AUTO_EXAMPLES_DIR):
+    highest = 0
+    candidates = [record.get("filename", "") for record in records]
+    examples_dir = Path(examples_dir)
+    if examples_dir.is_dir():
+        candidates.extend(
+            path.name for path in examples_dir.rglob("*") if path.is_file()
+        )
+    for name in candidates:
+        match = re.search(r"_(\d+)$", Path(str(name)).stem)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+class SemiAutoAssistant:
+    """OpenCV example matcher that learns only from user-confirmed choices.
+
+    Persistent examples live under board_vision_assistant/, separate from
+    board_debug/'s CNN dataset. During one board, manual_review_tiles can
+    also pass the already-confirmed squares from that board as temporary
+    examples, so suggestions improve immediately while the user is working.
+    """
+
+    def __init__(self, base_dir=SEMI_AUTO_DIR, examples=None, records=None):
+        self.base_dir = Path(base_dir)
+        self.examples_dir = self.base_dir / "examples"
+        self.csv_path = self.base_dir / "examples.csv"
+        self.examples = list(examples or [])
+        self.records = list(records or [])
+
+    @classmethod
+    def load(cls, base_dir=SEMI_AUTO_DIR):
+        assistant = cls(base_dir=base_dir)
+        assistant.examples_dir.mkdir(parents=True, exist_ok=True)
+        records = load_semi_auto_records(assistant.csv_path)
+        if not records:
+            records = _scan_semi_auto_records(assistant.examples_dir)
+        assistant.records = records
+
+        for record in records:
+            option = LABEL_OPTION_BY_CODE.get(record.get("label_code", ""))
+            square_type = record.get("square_type", "")
+            if option is None or square_type not in SQUARE_TYPE_DISPLAY:
+                continue
+            image_path = _resolve_local_path(record.get("image_path", ""))
+            if not image_path.is_file():
+                continue
+            image = cv2.imread(str(image_path))
+            example = _make_semi_auto_example(image, option, square_type)
+            if example is not None:
+                example["path"] = image_path
+                assistant.examples.append(example)
+        return assistant
+
+    @property
+    def example_count(self):
+        return len(self.examples)
+
+    def _group_scores(self, feature, examples):
+        usable = [
+            example
+            for example in examples
+            if example is not None
+            and example.get("feature") is not None
+            and np.asarray(example["feature"]).shape == np.asarray(feature).shape
+        ]
+        if not usable:
+            return {}
+
+        vectors = np.stack(
+            [np.asarray(example["feature"], dtype=np.float32) for example in usable]
+        )
+        distances = np.sqrt(
+            np.mean(
+                (vectors - np.asarray(feature, dtype=np.float32)) ** 2,
+                axis=1,
+            )
+        )
+
+        grouped = {}
+        for example, distance in zip(usable, distances):
+            option = example.get("label_option")
+            square_type = example.get("square_type")
+            if (
+                not option
+                or option[0] not in LABEL_OPTION_BY_CODE
+                or square_type not in SQUARE_TYPE_DISPLAY
+            ):
+                continue
+            grouped.setdefault((option[0], square_type), []).append(float(distance))
+
+        return {
+            key: float(np.mean(sorted(values)[:SEMI_AUTO_FEATURE_K]))
+            for key, values in grouped.items()
+            if values
+        }
+
+    def suggest_feature(self, feature, extra_examples=(), label_option=None):
+        """Suggest a piece and/or square type for one feature vector."""
+        if feature is None:
+            return None
+        examples = self.examples + [
+            example for example in extra_examples if example is not None
+        ]
+        group_scores = self._group_scores(feature, examples)
+        if not group_scores:
+            return None
+
+        sorted_groups = sorted(group_scores.items(), key=lambda item: item[1])
+        piece_scores = {}
+        for (label_code, _square_type), score in group_scores.items():
+            piece_scores[label_code] = min(score, piece_scores.get(label_code, math.inf))
+        sorted_pieces = sorted(piece_scores.items(), key=lambda item: item[1])
+
+        if label_option is None:
+            best_piece_code = sorted_groups[0][0][0]
+            chosen_option = LABEL_OPTION_BY_CODE[best_piece_code]
+            combined_best = sorted_groups[0][1]
+            combined_second = (
+                sorted_groups[1][1] if len(sorted_groups) > 1 else None
+            )
+            combined_confidence = _match_confidence(
+                combined_best, combined_second
+            )
+            alternatives = [
+                (
+                    LABEL_OPTION_BY_CODE[label_code],
+                    square_type,
+                    score,
+                )
+                for (label_code, square_type), score in sorted_groups[:3]
+            ]
+        else:
+            chosen_option = label_option
+            combined_confidence = _match_confidence(
+                sorted_groups[0][1],
+                sorted_groups[1][1] if len(sorted_groups) > 1 else None,
+            )
+            alternatives = []
+
+        piece_best = sorted_pieces[0][1]
+        piece_second = sorted_pieces[1][1] if len(sorted_pieces) > 1 else None
+        piece_confidence = _match_confidence(piece_best, piece_second)
+
+        square_candidates = sorted(
+            (
+                (square_type, score)
+                for (label_code, square_type), score in group_scores.items()
+                if label_code == chosen_option[0]
+            ),
+            key=lambda item: item[1],
+        )
+        if not square_candidates:
+            # No saved example for this manually chosen piece yet. Fall back
+            # to the closest learned square colours across all pieces.
+            global_square_scores = {}
+            for (_label_code, square_type), score in group_scores.items():
+                global_square_scores[square_type] = min(
+                    score, global_square_scores.get(square_type, math.inf)
+                )
+            square_candidates = sorted(
+                global_square_scores.items(), key=lambda item: item[1]
+            )
+
+        square_type, square_score = square_candidates[0]
+        square_second = (
+            square_candidates[1][1] if len(square_candidates) > 1 else None
+        )
+        square_confidence = _match_confidence(square_score, square_second)
+
+        return {
+            "label_option": chosen_option,
+            "square_type": square_type,
+            "confidence": (
+                square_confidence if label_option is not None else combined_confidence
+            ),
+            "combined_confidence": combined_confidence,
+            "piece_confidence": piece_confidence,
+            "square_confidence": square_confidence,
+            "distance": square_score if label_option is not None else sorted_groups[0][1],
+            "example_count": len(examples),
+            "group_count": len(group_scores),
+            "alternatives": alternatives,
+        }
+
+    def suggest(self, tile, extra_examples=(), label_option=None):
+        return self.suggest_feature(
+            _semi_auto_feature(tile),
+            extra_examples=extra_examples,
+            label_option=label_option,
+        )
+
+    def learn_from_board(self, tile_entries, answers, source_image, board_id):
+        """Save a bounded, diverse set of this board's confirmed examples.
+
+        Only final answers from a completed board should be passed here.
+        Existing assistant examples are preserved. At most
+        SEMI_AUTO_MAX_PER_GROUP references per (piece, square type) are kept.
+        """
+        if len(tile_entries) != len(answers):
+            raise ValueError("Every tile must have a confirmed semi-auto answer")
+
+        candidates = {}
+        for (_row, _col, tile), (label_option, square_type) in zip(
+            tile_entries, answers
+        ):
+            feature = _semi_auto_feature(tile)
+            if feature is None:
+                continue
+            key = (label_option[0], square_type)
+            candidates.setdefault(key, []).append(
+                {
+                    "tile": tile,
+                    "label_option": label_option,
+                    "square_type": square_type,
+                    "feature": feature,
+                }
+            )
+
+        existing_counts = {}
+        existing_features = {}
+        for record in self.records:
+            key = (record.get("label_code", ""), record.get("square_type", ""))
+            existing_counts[key] = existing_counts.get(key, 0) + 1
+        for example in self.examples:
+            option = example.get("label_option")
+            if not option:
+                continue
+            key = (option[0], example.get("square_type"))
+            existing_features.setdefault(key, []).append(example["feature"])
+            existing_counts[key] = max(
+                existing_counts.get(key, 0), len(existing_features[key])
+            )
+
+        additions = []
+        for key, group_candidates in candidates.items():
+            room = SEMI_AUTO_MAX_PER_GROUP - existing_counts.get(key, 0)
+            limit = min(room, SEMI_AUTO_MAX_NEW_PER_BOARD_GROUP)
+            if limit <= 0:
+                continue
+
+            remaining = list(group_candidates)
+            references = list(existing_features.get(key, []))
+            while remaining and limit > 0:
+                scored = []
+                for candidate_index, candidate in enumerate(remaining):
+                    nearest = min(
+                        (
+                            _semi_auto_distance(candidate["feature"], reference)
+                            for reference in references
+                        ),
+                        default=math.inf,
+                    )
+                    scored.append((nearest, candidate_index, candidate))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                nearest, chosen_index, chosen = scored[0]
+
+                # One duplicate can help early on; after that, prefer saving
+                # room for a future board/theme instead of near-identical tiles.
+                if references and len(references) >= 2 and nearest < 0.01:
+                    break
+
+                additions.append(chosen)
+                references.append(chosen["feature"])
+                del remaining[chosen_index]
+                limit -= 1
+
+        if not additions:
+            return {
+                "saved": 0,
+                "considered": len(tile_entries),
+                "total_examples": self.example_count,
+            }
+
+        self.examples_dir.mkdir(parents=True, exist_ok=True)
+        sequence = _next_semi_auto_sequence(self.records, self.examples_dir)
+        saved = 0
+
+        for candidate in additions:
+            label_option = candidate["label_option"]
+            square_type = candidate["square_type"]
+            group_dir = self.examples_dir / label_option[0] / square_type
+            group_dir.mkdir(parents=True, exist_ok=True)
+
+            while True:
+                filename = (
+                    f"assistant_{label_option[0]}_{square_type}_"
+                    f"{sequence:06d}.png"
+                )
+                image_path = group_dir / filename
+                sequence += 1
+                if not image_path.exists():
+                    break
+
+            if not cv2.imwrite(str(image_path), candidate["tile"]):
+                raise OSError(f"Could not save semi-auto example: {image_path}")
+
+            self.records.append(
+                {
+                    "image_path": _path_for_csv(image_path),
+                    "filename": filename,
+                    "label": label_option[1],
+                    "label_code": label_option[0],
+                    "square_type": square_type,
+                    "source_image": _path_for_csv(source_image),
+                    "board_id": board_id,
+                }
+            )
+            example = _make_semi_auto_example(
+                candidate["tile"],
+                label_option,
+                square_type,
+                feature=candidate["feature"],
+            )
+            if example is not None:
+                example["path"] = image_path
+                self.examples.append(example)
+            saved += 1
+
+        write_semi_auto_records(self.records, self.csv_path)
+        return {
+            "saved": saved,
+            "considered": len(tile_entries),
+            "total_examples": self.example_count,
+        }
+
+
 class ZoomView:
     """Zoomable/pannable OpenCV window for pixel-accurate work.
 
@@ -719,10 +1275,18 @@ def _manual_text(canvas, text, origin, scale=0.62, colour=(255, 255, 255), thick
     )
 
 
-def _manual_button(canvas, rect, text, selected=False):
+def _manual_button(canvas, rect, text, selected=False, suggested=False):
     x, y, w, h = rect
-    fill = (64, 145, 72) if selected else (62, 62, 72)
-    border = (150, 255, 170) if selected else (165, 165, 175)
+    if selected:
+        fill = (64, 145, 72)
+        border = (150, 255, 170)
+    elif suggested:
+        # Cyan/blue marks an OpenCV suggestion; it is never auto-confirmed.
+        fill = (92, 72, 25)
+        border = (255, 240, 90)
+    else:
+        fill = (62, 62, 72)
+        border = (165, 165, 175)
     cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), fill, -1)
     cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), border, 2)
     scale = 0.52
@@ -737,13 +1301,16 @@ def _manual_button(canvas, rect, text, selected=False):
     )
 
 
-def manual_review_tiles(tile_entries):
-    """Manually label every tile, then ask its square type.
+def manual_review_tiles(tile_entries, assistant=None, semi_auto_enabled=True):
+    """Review every tile, with optional OpenCV semi-auto suggestions.
 
-    No automatic classification or preselected answer is used. For each
-    square the user first chooses the piece/blank class, then chooses
-    Light square, Dark square, or Highlighted square. Returns a list of
-    ``(label_option, square_type)`` in tile order, or None if cancelled.
+    The user always makes the final choice. For each square they first
+    confirm the piece/blank class, then confirm Light square, Dark square,
+    or Highlighted square. When semi-auto is enabled, the assistant's best
+    learned match is highlighted in cyan and can be accepted with A/Enter;
+    already-confirmed squares from this same board are used immediately as
+    temporary learning examples. Returns ``(label_option, square_type)``
+    pairs in tile order, or None if cancelled.
     """
     if not tile_entries:
         return []
@@ -752,8 +1319,53 @@ def manual_review_tiles(tile_entries):
     index = 0
     stage = "label"
     selected_label = None
+    semi_auto_enabled = bool(semi_auto_enabled and assistant is not None)
+    tile_features = {}
+    suggestion_cache = {}
     click = {"point": None}
-    title = "Manual piece review"
+    title = "Semi-auto piece review" if semi_auto_enabled else "Manual piece review"
+
+    def feature_for(tile_index):
+        if tile_index not in tile_features:
+            tile_features[tile_index] = _semi_auto_feature(
+                tile_entries[tile_index][2]
+            )
+        return tile_features[tile_index]
+
+    def temporary_examples(up_to_index):
+        examples = []
+        for answer_index in range(up_to_index):
+            answer = answers[answer_index]
+            if answer is None:
+                continue
+            example = _make_semi_auto_example(
+                tile_entries[answer_index][2],
+                answer[0],
+                answer[1],
+                feature=feature_for(answer_index),
+            )
+            if example is not None:
+                examples.append(example)
+        return examples
+
+    def suggestion_for(tile_index, label_option=None):
+        if not semi_auto_enabled:
+            return None
+        cache_key = (
+            tile_index,
+            tuple(answers[:tile_index]),
+            label_option[0] if label_option else "",
+        )
+        if cache_key not in suggestion_cache:
+            try:
+                suggestion_cache[cache_key] = assistant.suggest_feature(
+                    feature_for(tile_index),
+                    extra_examples=temporary_examples(tile_index),
+                    label_option=label_option,
+                )
+            except Exception:
+                suggestion_cache[cache_key] = None
+        return suggestion_cache[cache_key]
 
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -768,20 +1380,36 @@ def manual_review_tiles(tile_entries):
             row, col, tile = tile_entries[index]
             canvas = np.full((MANUAL_H, MANUAL_W, 3), 36, np.uint8)
 
+            suggestion = suggestion_for(
+                index, selected_label if stage == "square" else None
+            )
+
+            review_kind = "Semi-auto" if semi_auto_enabled else "Manual"
             _manual_text(
                 canvas,
-                f"Manual review {index + 1}/{len(tile_entries)}  -  square r{row} c{col}",
+                f"{review_kind} review {index + 1}/{len(tile_entries)}  -  square r{row} c{col}",
                 (24, 36),
                 scale=0.72,
                 thickness=2,
             )
             if stage == "label":
-                instruction = "Step 1: click what is on this square (manual only - no auto-review)"
+                if suggestion:
+                    instruction = "Step 1: confirm piece. Cyan = OpenCV suggestion; A/Enter uses it"
+                elif semi_auto_enabled:
+                    instruction = "Step 1: choose piece. Semi-auto learns from each choice"
+                else:
+                    instruction = "Step 1: click what is on this square"
             else:
-                instruction = (
-                    f"Step 2: {selected_label[2]} - is it on a light, dark, "
-                    "or highlighted square?"
-                )
+                if suggestion:
+                    instruction = (
+                        f"Step 2: {selected_label[2]} - confirm square. "
+                        "Cyan = OpenCV suggestion; A/Enter uses it"
+                    )
+                else:
+                    instruction = (
+                        f"Step 2: {selected_label[2]} - is it on a light, dark, "
+                        "or highlighted square?"
+                    )
             _manual_text(canvas, instruction, (24, 68), scale=0.54)
 
             if tile is not None and tile.size:
@@ -814,6 +1442,60 @@ def manual_review_tiles(tile_entries):
                 scale=0.58,
             )
 
+            if semi_auto_enabled:
+                if suggestion:
+                    confidence = float(suggestion.get("confidence", 0.0))
+                    if stage == "label":
+                        suggestion_text = (
+                            f"OpenCV: {suggestion['label_option'][2]} + "
+                            f"{SQUARE_TYPE_DISPLAY[suggestion['square_type']]} "
+                            f"({confidence:.0%})"
+                        )
+                    else:
+                        suggestion_text = (
+                            "OpenCV: "
+                            f"{SQUARE_TYPE_DISPLAY[suggestion['square_type']]} "
+                            f"({confidence:.0%})"
+                        )
+                    suggestion_colour = (
+                        (120, 255, 150)
+                        if confidence >= 0.65
+                        else (110, 230, 255)
+                        if confidence >= 0.35
+                        else (130, 180, 255)
+                    )
+                else:
+                    suggestion_text = "OpenCV: no suggestion yet - still learning"
+                    suggestion_colour = (210, 210, 210)
+                _manual_text(
+                    canvas,
+                    suggestion_text,
+                    (24, 104 + MANUAL_TILE_SIZE + 72),
+                    scale=0.52,
+                    colour=suggestion_colour,
+                )
+                _manual_text(
+                    canvas,
+                    f"Learned: {assistant.example_count} saved + {index} this board",
+                    (24, 104 + MANUAL_TILE_SIZE + 104),
+                    scale=0.48,
+                )
+                _manual_text(
+                    canvas,
+                    "S = suggestions on/off",
+                    (24, 104 + MANUAL_TILE_SIZE + 134),
+                    scale=0.48,
+                    colour=(200, 220, 255),
+                )
+            elif assistant is not None:
+                _manual_text(
+                    canvas,
+                    "Suggestions: OFF (S to turn on)",
+                    (24, 104 + MANUAL_TILE_SIZE + 72),
+                    scale=0.52,
+                    colour=(210, 210, 210),
+                )
+
             buttons = []
             if stage == "label":
                 start_x, start_y = 424, 108
@@ -827,11 +1509,15 @@ def manual_review_tiles(tile_entries):
                         button_w,
                         button_h,
                     )
+                    is_suggested = bool(
+                        suggestion and suggestion.get("label_option") == option
+                    )
                     _manual_button(
                         canvas,
                         rect,
-                        f"{option[2]} ({option[0]})",
+                        f"{'> ' if is_suggested else ''}{option[2]} ({option[0]})",
                         selected=(selected_label == option),
+                        suggested=is_suggested,
                     )
                     buttons.append((rect, "label", option))
             else:
@@ -844,7 +1530,15 @@ def manual_review_tiles(tile_entries):
                         button_w,
                         button_h,
                     )
-                    _manual_button(canvas, rect, display)
+                    is_suggested = bool(
+                        suggestion and suggestion.get("square_type") == square_type
+                    )
+                    _manual_button(
+                        canvas,
+                        rect,
+                        f"{'> ' if is_suggested else ''}{display}",
+                        suggested=is_suggested,
+                    )
                     buttons.append((rect, "square", square_type))
                 _manual_text(
                     canvas,
@@ -859,9 +1553,20 @@ def manual_review_tiles(tile_entries):
             _manual_button(canvas, cancel_rect, "Cancel (Esc)")
             buttons.append((back_rect, "back", None))
             buttons.append((cancel_rect, "cancel", None))
+            if suggestion:
+                accept_rect = (836, MANUAL_H - 78, 260, 48)
+                accept_text = "Use suggestion (A)"
+                _manual_button(
+                    canvas, accept_rect, accept_text, suggested=True
+                )
+                buttons.append((accept_rect, "accept_suggestion", None))
             _manual_text(
                 canvas,
-                "Every square is labelled manually, including blank squares.",
+                (
+                    "You make the final choice; confirmed squares teach the assistant."
+                    if semi_auto_enabled
+                    else "Every square is labelled manually, including blank squares."
+                ),
                 (24, MANUAL_H - 24),
                 scale=0.52,
                 colour=(190, 220, 255),
@@ -884,6 +1589,10 @@ def manual_review_tiles(tile_entries):
                 action = ("cancel", None)
             elif key in (8, ord("b"), ord("B")):
                 action = ("back", None)
+            elif assistant is not None and key in (ord("s"), ord("S")):
+                action = ("toggle_semi_auto", None)
+            elif suggestion and key in (10, 13, ord("a"), ord("A")):
+                action = ("accept_suggestion", None)
             elif stage == "square" and key in (ord("l"), ord("L")):
                 action = ("square", "light")
             elif stage == "square" and key in (ord("d"), ord("D")):
@@ -897,6 +1606,24 @@ def manual_review_tiles(tile_entries):
             kind, value = action
             if kind == "cancel":
                 return None
+            if kind == "toggle_semi_auto":
+                semi_auto_enabled = not semi_auto_enabled
+                suggestion_cache.clear()
+                continue
+            if kind == "accept_suggestion" and suggestion:
+                if stage == "label":
+                    selected_label = suggestion["label_option"]
+                    stage = "square"
+                elif (
+                    stage == "square"
+                    and selected_label is not None
+                    and suggestion.get("square_type") in SQUARE_TYPE_DISPLAY
+                ):
+                    answers[index] = (selected_label, suggestion["square_type"])
+                    index += 1
+                    selected_label = None
+                    stage = "label"
+                continue
             if kind == "back":
                 if stage == "square":
                     stage = "label"
@@ -941,7 +1668,7 @@ def show_grid_debug(board, debug, square_size):
             if hover is not None:
                 row, col = hover
                 # Same rounding as the tile-splitting code, so the preview
-                # is exactly the tile that will be manually labelled next.
+                # is exactly the tile that will be reviewed next.
                 left = round(col * square_size)
                 top = round(row * square_size)
                 right = round((col + 1) * square_size)
@@ -956,7 +1683,7 @@ def show_grid_debug(board, debug, square_size):
                 )
                 hud.append(
                     f"square r{row} c{col}: x {left}-{right - 1}, y {top}-{bottom - 1} "
-                    "(manual label chosen after this grid check)"
+                    "(label reviewed after this grid check)"
                 )
             else:
                 preview = _labelled_preview([("Hover a square", PREVIEW_SIZE // 2)])
@@ -972,12 +1699,15 @@ def show_grid_debug(board, debug, square_size):
         cv2.destroyAllWindows()
 
 
-def process_image(image_path):
-    """Crop one screenshot, manually label its 64 squares, and append CSV rows.
+def process_image(image_path, semi_auto_enabled=True):
+    """Crop one screenshot, review its 64 squares, and append CSV rows.
 
-    Returns the full dataset record list after this board is appended, or
-    None if board selection/manual review was cancelled. No labelled tile
-    or CSV row from this board is saved when manual review is cancelled.
+    Semi-auto suggestions are enabled by default: OpenCV proposes the piece
+    and square type from previously confirmed examples, while the user makes
+    every final choice. Returns the full CNN dataset record list after this
+    board is appended, or None if board selection/review was cancelled. No
+    CNN-dataset tile/CSV row or persistent semi-auto example from this board
+    is saved when review is cancelled.
     """
     image_path = Path(image_path)
     image = load_screenshot(image_path)
@@ -1048,12 +1778,39 @@ def process_image(image_path):
           "wheel zooms, right-drag pans, Q/ESC closes.")
     show_grid_debug(board, debug, square_size)
 
-    print("\nManual review: for every square, first choose the piece/blank,")
-    print("then choose Light square, Dark square, or Highlighted square.")
-    print("No auto-review or preselected label is used.")
-    answers = manual_review_tiles(tile_entries)
+    print("\nReview: for every square, first confirm the piece/blank,")
+    print("then confirm Light square, Dark square, or Highlighted square.")
+
+    assistant = None
+    if semi_auto_enabled:
+        try:
+            assistant = SemiAutoAssistant.load()
+            print(
+                "Semi-auto review: OpenCV suggestions are highlighted in cyan; "
+                "press A/Enter to use one, or click any other answer to correct it."
+            )
+            print(
+                f"Semi-auto learning folder (separate from the CNN dataset): "
+                f"{SEMI_AUTO_DIR.resolve()} "
+                f"({assistant.example_count} saved example(s) loaded)."
+            )
+            print("Choices confirmed earlier on this board also teach the assistant immediately.")
+        except Exception as exc:
+            print(f"Semi-auto assistant unavailable; continuing manually: {exc}")
+            assistant = None
+    else:
+        print("Semi-auto review disabled; every answer is chosen manually.")
+
+    answers = manual_review_tiles(
+        tile_entries,
+        assistant=assistant,
+        semi_auto_enabled=semi_auto_enabled,
+    )
     if answers is None:
-        print("Manual review cancelled; no tiles or CSV rows were saved for this board.")
+        print(
+            "Review cancelled; no CNN-dataset tiles/CSV rows or semi-auto "
+            "examples were saved for this board."
+        )
         return None
 
     board_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1069,11 +1826,26 @@ def process_image(image_path):
 
     print(f"Saved board crop: {board_path}")
     print(f"Saved grid debug: {grid_path}")
-    print(f"Saved {len(new_records)} manually labelled square images to: {OUTPUT_DIR.resolve()}")
+    print(f"Saved {len(new_records)} reviewed square images to: {OUTPUT_DIR.resolve()}")
     if csv_existed:
         print("Appended these rows to the existing dataset.csv and recalculated its splits.")
     else:
         print("Created dataset.csv. Its rows are 'unsplit' on this first creation.")
+
+    if assistant is not None:
+        try:
+            learning = assistant.learn_from_board(
+                tile_entries, answers, image_path, board_id
+            )
+            print(
+                "Semi-auto assistant learned from this completed board: "
+                f"saved {learning['saved']} new reference example(s) to "
+                f"{SEMI_AUTO_DIR.resolve()} "
+                f"({learning['total_examples']} total; separate from {OUTPUT_DIR.name}/)."
+            )
+        except Exception as exc:
+            print(f"Warning: semi-auto learning examples were not saved: {exc}")
+
     print_dataset_report(all_records, splits_recalculated=csv_existed)
     return all_records
 
@@ -1109,15 +1881,25 @@ def _wait_ready_for_another(next_path=None):
 
 
 def main(argv=None):
-    """Create/append the CNN dataset one manually reviewed board at a time.
+    """Create/append the CNN dataset one reviewed board at a time.
 
-    After every completed board, the user may create the CNN model through
-    cnn_trainer.py or add another screenshot. When they choose another,
-    the terminal waits for Enter before any next supplied image is used or
-    the Tk file picker is opened. Existing dataset rows/images are kept;
-    new boards are appended and then the split is recalculated.
+    Semi-auto OpenCV suggestions are on by default; pass ``--manual-only``
+    (or ``--no-semi-auto``) to disable both suggestions and assistant
+    learning. After every completed board, the user may create the CNN model
+    through cnn_trainer.py or add another screenshot. When they choose
+    another, the terminal waits for Enter before any next supplied image is
+    used or the Tk file picker is opened. Existing dataset rows/images are
+    kept; new boards are appended and then the split is recalculated.
     """
-    image_paths = list(choose_image_paths(argv))
+    args = list(sys.argv[1:] if argv is None else argv)
+    manual_only_flags = {"--manual-only", "--no-semi-auto"}
+    semi_auto_enabled = not any(arg in manual_only_flags for arg in args)
+    image_args = [
+        arg
+        for arg in args
+        if arg not in manual_only_flags and arg != "--semi-auto"
+    ]
+    image_paths = list(choose_image_paths(image_args))
     if not image_paths:
         print("No image selected. Drop an image onto board-vision.py, pass")
         print("its path on the command line, or choose it in the file picker.")
@@ -1130,7 +1912,7 @@ def main(argv=None):
         index += 1
         print(f"\nScreenshot: {image_path}")
 
-        records = process_image(image_path)
+        records = process_image(image_path, semi_auto_enabled=semi_auto_enabled)
         if records is None:
             # A cancelled ROI/manual review produces no new dataset rows.
             # Offer another screenshot without opening the picker until the

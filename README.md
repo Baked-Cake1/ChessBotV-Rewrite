@@ -134,13 +134,28 @@ depth=25
 
 1. Run `python board-vision.py` (or drag a screenshot onto it).
 2. Select the outer edge of the chessboard exactly as before; it is cropped and split into the 64 squares.
-3. Manually review every square — there is no auto-review. First choose the piece (or Blank / Empty), then choose **Light square**, **Dark square**, or **Highlighted square**. This second choice is also required for blank squares.
+3. Review every square. Semi-auto OpenCV help is on by default: its suggested piece and then suggested **Light square**, **Dark square**, or **Highlighted square** are highlighted in cyan, but you make the final choice for every square (including blanks). Press **A** or **Enter** to use a suggestion, click another answer to correct it, or press **S** to toggle suggestions during a board. Use `python board-vision.py --manual-only` to disable semi-auto suggestions and learning completely.
 4. The labelled tiles are saved with unique names such as `wp_light_000001.png`, `blank_dark_000002.png`, and `bq_highlighted_000003.png`, and their rows are appended to `board_debug/dataset.csv` (`image_path`, `label`, `label_code`, `square_type`, `split`, row/column, and source-board details).
 5. At the end of the board, answer whether to create the CNN model now:
    - **Yes** runs `cnn_trainer.py` against `dataset.csv` and writes `chessbotv_cnn.pth`.
    - **No** returns to the terminal and waits for Enter before opening the next file picker, so you can prepare another screenshot first. Answering with another board appends to the CSV rather than overwriting earlier rows/images.
 6. The first creation of `dataset.csv` leaves every row as `unsplit`. On every later CSV change, splits are recalculated as **70% train / 15% validation / 15% test** (for example, 6,400 images → 4,480 / 960 / 960) and `train.csv`, `validation.csv`, and `test.csv` are refreshed beside the master CSV.
 7. For every class, light-square and dark-square counts must differ by at most **2** before training. Highlighted-square images are excluded from that balance check; `cnn_trainer.py` trains them without colour jitter and also supports `--highlighted-mode exclude|only` for separate experiments.
+
+### Semi-auto assistant learning folder
+
+The assistant does **not** learn inside `board_debug/` (that folder remains only for the CNN model dataset). After a board is completed, a bounded and visually diverse selection of your confirmed squares is saved separately to:
+
+```
+board_vision_assistant/
+├── examples.csv
+└── examples/
+    ├── wp/light/assistant_wp_light_000001.png
+    ├── blank/dark/assistant_blank_dark_000002.png
+    └── bq/highlighted/assistant_bq_highlighted_000003.png
+```
+
+It learns each confirmed **piece + Light/Dark/Highlighted** combination. Squares confirmed earlier on the current board are used immediately for later suggestions on that same board; persistent examples are saved only after the board is completed, so cancelling a review does not teach partial answers. At most 16 saved references per piece/square-type combination are kept. These assistant examples are ignored by `cnn_trainer.py` and are not included in `board_debug/dataset.csv` or its train/validation/test splits.
 
 You can also train directly:
 
@@ -157,8 +172,10 @@ The trainer still falls back to the older filename-prefix scan when no `dataset.
 ```
 ChessBotV-Rewrite/
 ├── new.py              # Main GUI + engine thread (60 FPS, 640x640 board)
-├── board-vision.py      # Screenshot → 64 manually labelled CNN dataset squares
+├── board-vision.py      # Screenshot → 64 reviewed CNN dataset squares (+ semi-auto help)
 ├── cnn_trainer.py       # Trains chessbotv_cnn.pth from board_debug/dataset.csv
+├── board_debug/         # Generated CNN dataset images and CSV splits (not assistant data)
+├── board_vision_assistant/ # Generated OpenCV semi-auto learning examples, kept separate
 ├── start.bat            # Windows launcher (auto-close + restart loop on exit 42)
 ├── configuration.cfg    # Engine settings (hash/threads/skill/depth)
 ├── openings.json        # FEN placement → opening name (~370k entries)

@@ -1,0 +1,9 @@
+# Generated local data
+__pycache__/
+*.py[cod]
+
+# board-vision CNN dataset output
+board_debug/
+
+# Separate OpenCV semi-auto learning library (not CNN training data)
+board_vision_assistant/
