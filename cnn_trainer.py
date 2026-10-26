@@ -23,7 +23,7 @@ from tqdm import tqdm
 # CHESSBOTV CNN TRAINER
 # Preferred input is board_debug/dataset.csv created by board-vision.py.
 # The CSV contains the manual piece label, light/dark/highlighted square
-# type, and the train/validation/test split. A legacy flat folder whose
+# type, game ID, and whole-game train/validation/test split. A legacy flat folder whose
 # labels are inferred from filename prefixes is still supported.
 # ============================================================
 
@@ -319,12 +319,22 @@ def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
         if split not in ("train", "validation", "test"):
             split = "unsplit"
 
+        game_id = (
+            row.get("game_id")
+            or row.get("board_id")
+            or row.get("source_image")
+            or ""
+        ).strip() or None
+
         records.append({
             "path": image_path,
             "label": label,
             "label_code": label_code,
             "square_type": square_type,
             "split": split,
+            "game_id": game_id,
+            "board_id": (row.get("board_id") or "").strip() or None,
+            "source_image": (row.get("source_image") or "").strip() or None,
         })
 
     print(f"\nUsable CSV images: {len(records)}")
@@ -346,6 +356,8 @@ def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
         split_counts[record.get("split") or "unsplit"] += 1
     print("\nSquare types:", dict(sorted(square_counts.items())))
     print("CSV splits:", dict(sorted(split_counts.items())))
+    game_ids = {record.get("game_id") for record in records if record.get("game_id")}
+    print(f"Game IDs: {len(game_ids)}")
     return records
 
 
@@ -366,6 +378,76 @@ def _split_target_counts(total):
         counts[name] += 1
         remaining -= 1
     return counts
+
+
+def _record_game_id(record):
+    """Explicit game/board grouping ID for a trainer record, if present."""
+    if not isinstance(record, dict):
+        return None
+    for field in ("game_id", "board_id", "source_image"):
+        value = str(record.get(field, "") or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _game_split_target_counts(total_games):
+    """Whole-game split counts matching board-vision's small-game rules."""
+    counts = _split_target_counts(max(0, int(total_games)))
+    if total_games >= 2 and counts["validation"] == 0 and counts["train"] > 1:
+        counts["train"] -= 1
+        counts["validation"] += 1
+    if total_games >= 3 and counts["test"] == 0:
+        donor = "train" if counts["train"] > 1 else "validation"
+        if counts[donor] > 1:
+            counts[donor] -= 1
+            counts["test"] += 1
+    return counts
+
+
+def _internal_game_split(records):
+    """Temporary whole-game split, or None when fewer than 3 games exist."""
+    groups = defaultdict(list)
+    for record in records:
+        game_id = _record_game_id(record)
+        if game_id is None:
+            return None
+        groups[game_id].append(record)
+    if len(groups) < 3:
+        return None
+
+    ordered_game_ids = sorted(
+        groups,
+        key=lambda game_id: (
+            random.Random(f"{RANDOM_SEED}:{game_id}").random(),
+            game_id,
+        ),
+    )
+    targets = _game_split_target_counts(len(ordered_game_ids))
+    split_records_by_name = {"train": [], "validation": [], "test": []}
+    cursor = 0
+    for split_name in ("train", "validation", "test"):
+        count = targets[split_name]
+        for game_id in ordered_game_ids[cursor:cursor + count]:
+            split_records_by_name[split_name].extend(groups[game_id])
+        cursor += count
+
+    rng = random.Random(RANDOM_SEED)
+    for split in split_records_by_name.values():
+        rng.shuffle(split)
+    return (
+        split_records_by_name["train"],
+        split_records_by_name["validation"],
+        split_records_by_name["test"],
+    )
+
+
+def _internal_temporary_split(records):
+    """Prefer whole-game temporary splits; use image split only if needed."""
+    game_split = _internal_game_split(records)
+    if game_split is not None:
+        return game_split
+    return _internal_stratified_split(records)
 
 
 def _internal_stratified_split(records):
@@ -464,20 +546,21 @@ def split_records(records):
             unsplit.append(record)
 
     if unsplit:
-        extra_train, extra_val, extra_test = _internal_stratified_split(unsplit)
+        extra_train, extra_val, extra_test = _internal_temporary_split(unsplit)
         assigned["train"].extend(extra_train)
         assigned["validation"].extend(extra_val)
         assigned["test"].extend(extra_test)
         print(
-            "Some/all rows were 'unsplit'; using a temporary stratified "
-            "70/15/15 split for this training run without changing the CSV."
+            "Some/all rows were 'unsplit'; using a temporary whole-game "
+            "70/15/15 split when at least 3 game IDs are available "
+            "(otherwise an image-level fallback) without changing the CSV."
         )
 
     if not assigned["train"]:
         raise RuntimeError("No training images after applying dataset splits")
     if not assigned["validation"] or not assigned["test"]:
         print("CSV split had an empty validation/test set; re-splitting temporarily.")
-        return _internal_stratified_split(records)
+        return _internal_temporary_split(records)
     return assigned["train"], assigned["validation"], assigned["test"]
 
 
