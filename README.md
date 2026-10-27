@@ -46,7 +46,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
   - **Pieces Styles** — visual, scrollable style cards with sample pieces on board-coloured squares, source/current-state labels, hover highlighting, and a full 12-piece preview using the active board colours
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
   - **Engine Settings** — its polished indigo main-menu button carries a detailed gear medallion, five miniature tracks mirroring the staged slider values, an amber unsaved-changes badge and a hover values tooltip; its polished Threads slider adds a CPU chip/core-bank track with core pips and parallel lanes, saved/staged markers, a four-core thumb, an `x of y` value chip capped at this PC's logical-thread limit and an in-row hover/drag bubble; the page itself has sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), and `MultiPV` (1-5), and saving a changed MultiPV value immediately recalculates the current board
-  - **Analysis** — its polished teal-to-violet main-menu button carries a scanning eval-scope medallion, a live priority subtitle and three status rails for Auto-Move, Board Detection and external Auto-play, with a hover tooltip spelling out each state; on the page, internal **Auto-Move** always starts off and its on/off state is never saved. Its separate target-depth control accepts `0-40`; `0` means “use the current Depth Limit”. The same page also hosts Board Detection and Auto-play
+  - **Analysis** — its polished teal-to-violet main-menu button carries a scanning eval-scope medallion, a live priority subtitle and three status rails for Auto-Move, Board Detection and external Auto-play, with a hover tooltip spelling out each state; on the page, internal **Auto-Move** always starts off and its on/off state is never saved. Its separate target-depth control accepts `0-40`; `0` means “use the current Depth Limit”. The same page also hosts Board Detection, Auto-play and a saved **Use Package** toggle: off uses the local `chessbotv_cnn.pth`, while on sends ChessBotV's already-located full-board crop to the optional `chess-fen-detector` package for the next detection/Auto-play scan and that session's changed-square checks
   - **About** — version `v1.5-beta2` + polished sapphire **GitHub** button with a cat medallion, source-branch traces and an external-link arrow (opens https://github.com/Baked-Cake1/ChessBotV-Rewrite) + polished ruby **Restart** button with a rotating circular-arrow medallion, reboot-status dots and a brief “Restarting…” state (fires `start.bat` via exit code 42 loop); pinned at the bottom is a polished **Always on Top** toggle whose stacked-window icon rises when on, with a status LED, gradient track and tactile sliding knob
 
 ---
@@ -59,6 +59,14 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
   ```bash
   pip install pygame python-chess
   ```
+
+- **Optional package recogniser:** only needed when **Analysis → Use Package** is on. ChessBotV imports it lazily for a Board Detection/Auto-play vision operation, so its TensorFlow/scikit-image dependencies are not needed for normal play or for the built-in CNN path:
+
+  ```bash
+  pip install chess-fen-detector
+  ```
+
+  ChessBotV still finds and crops the board itself because `chess-fen-detector` recognises an already-cropped board and returns its piece placement. If the package or its dependencies cannot load, the vision operation reports the install problem instead of silently falling back to `chessbotv_cnn.pth`.
 
 - **Engine:** Stockfish (or any UCI engine) — place anywhere and set `ENGINE_PATH` in `new.py`
 
@@ -110,6 +118,7 @@ python new.py --help
 | **Engine Settings** (Settings main menu) | Open engine sliders; hovering turns the gear, animates the five staged-value tracks and shows the current Threads/Skill/Hash/Depth/MultiPV values (amber when unsaved) |
 | **Board** (Settings main menu) | Open Pieces Styles / Board Themes; its miniature board, piece pair, theme strip, halo and accent follow the active board colours, with a scanning square highlight on hover |
 | **Analysis Settings** (Settings main menu) | Open Auto-Move, Board Detection and Auto-play; its eval scope sweeps on hover or while a feature is live, while the subtitle, three colour-coded status rails and below-row tooltip summarise each feature (amber for setup, red when attention is needed) |
+| **Use Package** (Analysis Settings) | Toggle the board-vision recogniser for the next Board Detection/Auto-play scan: off uses `chessbotv_cnn.pth`; on uses the installed `chess-fen-detector` package on ChessBotV's located board crop. A running Auto-play session keeps the recogniser from its initial scan |
 | **Mouse drag on slider** (Engine Settings) | Adjust the staged engine values; Threads lights its CPU core ticks/pips and lanes, distinguishes the smoothed thumb from the amber staged target and ivory saved marker, and shows an in-row value bubble while hovering/dragging |
 | **Github / Restart** (About) | Open repo in browser / restart via start.bat; hovering GitHub animates its cat medallion and external-link arrow, while hovering Restart turns its circular-arrow medallion, lights the status dots, and clicking it briefly shows “Restarting…” |
 | **Always on Top** (Settings main menu) | Toggle whether the ChessBotV window stays above other windows; the stacked-window icon, row and switch track cross-fade between slate/off and emerald/on |
@@ -133,11 +142,13 @@ skill=20
 depth=25
 multipv=1
 auto_move_depth=0
+use_package=0
 ```
 - Loaded at startup and saved by the settings UI
 - `Hash` steps: 16,32,64,128,256,512,1024,2048,4096,8192,16384,32768
 - `Depth` slider: 5-40, directly controls `ANALYSIS_DEPTH` for `go depth`
 - `auto_move_depth=0` means Auto-Move plays when the search reaches the current Depth Limit; positive values use that depth (capped by the Depth Limit)
+- `use_package=0` selects the local CNN; `use_package=1` selects `chess-fen-detector` for the next Board Detection/Auto-play scan. Existing scans/sessions keep the backend they started with
 - Auto-Move's enabled state is deliberately not written to the file and is always off on a fresh launch, including when an older file contains `auto_move=1`
 - Changes are queued as `setoption` + `isready`/`readyok` before the next search (never mid-search); a saved MultiPV change forces that next search to be a recalculation of the current position
 
