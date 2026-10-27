@@ -853,6 +853,10 @@ new_game_sparkle_phase = 0.0
 # the current board orientation so its ivory/charcoal arrows swap smoothly.
 flip_button_hover_amount = 0.0
 flip_icon_turn = 0.0
+# Settings > About > Restart button polish. The icon turns slowly on hover
+# and spins faster after a restart has been requested while the menu closes.
+restart_button_hover_amount = 0.0
+restart_icon_rotation = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -6930,6 +6934,366 @@ def get_restart_button_rect(offset_x=0, about_y=0):
     y = about_y + 108
     return pygame.Rect(x, y, w, h)
 
+
+def _draw_restart_icon(surface, cx, cy, radius, rotation):
+    """Draw twin circular arrows on a small pale Restart medallion."""
+    cx, cy, radius = int(cx), int(cy), max(8, int(radius))
+
+    # Layered disc: offset shadow, pale enamel face, inner ring and rim.
+    pygame.draw.circle(surface, (43, 13, 17), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, (255, 238, 238), (cx, cy), radius)
+    pygame.draw.circle(
+        surface, (249, 211, 211), (cx, cy), max(5, radius - 2)
+    )
+    pygame.draw.circle(surface, (104, 31, 37), (cx, cy), radius, 1)
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (104, 31, 37, 255)
+        )
+        pygame.gfxdraw.aacircle(
+            surface,
+            cx,
+            cy,
+            max(5, radius - 2),
+            (190, 91, 95, 255),
+        )
+    except Exception:
+        pass
+
+    glint_x = cx - max(2, radius // 3)
+    glint_y = cy - max(2, radius // 3)
+    pygame.draw.circle(surface, (255, 255, 255), (glint_x, glint_y), 1)
+
+    # Two opposing arcs, drawn as short polylines so their arrowheads can
+    # be aligned exactly with each arc's tangent at any rotation.
+    arc_radius = max(5, radius - 4)
+    arc_colours = ((126, 31, 38), (181, 65, 68))
+    for arc_index in range(2):
+        start = rotation + arc_index * math.pi - 0.35
+        end = start + 2.25
+        points = []
+        steps = 14
+        for step in range(steps + 1):
+            angle = start + (end - start) * step / steps
+            points.append(
+                (
+                    cx + arc_radius * math.cos(angle),
+                    cy + arc_radius * math.sin(angle),
+                )
+            )
+        colour = arc_colours[arc_index]
+        if len(points) >= 2:
+            pygame.draw.lines(surface, colour, False, points, 2)
+            try:
+                pygame.draw.aalines(surface, colour, False, points)
+            except Exception:
+                pass
+
+        # Screen-space polar derivative: this is the clockwise tangent.
+        end_x, end_y = points[-1]
+        tangent = (-math.sin(end), math.cos(end))
+        normal = (math.cos(end), math.sin(end))
+        tip = (
+            end_x + tangent[0] * 3.2,
+            end_y + tangent[1] * 3.2,
+        )
+        base = (
+            end_x - tangent[0] * 1.4,
+            end_y - tangent[1] * 1.4,
+        )
+        arrowhead = [
+            tip,
+            (base[0] + normal[0] * 2.6, base[1] + normal[1] * 2.6),
+            (base[0] - normal[0] * 2.6, base[1] - normal[1] * 2.6),
+        ]
+        pygame.draw.polygon(surface, colour, arrowhead)
+        try:
+            pygame.gfxdraw.aapolygon(surface, arrowhead, (*colour, 255))
+        except Exception:
+            pass
+
+    pygame.draw.circle(surface, (154, 45, 49), (cx, cy), 2)
+    pygame.draw.circle(surface, (255, 226, 220), (cx - 1, cy - 1), 1)
+
+
+def draw_polished_restart_button(screen, rect, hovered):
+    """Draw Settings > About > Restart as a polished ruby action button.
+
+    The click rectangle and restart/exit-code behaviour are unchanged.
+    This helper owns only visual hover/pending animation state.
+    """
+    global restart_button_hover_amount, restart_icon_rotation
+
+    pending = bool(restart_requested)
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered or pending else 0.0
+    restart_button_hover_amount += (
+        hover_target - restart_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - restart_button_hover_amount) < 0.01:
+        restart_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, restart_button_hover_amount)
+    )
+    if pending:
+        restart_icon_rotation = (
+            restart_icon_rotation + 0.30
+        ) % (2.0 * math.pi)
+    elif hovered:
+        restart_icon_rotation = (
+            restart_icon_rotation + (0.012 if pressed else 0.035)
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed or pending else 0)
+
+    # Ruby halo that eases in behind the button.
+    if hover_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 18), (4, 28), (7, 42)):
+            pygame.draw.rect(
+                glow,
+                (255, 86, 92, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=15 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (30, 10, 13),
+        visual_rect.move(0, 1 if pressed or pending else 2),
+        border_radius=10,
+    )
+
+    if pressed or pending:
+        top_colour = (97, 46, 50)
+        bottom_colour = (65, 31, 36)
+        border_colour = (190, 105, 108)
+    elif hovered:
+        top_colour = (165, 76, 79)
+        bottom_colour = (106, 46, 51)
+        border_colour = (255, 151, 151)
+    else:
+        top_colour = (129, 64, 67)
+        bottom_colour = (80, 39, 44)
+        border_colour = (184, 105, 108)
+
+    # Rounded ruby-metal body. Sheen/shading goes through an overlay and
+    # rounded mask, matching the polished top-bar buttons' construction.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(10 + 17 * hover_amount)),
+        [
+            (-12, visual_rect.height),
+            (visual_rect.width * 0.42, 0),
+            (visual_rect.width * 0.62, 0),
+            (visual_rect.width * 0.14, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(70 + 48 * hover_amount)),
+        (8, 1),
+        (visual_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 23),
+        (2, 6),
+        (2, visual_rect.height - 7),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 46 if pressed or pending else 31),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 25),
+        (visual_rect.width - 3, 5, 3, visual_rect.height - 10),
+        border_radius=2,
+    )
+    # Two very faint diagonal caution facets at the far edges. They add
+    # detail without turning the whole button into a hazard sign.
+    for stripe_x in (10, 18):
+        pygame.draw.polygon(
+            overlay,
+            (255, 205, 170, 13),
+            [
+                (stripe_x, visual_rect.height),
+                (stripe_x + 12, 0),
+                (stripe_x + 17, 0),
+                (stripe_x + 5, visual_rect.height),
+            ],
+        )
+        pygame.draw.polygon(
+            overlay,
+            (255, 205, 170, 13),
+            [
+                (visual_rect.width - stripe_x - 17, visual_rect.height),
+                (visual_rect.width - stripe_x - 5, 0),
+                (visual_rect.width - stripe_x, 0),
+                (visual_rect.width - stripe_x - 12, visual_rect.height),
+            ],
+        )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=10,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=10)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=8,
+    )
+
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour, (255, 178, 158), hover_amount
+        )
+        accent_w = int(92 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    # Three little reboot-sequence dots on the right. They fill as hover
+    # eases in, then chase one another while a restart is pending.
+    active_dot = int(restart_icon_rotation / (math.pi / 3.0)) % 3
+    for dot_index in range(3):
+        dot_centre = (
+            visual_rect.right - 34 + dot_index * 9,
+            visual_rect.centery,
+        )
+        pygame.draw.circle(
+            screen, (43, 14, 18), (dot_centre[0], dot_centre[1] + 1), 3
+        )
+        if pending:
+            lit = dot_index <= active_dot
+        else:
+            lit = hover_amount >= (dot_index + 1) / 3.0
+        pygame.draw.circle(
+            screen,
+            (255, 190, 164) if lit else (105, 54, 59),
+            dot_centre,
+            3,
+        )
+        pygame.draw.circle(
+            screen,
+            (255, 151, 151) if lit else (150, 82, 86),
+            dot_centre,
+            3,
+            1,
+        )
+        if lit:
+            pygame.draw.circle(
+                screen,
+                (255, 246, 238),
+                (dot_centre[0] - 1, dot_centre[1] - 1),
+                1,
+            )
+
+    # Medallion + label as one centred group, leaving the dots clear.
+    label = "Restarting…" if pending else "Restart"
+    text_colour = _lerp_color(
+        (246, 226, 226), (255, 255, 255), hover_amount
+    )
+    text = font_small.render(label, True, text_colour)
+    icon_radius = 12
+    gap = 8
+    group_w = icon_radius * 2 + gap + text.get_width()
+    group_x = visual_rect.centerx - group_w // 2 - 8
+    icon_cx = group_x + icon_radius
+    _draw_restart_icon(
+        screen,
+        icon_cx,
+        visual_rect.centery,
+        icon_radius,
+        restart_icon_rotation,
+    )
+    text_rect = text.get_rect(
+        midleft=(group_x + icon_radius * 2 + gap, visual_rect.centery)
+    )
+    shadow_text = font_small.render(label, True, (43, 13, 17))
+    screen.blit(shadow_text, text_rect.move(0, 1))
+    screen.blit(text, text_rect)
+
+    # Explanatory hover tooltip in the 40 px gap before Always on Top.
+    # It uses the same below-button, clamped-pointer language as the
+    # top-bar tooltips, in the Restart button's ruby palette.
+    if hovered and not pressed and not pending:
+        tip = font_tiny.render(
+            "Restart ChessBotV via start.bat", True, TEXT_COLOR
+        )
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(visual_rect.centerx - tip_w // 2, WIDTH - tip_w - 4),
+        )
+        tip_y = min(visual_rect.bottom + 7, HEIGHT - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (34, 18, 21), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen, (255, 151, 151), tip_rect, 1, border_radius=7
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (34, 18, 21),
+            [
+                (pointer_x - 5, tip_rect.y + 1),
+                (pointer_x + 5, tip_rect.y + 1),
+                (pointer_x, max(visual_rect.bottom + 1, tip_rect.y - 5)),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
+
+
 def draw_polished_close_button(screen, rect, hovered):
     # Modern pill with X icon: subtle gradient, hover glow, AA circle
     bg = (200, 60, 60) if hovered else (155, 55, 55)
@@ -7394,10 +7758,7 @@ def draw_settings_menu(screen):
 
             restart_rect = get_restart_button_rect(offset_x, about_y)
             restart_hovered = transition_idle and restart_rect.collidepoint(mx, my)
-            pygame.draw.rect(screen, (140, 50, 50) if restart_hovered else (100, 50, 50), restart_rect, border_radius=6)
-            pygame.draw.rect(screen, MENU_BORDER_COLOR, restart_rect, 2, border_radius=6)
-            restart_text = font_small.render("Restart", True, TEXT_COLOR)
-            screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
+            draw_polished_restart_button(screen, restart_rect, restart_hovered)
 
             # Always on Top toggle, pinned to the bottom of the main menu
             aot_rect = get_always_on_top_rect(offset_x, open_slide)
