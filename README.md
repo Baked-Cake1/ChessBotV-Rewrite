@@ -45,7 +45,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
   - **Engine Settings** — sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), and `MultiPV` (1-5); saving a changed MultiPV value immediately recalculates the current board
   - **Analysis** — internal **Auto-Move** always starts off and its on/off state is never saved. Its separate target-depth control accepts `0-40`; `0` means “use the current Depth Limit”
-  - **About** — version `v1.5-beta2` + **Github** button (opens https://github.com/Baked-Cake1/ChessBotV-Rewrite) + **Restart** button (fires `start.bat` via exit code 42 loop)
+  - **About** — version `v1.5-beta2` + **Github** button (opens https://github.com/Baked-Cake1/ChessBotV-Rewrite) + polished ruby **Restart** button with a rotating circular-arrow medallion, reboot-status dots and a brief “Restarting…” state (fires `start.bat` via exit code 42 loop)
 
 ---
 
@@ -105,7 +105,7 @@ python new.py --help
 | **New** (top bar) | Smooth animated reset to starting position and clear eval; hovering shows its polished emerald glow/sparkle state and “Start a new game” tooltip |
 | **Gear** (top bar) | Open Settings overlay; hovering brightens the button, turns the detailed cog slowly, and shows a “Settings” tooltip |
 | **Mouse drag on slider** (Engine Settings) | Adjust Threads/Skill/Hash/Depth live |
-| **Github / Restart** (About) | Open repo in browser / restart via start.bat |
+| **Github / Restart** (About) | Open repo in browser / restart via start.bat; hovering Restart turns its circular-arrow medallion and lights the status dots, and clicking it briefly shows “Restarting…” |
 | **Mouse wheel** (Pieces Styles) | Scroll the visual style cards; hover a card to preview all 12 pieces, click to apply |
 | **Esc** | Cancel promotion → Back from sub-page → close Settings; also cancels selection |
 
