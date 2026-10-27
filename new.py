@@ -4,6 +4,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -281,7 +282,7 @@ MAX_THREADS = max(1, os.cpu_count() or 1)
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "use_package": 0}
 _STRING_CONFIG_KEYS = ("theme", "board_theme", "auto_move_color")
 
 
@@ -308,6 +309,7 @@ def _clamp_config_limits(cfg):
     color = str(cfg.get("auto_move_color", "both")).strip().lower()
     cfg["auto_move_color"] = color if color in ("white", "black", "both") else "both"
     cfg["always_on_top"] = 1 if cfg.get("always_on_top", 1) else 0
+    cfg["use_package"] = 1 if cfg.get("use_package", 0) else 0
     # Auto-Move's on/off state is deliberately session-only. Even if an
     # older configuration file still contains ``auto_move=1``, startup must
     # ignore it and leave the feature off until the user enables it again.
@@ -374,6 +376,7 @@ def save_config():
             f.write(f"always_on_top={1 if config.get('always_on_top', 1) else 0}\n")
             f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
+            f.write(f"use_package={1 if config.get('use_package', 0) else 0}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
 
@@ -391,6 +394,7 @@ auto_move_color = "both"  # "white" | "black" | "both"
 auto_move_depth = 0  # 0 means "use the configured Depth Limit"
 auto_move_arm_reset = False  # main() consumes this to re-arm Auto-Move
 auto_move_status_text = ""  # human-readable arming state for the Analysis page
+use_package_enabled = False  # chess-fen-detector instead of chessbotv_cnn.pth
 show_auto_color_dialog = False
 auto_color_dialog_anim = 0.0
 
@@ -432,6 +436,8 @@ _autoplay = {
     "window": None,
     "pending_window": None,
     "side": "white",
+    "vision_backend": "cnn",
+    "vision_use_package": False,
     "scan_id": 0,
     "scan_running": False,
     "scan_ready": False,
@@ -520,6 +526,25 @@ def set_auto_move_depth(depth, persist=True):
     if persist:
         save_config()
     return auto_move_depth
+
+
+def set_use_package(enabled, persist=True):
+    """Select the board-vision model used by future detection/scans.
+
+    ``True`` uses the optional ``chess-fen-detector`` package on the board
+    crop ChessBotV has already located; ``False`` keeps the local
+    ``chessbotv_cnn.pth`` classifier. The choice is an ordinary saved
+    preference, but it is snapshotted when Board Detection or an Auto-play
+    scan starts so one live operation never mixes two recognisers.
+    """
+    global use_package_enabled
+    use_package_enabled = bool(enabled)
+    config["use_package"] = 1 if use_package_enabled else 0
+    if persist:
+        save_config()
+    backend = "chess-fen-detector package" if use_package_enabled else "built-in CNN"
+    print(f"Board vision backend for the next detection/scan: {backend}.")
+    return use_package_enabled
 
 
 def normalise_board_theme(value):
@@ -712,6 +737,7 @@ try:
 except Exception:
     auto_move_depth = 0
 auto_move_arm_reset = True
+use_package_enabled = bool(config.get("use_package", 0))
 
 # Pieces Style menu layout & scrolling — two columns of visual style cards
 # below a larger live preview. Cards are tall enough to show sample pieces,
@@ -766,6 +792,7 @@ always_on_top_hover_amount = 0.0
 always_on_top_icon_phase = 0.0
 auto_move_anim = 1.0 if auto_move_enabled else 0.0
 autoplay_anim = 0.0
+use_package_anim = 1.0 if use_package_enabled else 0.0
 # Smoothed depth progress-bar fill (0..1 of the target depth)
 depth_bar_fraction = 0.0
 # One-shot opening animation for the in-window title. It advances once per
@@ -979,7 +1006,7 @@ def update_slider_display():
 def update_global_anims():
     global legal_pulse_t, eval_highlight_pulse, confirm_anim, game_over_anim
     global always_on_top_anim, auto_move_anim, auto_color_dialog_anim
-    global board_detection_dialog_anim, autoplay_anim
+    global board_detection_dialog_anim, autoplay_anim, use_package_anim
     global autoplay_side_dialog_anim, autoplay_gameover_dialog_anim
     global title_slide_progress
     if title_slide_progress < 1.0:
@@ -1022,6 +1049,7 @@ def update_global_anims():
         ("always_on_top_anim", always_on_top_enabled),
         ("auto_move_anim", auto_move_enabled or show_auto_color_dialog),
         ("autoplay_anim", autoplay_shown_on),
+        ("use_package_anim", use_package_enabled),
     ):
         cur = globals()[name]
         target = 1.0 if on else 0.0
@@ -4638,10 +4666,11 @@ BOARD_DETECTION_MIN_SIDE = 120
 BOARD_DETECTION_BLUE_BGR = (255, 0, 0)       # blue in OpenCV's BGR order
 BOARD_DETECTION_LINE_BGR = (255, 140, 0)     # lighter blue/cyan in BGR
 
-# Piece/empty-square recognition is handled by the trained PyTorch CNN in
-# chessbotv_cnn.pth. The model is loaded lazily the first time Board
-# Detection or Auto-play needs it; no sprite/template dataset is loaded into
-# memory. The checkpoint's class metadata is used when present, with the
+# Piece/empty-square recognition normally uses the trained PyTorch CNN in
+# chessbotv_cnn.pth; Analysis > Use Package can select chess-fen-detector
+# instead. Either model is loaded lazily the first time Board Detection or
+# Auto-play needs it; no sprite/template dataset is loaded into memory.
+# The local checkpoint's class metadata is used when present, with the
 # known ChessBotV class order as the fallback.
 CNN_MODEL_FILENAME = "chessbotv_cnn.pth"
 CNN_MODEL_ENV_VAR = "CHESSBOTV_CNN_MODEL"
@@ -4713,6 +4742,18 @@ SQUARE_BG_TOLERANCE = 24
 _cnn_classifier_cache = None
 _cnn_classifier_lock = threading.Lock()
 _cnn_inference_lock = threading.Lock()
+
+# Optional alternative recogniser selected by Analysis > Use Package. The
+# chess-fen-detector package does not find a board in a window screenshot:
+# ChessBotV's existing geometry still locates and crops the board, then the
+# package's public ``predict_fen(image_path)`` API labels that full-board
+# crop. Importing it pulls in TensorFlow, so it is only loaded lazily after
+# the user has selected the package backend for an actual vision operation.
+PACKAGE_DETECTOR_NAME = "chess-fen-detector"
+PACKAGE_DETECTOR_MODULE = "chess_fen_detector"
+_package_detector_cache = None
+_package_detector_lock = threading.Lock()
+_package_inference_lock = threading.Lock()
 
 
 def _piece_name(symbol):
@@ -5007,6 +5048,303 @@ def _load_cnn_classifier():
 
 def _get_cnn_classifier():
     return _load_cnn_classifier()
+
+
+def _use_package_selected(use_package=None):
+    """Resolve an optional backend override against the saved preference."""
+    if use_package is None:
+        return bool(globals().get("use_package_enabled", False))
+    return bool(use_package)
+
+
+def _vision_backend_name(use_package=None):
+    return "package" if _use_package_selected(use_package) else "cnn"
+
+
+def _vision_backend_label(use_package=None):
+    return PACKAGE_DETECTOR_NAME if _use_package_selected(use_package) else "built-in CNN"
+
+
+def _get_package_detector():
+    """Import and construct ``chess_fen_detector.ChessFENDetector`` once.
+
+    This intentionally uses the package's documented class API rather than
+    its ``get_fen()`` convenience function: ``get_fen()`` constructs (and
+    therefore reloads) a detector on every call, which would be far too
+    slow for Auto-play polling.
+    """
+    global _package_detector_cache
+    if _package_detector_cache is not None:
+        return _package_detector_cache
+    with _package_detector_lock:
+        if _package_detector_cache is not None:
+            return _package_detector_cache
+
+        try:
+            import chess_fen_detector
+        except ModuleNotFoundError as exc:
+            missing = str(getattr(exc, "name", "") or "")
+            if missing == PACKAGE_DETECTOR_MODULE or PACKAGE_DETECTOR_MODULE in str(exc):
+                raise RuntimeError(
+                    "Install chess-fen-detector: pip install chess-fen-detector"
+                ) from exc
+            raise RuntimeError(
+                "Install chess-fen-detector and its dependencies: "
+                "pip install chess-fen-detector"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"chess-fen-detector could not be imported: {exc}"
+            ) from exc
+
+        detector_class = getattr(chess_fen_detector, "ChessFENDetector", None)
+        if detector_class is None:
+            raise RuntimeError(
+                "The installed chess-fen-detector package does not provide "
+                "ChessFENDetector; reinstall it with: "
+                "pip install --force-reinstall chess-fen-detector"
+            )
+        try:
+            detector = detector_class()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "chess-fen-detector is installed but its bundled model is "
+                "missing; reinstall it with: "
+                "pip install --force-reinstall chess-fen-detector"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"chess-fen-detector could not load its model: {exc}"
+            ) from exc
+
+        version = str(getattr(chess_fen_detector, "__version__", "") or "")
+        _package_detector_cache = {
+            "detector": detector,
+            "module": chess_fen_detector,
+            "name": PACKAGE_DETECTOR_NAME,
+            "version": version,
+        }
+        version_text = f" {version}" if version else ""
+        print(f"Package vision model loaded: chess-fen-detector{version_text}.")
+        return _package_detector_cache
+
+
+def _ensure_vision_backend_ready(use_package=None):
+    """Warm the selected recogniser, normally from a worker thread."""
+    if _use_package_selected(use_package):
+        return _get_package_detector()
+    return _get_cnn_classifier()
+
+
+def _package_fen_to_grid(raw_fen):
+    """Parse chess-fen-detector's dash-separated placement into an 8x8 grid.
+
+    The package returns only piece placement, with ``-`` between ranks
+    (for example ``rnbqkbnr-pppppppp-8-...``). Standard ``/`` separators
+    are also accepted. Returns ``(grid, normalized_slash_placement)``;
+    empty squares use ChessBotV's existing ``.`` symbol.
+    """
+    text = str(raw_fen or "").strip()
+    if not text:
+        raise ValueError("chess-fen-detector returned an empty FEN")
+    placement = text.split()[0].replace("-", "/")
+    ranks = placement.split("/")
+    if len(ranks) != 8:
+        raise ValueError(
+            f"chess-fen-detector returned {len(ranks)} ranks instead of 8: "
+            f"{text[:96]!r}"
+        )
+
+    valid_symbols = set("pnbrqkPNBRQK")
+    grid = []
+    normalized_ranks = []
+    for rank_index, rank in enumerate(ranks):
+        row = []
+        for char in rank:
+            if char.isdigit():
+                count = int(char)
+                if count < 1 or count > 8:
+                    raise ValueError(
+                        f"chess-fen-detector returned an invalid empty count "
+                        f"in rank {8 - rank_index}: {text[:96]!r}"
+                    )
+                row.extend("." for _ in range(count))
+            elif char in valid_symbols:
+                row.append(char)
+            else:
+                raise ValueError(
+                    f"chess-fen-detector returned unsupported symbol "
+                    f"{char!r}: {text[:96]!r}"
+                )
+        if len(row) != 8:
+            raise ValueError(
+                f"chess-fen-detector rank {8 - rank_index} expands to "
+                f"{len(row)} squares instead of 8: {text[:96]!r}"
+            )
+        grid.append(row)
+
+        normalized = ""
+        empty = 0
+        for symbol in row:
+            if symbol == ".":
+                empty += 1
+            else:
+                if empty:
+                    normalized += str(empty)
+                    empty = 0
+                normalized += symbol
+        if empty:
+            normalized += str(empty)
+        normalized_ranks.append(normalized)
+    return grid, "/".join(normalized_ranks)
+
+
+def _write_package_board_image(board_crop):
+    """Write a located BGR board crop to a temporary PNG for predict_fen().
+
+    ``cv2.imwrite`` understands OpenCV's BGR in-memory convention, so the
+    PNG on disk has the correct colours for scikit-image's RGB reader.
+    """
+    import cv2
+    import numpy as np
+
+    array = np.asarray(board_crop)
+    if array.ndim == 2:
+        array = np.stack((array, array, array), axis=2)
+    elif array.ndim == 3:
+        if array.shape[2] == 1:
+            array = np.repeat(array, 3, axis=2)
+        elif array.shape[2] >= 3:
+            array = array[:, :, :3]
+        else:
+            raise ValueError("Package board crop needs at least one colour channel")
+    else:
+        raise ValueError("Package board crop must be a 2D or 3D image")
+    if min(array.shape[:2]) < 8:
+        raise ValueError("Package board crop is too small to recognise")
+
+    if array.dtype != np.uint8:
+        if np.issubdtype(array.dtype, np.floating) and array.size:
+            if float(np.nanmax(array)) <= 1.0:
+                array = array * 255.0
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    array = np.ascontiguousarray(array)
+
+    fd, path = tempfile.mkstemp(
+        prefix="chessbotv_package_board_", suffix=".png"
+    )
+    os.close(fd)
+    try:
+        if not cv2.imwrite(path, array):
+            raise RuntimeError("Could not write the temporary board image")
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _recognize_board_crop_with_package(board_crop, package_cache=None):
+    """Run the package on one already-cropped full chessboard."""
+    cache = package_cache or _get_package_detector()
+    detector = cache.get("detector") if isinstance(cache, dict) else cache
+    if detector is None or not hasattr(detector, "predict_fen"):
+        raise RuntimeError("chess-fen-detector did not provide predict_fen()")
+
+    image_path = _write_package_board_image(board_crop)
+    try:
+        with _package_inference_lock:
+            raw_fen = detector.predict_fen(image_path)
+    finally:
+        try:
+            os.unlink(image_path)
+        except OSError:
+            pass
+
+    grid, normalized_placement = _package_fen_to_grid(raw_fen)
+    return {
+        "piece_grid": grid,
+        "package_fen": str(raw_fen).strip(),
+        "fen_placement": normalized_placement,
+        "package_name": PACKAGE_DETECTOR_NAME,
+        "package_version": (
+            str(cache.get("version", "") or "") if isinstance(cache, dict) else ""
+        ),
+    }
+
+
+def _board_classification_from_grid(grid, source="package"):
+    """Build the established all-square classification dict from a grid."""
+    if len(grid) != 8 or any(len(row) != 8 for row in grid):
+        raise ValueError("Board recognition did not return an 8x8 grid")
+
+    sources = []
+    confidences = []
+    ranked_grid = []
+    piece_count = 0
+    blank_count = 0
+    unknown_squares = []
+    for row_index, row in enumerate(grid):
+        source_row = []
+        confidence_row = []
+        ranked_row = []
+        for col_index, symbol in enumerate(row):
+            symbol = str(symbol)
+            if symbol == "?":
+                source_row.append("unknown")
+                unknown_squares.append((row_index, col_index))
+            else:
+                source_row.append(source)
+            # predict_fen() exposes final labels, not probabilities. These
+            # values are accepted-label markers, preserving the result and
+            # anchor-scoring shape previously supplied by the local CNN.
+            confidence_row.append(0.0 if symbol == "?" else 1.0)
+            ranked_row.append([] if symbol == "?" else [(symbol, 0.0)])
+            if symbol == ".":
+                blank_count += 1
+            elif symbol != "?":
+                piece_count += 1
+        sources.append(source_row)
+        confidences.append(confidence_row)
+        ranked_grid.append(ranked_row)
+
+    return {
+        "piece_grid": [list(row) for row in grid],
+        "piece_sources": sources,
+        "piece_confidences": confidences,
+        "piece_ranked": ranked_grid,
+        "piece_count": piece_count,
+        "blank_count": blank_count,
+        "unknown_squares": unknown_squares,
+    }
+
+
+def _classify_board_pieces_with_package(image, board_rect):
+    """Recognise all 64 squares of one located board with the package."""
+    if image is None or getattr(image, "ndim", 0) < 2:
+        raise ValueError("Package recognition needs a board image")
+    x, y, width, _height = [int(value) for value in board_rect]
+    side = int(width)
+    board_crop = image[y:y + side, x:x + side]
+    if board_crop.shape[0] != side or board_crop.shape[1] != side:
+        raise ValueError("Located board crop falls outside the screenshot")
+
+    recognized = _recognize_board_crop_with_package(board_crop)
+    result = _board_classification_from_grid(
+        recognized["piece_grid"], source="package"
+    )
+    result.update({
+        "vision_backend": "package",
+        "vision_use_package": True,
+        "vision_model_name": PACKAGE_DETECTOR_NAME,
+        "package_name": recognized["package_name"],
+        "package_version": recognized["package_version"],
+        "package_fen": recognized["package_fen"],
+        "fen_placement": recognized["fen_placement"],
+    })
+    return result
 
 
 def _prepare_cnn_square(square, classifier):
@@ -5356,7 +5694,7 @@ def _refine_board_rect(board_rect, integrals, image_w, image_h):
 
 
 def _anchor_match_score(ranked, expected_symbol):
-    """Score a CNN ranking against the expected anchor piece."""
+    """Score a classifier ranking against the expected anchor piece."""
     if not ranked:
         return 0.0
     probabilities = {
@@ -5379,9 +5717,18 @@ def _piece_display_code(symbol):
     return PIECE_CODES.get(symbol, str(symbol))
 
 
-def _classify_board_anchor(image, board_rect, row, col, expected_symbol):
+_NO_PRECOMPUTED_CLASSIFICATION = object()
+
+
+def _classify_board_anchor(
+    image,
+    board_rect,
+    row,
+    col,
+    expected_symbol,
+    precomputed_result=_NO_PRECOMPUTED_CLASSIFICATION,
+):
     left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
-    cell = image[top:bottom, left:right]
     centre = ((left + right) // 2, (top + bottom) // 2)
     info = {
         "row": row,
@@ -5397,25 +5744,61 @@ def _classify_board_anchor(image, board_rect, row, col, expected_symbol):
         "score": 0.0,
         "match": None,
     }
-    if cell.shape[0] < 8 or cell.shape[1] < 8:
-        return info
-    try:
-        symbol, confidence, ranked = _classify_square_with_cnn(cell)
-    except Exception:
-        return info
+
+    if precomputed_result is not _NO_PRECOMPUTED_CLASSIFICATION:
+        # An explicit None is a failed package classification. Return an
+        # unscored anchor instead of silently falling back to the CNN the
+        # user has asked ChessBotV not to use.
+        if precomputed_result is None:
+            return info
+        try:
+            symbol = precomputed_result["piece_grid"][row][col]
+            confidences = precomputed_result.get("piece_confidences") or []
+            ranked_grid = precomputed_result.get("piece_ranked") or []
+            try:
+                confidence = float(confidences[row][col])
+            except Exception:
+                confidence = 1.0
+            try:
+                ranked = list(ranked_grid[row][col] or [])
+            except Exception:
+                ranked = []
+            if not ranked and symbol not in (None, "?"):
+                ranked = [(symbol, max(0.0, min(1.0, 1.0 - confidence)))]
+        except Exception:
+            return info
+    else:
+        cell = image[top:bottom, left:right]
+        if cell.shape[0] < 8 or cell.shape[1] < 8:
+            return info
+        try:
+            symbol, confidence, ranked = _classify_square_with_cnn(cell)
+        except Exception:
+            return info
+
     detected = ranked[0][0] if ranked else symbol
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = 0.0
     info.update({
         "detected_symbol": detected,
         "classified_symbol": symbol,
         "detected_name": _piece_name(detected),
-        "confidence": float(confidence),
+        "confidence": confidence,
         "score": _anchor_match_score(ranked, expected_symbol),
         "match": detected == expected_symbol,
     })
     return info
 
 
-def _score_board_candidate(image, board_rect, integrals, expected_anchors):
+def _score_board_candidate(
+    image,
+    board_rect,
+    integrals,
+    expected_anchors,
+    use_package=False,
+):
     metrics = _board_geometry_score(board_rect, integrals)
     total = metrics["score"]
     anchors = {}
@@ -5424,6 +5807,24 @@ def _score_board_candidate(image, board_rect, integrals, expected_anchors):
         ("top_left", 0, 0, expected_tl),
         ("bottom_right", 7, 7, expected_br),
     )
+
+    # The package has no single-square API. In package mode, recognise
+    # this refined candidate's full board once, derive both anchors from
+    # that grid, and retain the result so the winning candidate does not
+    # need a second package inference.
+    classification = None
+    classification_error = ""
+    if use_package:
+        try:
+            classification = _classify_board_pieces_with_package(
+                image, board_rect
+            )
+        except Exception as exc:
+            classification_error = str(exc)
+
+    anchor_kwargs = (
+        {"precomputed_result": classification} if use_package else {}
+    )
     for name, row, col, expected in anchor_specs:
         anchors[name] = _classify_board_anchor(
             image,
@@ -5431,17 +5832,25 @@ def _score_board_candidate(image, board_rect, integrals, expected_anchors):
             row,
             col,
             expected,
+            **anchor_kwargs,
         )
     total += 1.5 * (
         anchors["top_left"]["score"] + anchors["bottom_right"]["score"]
     ) / 2.0
-    return {
+    result = {
         "board_rect": board_rect,
         "score": float(total),
         "coverage": metrics["coverage"],
         "parity": metrics["parity"],
         "anchors": anchors,
+        "vision_backend": "package" if use_package else "cnn",
+        "vision_use_package": bool(use_package),
     }
+    if classification is not None:
+        result["vision_classification"] = classification
+    if classification_error:
+        result["vision_error"] = classification_error
+    return result
 
 
 def _classify_board_pieces(image, board_rect):
@@ -5537,17 +5946,25 @@ def _sync_board_anchor_labels(result):
             pass
 
 
-def detect_chessboard_in_image(image, expected_anchors=None):
+def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
     """Find a White-oriented Chess.com board square in a BGR screenshot.
 
-    The grid-colour geometry does the locating; the CNN classifies the two
-    corner anchors (normally black rook on a8 and white rook on h1) as a
-    verification signal and then classifies all 64 squares. Returns a
+    The grid-colour geometry does the locating in both modes. With Use
+    Package off, the local CNN classifies the two corner anchors and then
+    all 64 squares. With it on, each refined candidate crop is sent to
+    ``chess-fen-detector`` once; its full-board grid supplies both the
+    anchors and (for the winning candidate) the final labels. Returns a
     detection dict or None.
     """
     if image is None or getattr(image, "ndim", 0) != 3:
         return None
-    classifier = _get_cnn_classifier()
+    use_package = _use_package_selected(use_package)
+    classifier = None
+    package_cache = None
+    if use_package:
+        package_cache = _get_package_detector()
+    else:
+        classifier = _get_cnn_classifier()
     image_h, image_w = image.shape[:2]
     light_mask, dark_mask, bg_mask = _board_colour_masks(image)
     integrals = {
@@ -5582,6 +5999,7 @@ def detect_chessboard_in_image(image, expected_anchors=None):
             rect,
             integrals,
             expected,
+            use_package=use_package,
         )
         for rect in refined_rects
     ]
@@ -5590,9 +6008,25 @@ def detect_chessboard_in_image(image, expected_anchors=None):
         return None
     best["expected_anchors"] = expected
     best["image_size"] = (image_w, image_h)
-    best["cnn_model_path"] = classifier["path"]
-    best["cnn_class_names"] = list(classifier["class_names"])
-    best.update(_classify_board_pieces(image, best["board_rect"]))
+    best["vision_backend"] = "package" if use_package else "cnn"
+    best["vision_use_package"] = bool(use_package)
+    if use_package:
+        best["vision_model_name"] = PACKAGE_DETECTOR_NAME
+        best["package_name"] = PACKAGE_DETECTOR_NAME
+        best["package_version"] = str(package_cache.get("version", "") or "")
+        classification = best.pop("vision_classification", None)
+        best.pop("vision_error", None)
+        if classification is None:
+            classification = _classify_board_pieces_with_package(
+                image, best["board_rect"]
+            )
+        best.update(classification)
+    else:
+        best["vision_model_name"] = os.path.basename(classifier["path"])
+        best["vision_model_path"] = classifier["path"]
+        best["cnn_model_path"] = classifier["path"]
+        best["cnn_class_names"] = list(classifier["class_names"])
+        best.update(_classify_board_pieces(image, best["board_rect"]))
     _sync_board_anchor_labels(best)
     return best
 
@@ -5766,11 +6200,69 @@ def _autoplay_changed_visual_squares(previous, current,
     return changed
 
 
-def _autoplay_classify_visual_squares(board_crop, visual_squares):
-    """Classify only the requested visual cells of a board-only crop."""
+def _autoplay_use_package_selected(use_package=None):
+    """Backend for Auto-play square checks.
+
+    A running Auto-play session keeps the recogniser captured by its
+    initial full-board scan. Outside a live session (including direct
+    helper calls), the current Use Package preference applies.
+    """
+    if use_package is not None:
+        return bool(use_package)
+    session_active = bool(
+        _autoplay.get("enabled")
+        or _autoplay.get("running")
+        or _autoplay.get("scan_running")
+    )
+    if session_active:
+        backend = str(_autoplay.get("vision_backend") or "").strip().lower()
+        if backend in ("package", "cnn"):
+            return backend == "package"
+        if "vision_use_package" in _autoplay:
+            return bool(_autoplay.get("vision_use_package"))
+    return _use_package_selected()
+
+
+def _autoplay_classify_visual_squares(
+    board_crop,
+    visual_squares,
+    use_package=None,
+):
+    """Return labels for the requested visual cells of a board-only crop.
+
+    The local CNN can batch just the changed cells. ``chess-fen-detector``
+    only recognises a complete board image, so package mode runs it once
+    on the whole already-located crop and extracts the requested cells
+    from its 8x8 result.
+    """
     visual_squares = list(visual_squares)
     if board_crop is None or getattr(board_crop, "ndim", 0) != 3:
         return {(row, col): "?" for row, col in visual_squares}
+    if not visual_squares:
+        return {}
+
+    if _autoplay_use_package_selected(use_package):
+        try:
+            side = min(int(board_crop.shape[1]), int(board_crop.shape[0]))
+            classification = _classify_board_pieces_with_package(
+                board_crop, (0, 0, side, side)
+            )
+            grid = classification["piece_grid"]
+            return {
+                (row, col): (
+                    grid[int(row)][int(col)]
+                    if 0 <= int(row) < 8 and 0 <= int(col) < 8
+                    else "?"
+                )
+                for row, col in visual_squares
+            }
+        except Exception as exc:
+            print(
+                "Auto-play: chess-fen-detector changed-square "
+                f"recognizer failed: {exc}"
+            )
+            return {(row, col): "?" for row, col in visual_squares}
+
     board_rect = (0, 0, board_crop.shape[1], board_crop.shape[0])
     cells = [
         _board_square_crop(board_crop, board_rect, row, col)
@@ -5900,7 +6392,7 @@ def annotate_board_detection(image, detection):
 
     # Label occupied squares last so their short piece codes stay readable
     # over the grid/pieces/anchor markers. Blank squares intentionally get
-    # no piece label; a square the CNN could not process shows '?'.
+    # no piece label; a square the recogniser could not process shows '?'.
     if piece_grid:
         for row in range(8):
             for col in range(8):
@@ -6433,23 +6925,33 @@ def _board_detection_summary(result):
             f" Pieces: {piece_count}, blanks: {blank_count}, "
             f"unknown: {unknown_count}."
         )
-        if result.get("cnn_model_path"):
+        if result.get("vision_backend") == "package" or result.get(
+            "vision_use_package"
+        ):
+            version = str(result.get("package_version", "") or "").strip()
+            version_text = f" {version}" if version else ""
+            summary += f" Package: {PACKAGE_DETECTOR_NAME}{version_text}."
+        elif result.get("cnn_model_path"):
             summary += f" CNN: {os.path.basename(result['cnn_model_path'])}."
     return summary
 
 
-def _board_detection_worker(window_info):
+def _board_detection_worker(window_info, use_package=None):
     global board_detection_running, board_detection_result
     global board_detection_result_ready, board_detection_error
     global board_detection_status, board_detection_last_summary
+    use_package = _use_package_selected(use_package)
     try:
         import cv2
 
-        _get_cnn_classifier()
+        _ensure_vision_backend_ready(use_package)
         image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
         if image is None:
             raise RuntimeError("Could not screenshot the selected window")
-        detection = detect_chessboard_in_image(image)
+        detection = detect_chessboard_in_image(
+            image,
+            use_package=use_package,
+        )
         if detection is None:
             board_detection_error = (
                 "No Chess.com-coloured 8x8 board found in that window. "
@@ -6512,9 +7014,10 @@ def start_board_detection(window_info):
     board_detection_error = ""
     board_detection_status = f"Capturing '{window_info.get('title', 'window')}'..."
     board_detection_running = True
+    use_package_snapshot = bool(use_package_enabled)
     _board_detection_thread = threading.Thread(
         target=_board_detection_worker,
-        args=(dict(window_info),),
+        args=(dict(window_info), use_package_snapshot),
         daemon=True,
     )
     _board_detection_thread.start()
@@ -6522,7 +7025,7 @@ def start_board_detection(window_info):
 
 
 def show_board_detection_result(result):
-    """Open the CNN-annotated Board Detection screenshot."""
+    """Open the annotated Board Detection screenshot."""
     global board_detection_error, board_detection_status
     global board_detection_last_summary
     try:
@@ -6665,10 +7168,11 @@ def _autoplay_window_selected(window_info):
     return True
 
 
-def _autoplay_scan_worker(window_info, side, scan_id):
+def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
     """Capture the target and run the one full-board Auto-play scan."""
+    use_package = _use_package_selected(use_package)
     try:
-        _get_cnn_classifier()
+        _ensure_vision_backend_ready(use_package)
         image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
         if image is None:
             raise RuntimeError("Could not screenshot the selected window")
@@ -6676,6 +7180,7 @@ def _autoplay_scan_worker(window_info, side, scan_id):
         detection = detect_chessboard_in_image(
             image,
             expected_anchors=expected_anchors,
+            use_package=use_package,
         )
         if detection is None:
             raise RuntimeError(
@@ -6721,6 +7226,7 @@ def start_autoplay_scan(side=None):
         return stop_autoplay("Choose a window before scanning.", error=True)
     side = _autoplay_side_name(side or _autoplay.get("side", "white"))
     scan_id = int(_autoplay.get("scan_id", 0)) + 1
+    use_package_snapshot = bool(use_package_enabled)
     _autoplay.update({
         "enabled": True,
         "running": False,
@@ -6728,6 +7234,8 @@ def start_autoplay_scan(side=None):
         "window": dict(window_info),
         "pending_window": dict(window_info),
         "side": side,
+        "vision_backend": "package" if use_package_snapshot else "cnn",
+        "vision_use_package": use_package_snapshot,
         "scan_id": scan_id,
         "scan_running": True,
         "scan_ready": False,
@@ -6742,7 +7250,8 @@ def start_autoplay_scan(side=None):
         "game_result": None,
     })
     _autoplay_set_status(
-        f"Scanning the full board as {side.capitalize()}..."
+        f"Scanning the full board as {side.capitalize()} with "
+        f"{_vision_backend_label(use_package_snapshot)}..."
     )
     try:
         begin_settings_menu_close()
@@ -6750,7 +7259,7 @@ def start_autoplay_scan(side=None):
         pass
     thread = threading.Thread(
         target=_autoplay_scan_worker,
-        args=(dict(window_info), side, scan_id),
+        args=(dict(window_info), side, scan_id, use_package_snapshot),
         name="autoplay-scan",
         daemon=True,
     )
@@ -7879,6 +8388,17 @@ def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(bd_rect.x, bd_rect.bottom + 42, bd_rect.width, 94)
 
 
+def get_use_package_toggle_rect(offset_x=0, offset_y=0):
+    """Recognition-backend toggle below Auto-play and its status line."""
+    autoplay_rect = get_autoplay_toggle_rect(offset_x, offset_y)
+    return pygame.Rect(
+        autoplay_rect.x,
+        autoplay_rect.bottom + 44,
+        autoplay_rect.width,
+        74,
+    )
+
+
 def _analysis_settings_button_summary():
     """Read-only Analysis status summary for the Settings main menu.
 
@@ -8785,6 +9305,25 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
             WIDTH // 2 - autoplay_status_s.get_width() // 2 + offset_x,
             autoplay_rect.bottom + 16 + offset_y,
         ),
+    )
+
+    # Board-vision backend for the next Board Detection / Auto-play scan.
+    # A scan or Auto-play session already in progress keeps the backend it
+    # started with; this saved preference takes over on the next scan.
+    use_package_rect = get_use_package_toggle_rect(offset_x, offset_y)
+    use_package_subtitle = (
+        "chess-fen-detector · next scan"
+        if use_package_enabled
+        else "Built-in CNN · next scan"
+    )
+    draw_toggle_row(
+        screen,
+        use_package_rect,
+        "Use Package",
+        use_package_subtitle,
+        use_package_enabled,
+        use_package_anim,
+        idle and use_package_rect.collidepoint(mx, my),
     )
 
 
@@ -12272,6 +12811,9 @@ def handle_menu_click(mx, my):
         if get_autoplay_toggle_rect().collidepoint(mx, my):
             request_autoplay_start()
             return True
+        if get_use_package_toggle_rect().collidepoint(mx, my):
+            set_use_package(not use_package_enabled)
+            return True
 
     elif settings_menu_state == "board":
         for page, rect in get_board_hub_rects().items():
@@ -13068,9 +13610,9 @@ def main():
     check_effect = CheckEffect()
     engine_thread = EngineThread(ENGINE_PATH, config)
 
-    # Decode the GUI piece sets once at startup. The CNN vision model is
-    # loaded lazily when Board Detection or Auto-play first needs it, so no
-    # recognition dataset is held in memory.
+    # Decode the GUI piece sets once at startup. The selected vision model
+    # (local CNN or chess-fen-detector) is loaded lazily when Board
+    # Detection or Auto-play first needs it.
     preload_piece_images()
 
     selected_sq = None
@@ -13263,6 +13805,15 @@ def main():
             "screen_board_rect": result.get("screen_board_rect"),
             "window": result.get("window") or _autoplay.get("window"),
             "side": side,
+            "vision_backend": result.get(
+                "vision_backend", _autoplay.get("vision_backend", "cnn")
+            ),
+            "vision_use_package": bool(
+                result.get(
+                    "vision_use_package",
+                    _autoplay.get("vision_use_package", False),
+                )
+            ),
             "last_image": board_crop,
             "last_grid": _autoplay_board_grid_from_board(board),
             "expected_fen": board.fen(),
