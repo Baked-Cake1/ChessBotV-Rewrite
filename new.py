@@ -760,6 +760,10 @@ SETTINGS_MAIN_ITEMS = [
 ]
 # Toggle knob animation (0 = off, 1 = on)
 always_on_top_anim = 1.0 if always_on_top_enabled else 0.0
+# Visual-only polish state for the Always on Top row. The enabled flag and
+# always_on_top_anim above remain the behavioural/animation source of truth.
+always_on_top_hover_amount = 0.0
+always_on_top_icon_phase = 0.0
 auto_move_anim = 1.0 if auto_move_enabled else 0.0
 autoplay_anim = 0.0
 # Smoothed depth progress-bar fill (0..1 of the target depth)
@@ -6434,6 +6438,550 @@ def get_always_on_top_rect(offset_x=0, offset_y=0):
     return pygame.Rect(WIDTH // 2 - 200 + offset_x, HEIGHT - 56 + offset_y, 400, 40)
 
 
+def _draw_always_on_top_icon(
+    surface, cx, cy, radius, anim=1.0, hover_amount=0.0, phase=0.0
+):
+    """Draw stacked windows with the front window rising when pinned.
+
+    The front window literally lifts above the rear window as the existing
+    0..1 Always on Top animation approaches the on position. A tiny upward
+    arrow reinforces the meaning without relying on a text glyph.
+    """
+    cx, cy, radius = int(cx), int(cy), max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, hover_amount))
+    e = cubic_ease_in_out(max(0.0, min(1.0, anim)))
+    unit = radius / 12.0
+
+    def scaled(value):
+        return max(1, int(round(value * unit)))
+
+    face_colour = _lerp_color((218, 224, 235), (225, 248, 235), e)
+    inner_colour = _lerp_color((182, 191, 208), (184, 230, 200), e)
+    rim_colour = _lerp_color((76, 84, 102), (43, 126, 78), e)
+    rim_colour = _lerp_color(rim_colour, (255, 255, 255), 0.18 * hover_amount)
+    accent_colour = _lerp_color((126, 142, 168), (57, 181, 105), e)
+
+    # Layered enamel disc, matching the neighbouring About medallions.
+    pygame.draw.circle(surface, (16, 20, 28), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), radius)
+    pygame.draw.circle(
+        surface, inner_colour, (cx, cy), max(5, radius - scaled(2))
+    )
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius, 1)
+    try:
+        pygame.gfxdraw.aacircle(surface, cx, cy, radius, (*rim_colour, 255))
+        pygame.gfxdraw.aacircle(
+            surface,
+            cx,
+            cy,
+            max(5, radius - scaled(2)),
+            (*_lerp_color(inner_colour, rim_colour, 0.45), 255),
+        )
+    except Exception:
+        pass
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (int(cx - 7.0 * unit), int(cy - 7.0 * unit)),
+        scaled(0.85),
+    )
+
+    bob = 0.35 * hover_amount * math.sin(phase)
+    lift = 1.7 * e + bob
+    back_rect = pygame.Rect(
+        int(round(cx - 8.0 * unit)),
+        int(round(cy - 3.5 * unit)),
+        max(3, int(round(13.0 * unit))),
+        max(3, int(round(10.0 * unit))),
+    )
+    front_rect = pygame.Rect(
+        int(round(cx - 4.5 * unit)),
+        int(round(cy + (0.5 - lift) * unit)),
+        max(3, int(round(13.0 * unit))),
+        max(3, int(round(10.0 * unit))),
+    )
+    corner = scaled(1.8)
+
+    # Rear window: only its top and left edges peek out from the stack.
+    back_fill = _lerp_color((111, 124, 148), (83, 130, 110), e)
+    pygame.draw.rect(
+        surface, (35, 42, 56), back_rect.move(0, scaled(0.8)), border_radius=corner
+    )
+    pygame.draw.rect(surface, back_fill, back_rect, border_radius=corner)
+    pygame.draw.rect(surface, rim_colour, back_rect, 1, border_radius=corner)
+    pygame.draw.line(
+        surface,
+        _lerp_color(back_fill, (255, 255, 255), 0.35),
+        (back_rect.x + scaled(1.5), back_rect.y + scaled(3.0)),
+        (back_rect.right - scaled(1.5), back_rect.y + scaled(3.0)),
+        1,
+    )
+
+    # The upward arrow is drawn before the front window so its base tucks
+    # behind the raised window at the end of the slide.
+    arrow_cx = cx + 2.0 * unit
+    arrow_tip_y = cy + (-8.8 - 0.45 * lift) * unit
+    arrow_base_y = cy + (-4.9 - 0.45 * lift) * unit
+    pygame.draw.line(
+        surface,
+        accent_colour,
+        (arrow_cx, arrow_base_y),
+        (arrow_cx, arrow_tip_y + scaled(1.4)),
+        scaled(1.7),
+    )
+    arrowhead = [
+        (arrow_cx, arrow_tip_y),
+        (arrow_cx - 2.4 * unit, arrow_tip_y + 3.0 * unit),
+        (arrow_cx + 2.4 * unit, arrow_tip_y + 3.0 * unit),
+    ]
+    pygame.draw.polygon(surface, accent_colour, arrowhead)
+    try:
+        pygame.gfxdraw.aapolygon(surface, arrowhead, (*accent_colour, 255))
+    except Exception:
+        pass
+
+    # Front window with title bar, two window-control dots and content.
+    front_fill = _lerp_color((220, 228, 240), (242, 255, 248), e)
+    pygame.draw.rect(
+        surface, (35, 42, 56), front_rect.move(0, scaled(0.9)), border_radius=corner
+    )
+    pygame.draw.rect(surface, front_fill, front_rect, border_radius=corner)
+    pygame.draw.rect(surface, rim_colour, front_rect, 1, border_radius=corner)
+    title_h = max(2, scaled(3.0))
+    title_rect = pygame.Rect(
+        front_rect.x + 1, front_rect.y + 1, front_rect.width - 2, title_h
+    )
+    pygame.draw.rect(surface, accent_colour, title_rect, border_radius=corner)
+    for dot_dx in (2.0, 4.2):
+        pygame.draw.circle(
+            surface,
+            (245, 250, 255),
+            (
+                int(front_rect.x + dot_dx * unit),
+                int(front_rect.y + 1.55 * unit),
+            ),
+            scaled(0.55),
+        )
+    content_colour = _lerp_color(front_fill, rim_colour, 0.48)
+    for line_dy, line_w in ((5.4, 7.2), (7.6, 5.2)):
+        y = int(front_rect.y + line_dy * unit)
+        pygame.draw.line(
+            surface,
+            content_colour,
+            (int(front_rect.x + 2.0 * unit), y),
+            (int(front_rect.x + (2.0 + line_w) * unit), y),
+            1,
+        )
+
+    # A fine baseline anchors the stack inside the medallion.
+    base_y = int(cy + 9.3 * unit)
+    pygame.draw.line(
+        surface,
+        rim_colour,
+        (int(cx - 7.8 * unit), base_y),
+        (int(cx + 7.8 * unit), base_y),
+        1,
+    )
+
+
+def draw_polished_always_on_top_toggle(screen, rect, on, anim, hovered):
+    """Draw the Settings-main Always on Top row and return its pill rect.
+
+    ``rect``, the 54x28 pill geometry and the caller's on/off animation
+    semantics are unchanged; this renderer adds only visual polish and its
+    own hover easing. Other toggle rows continue to use ``draw_toggle_row``.
+    """
+    global always_on_top_hover_amount, always_on_top_icon_phase
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    always_on_top_hover_amount += (
+        hover_target - always_on_top_hover_amount
+    ) * 0.22
+    if abs(hover_target - always_on_top_hover_amount) < 0.01:
+        always_on_top_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, always_on_top_hover_amount))
+    if hovered:
+        always_on_top_icon_phase = (
+            always_on_top_icon_phase + (0.025 if pressed else 0.07)
+        ) % (2.0 * math.pi)
+
+    e = cubic_ease_in_out(max(0.0, min(1.0, anim)))
+    visual_rect = rect.move(0, 1 if pressed else 0)
+    state_accent = _lerp_color((116, 132, 160), (92, 220, 145), e)
+
+    # State-tinted halo behind the whole row.
+    if hover_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 15), (4, 24), (7, 36)):
+            pygame.draw.rect(
+                glow,
+                (*state_accent, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=16 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (16, 18, 25),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=12,
+    )
+
+    if pressed:
+        base_top, base_bottom = (58, 61, 76), (39, 41, 52)
+        on_top, on_bottom = (54, 72, 65), (35, 52, 46)
+    elif hovered:
+        base_top, base_bottom = (83, 88, 112), (55, 59, 78)
+        on_top, on_bottom = (73, 104, 91), (46, 74, 62)
+    else:
+        base_top, base_bottom = (66, 69, 84), (45, 47, 59)
+        on_top, on_bottom = (62, 82, 76), (40, 61, 53)
+    top_colour = _lerp_color(base_top, on_top, 0.45 * e)
+    bottom_colour = _lerp_color(base_bottom, on_bottom, 0.45 * e)
+    border_colour = _lerp_color((128, 139, 163), (102, 205, 140), e)
+    border_colour = _lerp_color(
+        border_colour, (255, 255, 255), 0.22 * hover_amount
+    )
+
+    # Slate-metal card body. Translucent detail is composited through an
+    # overlay, then a rounded mask, as with the other polished controls.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(8 + 13 * hover_amount)),
+        [
+            (-18, visual_rect.height),
+            (visual_rect.width * 0.34, 0),
+            (visual_rect.width * 0.52, 0),
+            (visual_rect.width * 0.12, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(58 + 42 * hover_amount)),
+        (9, 1),
+        (visual_rect.width - 10, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 20),
+        (2, 7),
+        (2, visual_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 42 if pressed else 29),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 24),
+        (visual_rect.width - 3, 6, 3, visual_rect.height - 12),
+        border_radius=2,
+    )
+
+    # A very faint stacked-window watermark occupies the otherwise empty
+    # middle of the 400 px row; its front sheet rises with the toggle.
+    watermark_alpha = int(12 + 16 * hover_amount + 8 * e)
+    watermark_colour = (205, 232, 255, watermark_alpha)
+    back_mark = pygame.Rect(232, 8, 34, 21)
+    front_mark = pygame.Rect(240, 12 - int(round(2 * e)), 34, 21)
+    pygame.draw.rect(overlay, watermark_colour, back_mark, 1, border_radius=4)
+    pygame.draw.rect(overlay, watermark_colour, front_mark, 1, border_radius=4)
+    pygame.draw.line(
+        overlay,
+        watermark_colour,
+        (front_mark.x + 3, front_mark.y + 6),
+        (front_mark.right - 3, front_mark.y + 6),
+        1,
+    )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=12,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=12)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=10,
+    )
+
+    # State rail at the left edge and a bottom accent under the label.
+    pygame.draw.line(
+        screen,
+        state_accent,
+        (visual_rect.x + 3, visual_rect.y + 9),
+        (visual_rect.x + 3, visual_rect.bottom - 10),
+        3,
+    )
+    accent_w = int(112 * max(e, 0.8 * hover_amount))
+    if accent_w >= 2:
+        pygame.draw.line(
+            screen,
+            state_accent,
+            (visual_rect.x + 16, visual_rect.bottom - 3),
+            (visual_rect.x + 16 + accent_w, visual_rect.bottom - 3),
+            2,
+        )
+
+    _draw_always_on_top_icon(
+        screen,
+        visual_rect.x + 27,
+        visual_rect.centery,
+        12,
+        e,
+        hover_amount,
+        always_on_top_icon_phase,
+    )
+
+    label = "Always on Top"
+    title_colour = _lerp_color(
+        (231, 236, 246), (255, 255, 255), hover_amount
+    )
+    title = font_small.render(label, True, title_colour)
+    title_rect = title.get_rect(
+        midleft=(visual_rect.x + 50, visual_rect.centery)
+    )
+    title_shadow = font_small.render(label, True, (18, 20, 28))
+    screen.blit(title_shadow, title_rect.move(0, 1))
+    screen.blit(title, title_rect)
+
+    # Preserve the original pill geometry and knob travel exactly.
+    pill_w, pill_h = 54, 28
+    pill = pygame.Rect(
+        rect.right - 18 - pill_w,
+        rect.centery - pill_h // 2,
+        pill_w,
+        pill_h,
+    )
+    visual_pill = pill.move(0, 1 if pressed else 0)
+    knob_r = 11
+    knob_x = int(
+        visual_pill.x + 4 + knob_r + e * (pill_w - 8 - knob_r * 2)
+    )
+
+    # Status LED + immediate On/Off label, right-aligned before the pill.
+    state_text = "On" if on else "Off"
+    state_colour = _lerp_color((166, 174, 190), (145, 238, 175), e)
+    state_colour = _lerp_color(
+        state_colour, (255, 255, 255), 0.18 * hover_amount
+    )
+    state_surface = font_tiny.render(state_text, True, state_colour)
+    state_rect = state_surface.get_rect(
+        midright=(visual_pill.x - 10, visual_rect.centery)
+    )
+    state_shadow = font_tiny.render(state_text, True, (18, 20, 28))
+    screen.blit(state_shadow, state_rect.move(0, 1))
+    screen.blit(state_surface, state_rect)
+    led_centre = (state_rect.x - 9, visual_rect.centery)
+    pygame.draw.circle(
+        screen, (18, 20, 28), (led_centre[0], led_centre[1] + 1), 4
+    )
+    pygame.draw.circle(
+        screen,
+        _lerp_color((105, 112, 128), (104, 226, 151), e),
+        led_centre,
+        4,
+    )
+    pygame.draw.circle(
+        screen,
+        _lerp_color((148, 156, 174), (190, 255, 214), e),
+        led_centre,
+        4,
+        1,
+    )
+    pygame.draw.circle(
+        screen,
+        (255, 255, 255),
+        (led_centre[0] - 1, led_centre[1] - 1),
+        1,
+    )
+
+    # Gradient switch track with a lighter travelled section behind the
+    # knob, end glyphs, inset shading and a detailed tactile knob.
+    pygame.draw.rect(
+        screen,
+        (20, 23, 30),
+        visual_pill.move(0, 1),
+        border_radius=pill_h // 2,
+    )
+    off_top, off_bottom = (103, 109, 124), (65, 69, 82)
+    on_top_track, on_bottom_track = (82, 198, 124), (39, 132, 78)
+    track_top = _lerp_color(off_top, on_top_track, e)
+    track_bottom = _lerp_color(off_bottom, on_bottom_track, e)
+    if pressed:
+        track_top = _lerp_color(track_top, (0, 0, 0), 0.16)
+        track_bottom = _lerp_color(track_bottom, (0, 0, 0), 0.16)
+    else:
+        track_top = _lerp_color(
+            track_top, (255, 255, 255), 0.08 * hover_amount
+        )
+        track_bottom = _lerp_color(
+            track_bottom, (255, 255, 255), 0.05 * hover_amount
+        )
+
+    track = pygame.Surface(visual_pill.size, pygame.SRCALPHA)
+    track_denom = max(1, pill_h - 1)
+    for row in range(pill_h):
+        colour = _lerp_color(track_top, track_bottom, row / track_denom)
+        pygame.draw.line(track, (*colour, 255), (0, row), (pill_w - 1, row))
+    track_overlay = pygame.Surface(visual_pill.size, pygame.SRCALPHA)
+    travelled_w = max(0, knob_x - visual_pill.x - 2)
+    if travelled_w > 2:
+        pygame.draw.rect(
+            track_overlay,
+            (255, 255, 255, int(16 + 22 * e)),
+            (2, 2, travelled_w, pill_h - 4),
+            border_radius=pill_h // 2,
+        )
+    pygame.draw.line(
+        track_overlay,
+        (255, 255, 255, int(62 + 36 * hover_amount)),
+        (7, 1),
+        (pill_w - 8, 1),
+        1,
+    )
+    pygame.draw.rect(
+        track_overlay,
+        (0, 0, 0, 38 if pressed else 28),
+        (0, pill_h - 4, pill_w, 4),
+    )
+    track.blit(track_overlay, (0, 0))
+    track_mask = pygame.Surface(visual_pill.size, pygame.SRCALPHA)
+    track_mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        track_mask,
+        (255, 255, 255, 255),
+        track_mask.get_rect(),
+        border_radius=pill_h // 2,
+    )
+    track.blit(
+        track_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT
+    )
+    screen.blit(track, visual_pill.topleft)
+    pygame.draw.rect(
+        screen, (24, 27, 34), visual_pill, 1, border_radius=pill_h // 2
+    )
+    pygame.draw.rect(
+        screen,
+        _lerp_color(track_top, (255, 255, 255), 0.35),
+        visual_pill.inflate(-3, -3),
+        1,
+        border_radius=pill_h // 2,
+    )
+
+    # I/O-style end glyphs. Whichever end the knob has vacated remains
+    # faintly visible, reinforcing the two resting positions.
+    glyph_colour = _lerp_color(track_bottom, (242, 247, 255), 0.62)
+    pygame.draw.circle(
+        screen,
+        glyph_colour,
+        (visual_pill.x + 14, visual_pill.centery),
+        4,
+        2,
+    )
+    pygame.draw.line(
+        screen,
+        glyph_colour,
+        (visual_pill.right - 14, visual_pill.centery - 4),
+        (visual_pill.right - 14, visual_pill.centery + 4),
+        2,
+    )
+
+    stretch = math.sin(math.pi * e)
+    knob_rx = knob_r + 2.1 * stretch + 0.45 * hover_amount
+    knob_ry = knob_r - 0.65 * stretch + 0.45 * hover_amount
+    knob_rect = pygame.Rect(
+        int(round(knob_x - knob_rx)),
+        int(round(visual_pill.centery - knob_ry)),
+        int(round(knob_rx * 2)),
+        int(round(knob_ry * 2)),
+    )
+    pygame.draw.ellipse(screen, (22, 25, 32), knob_rect.move(1, 2))
+    pygame.draw.ellipse(screen, (238, 241, 246), knob_rect)
+    pygame.draw.ellipse(screen, (214, 220, 230), knob_rect.inflate(-4, -4))
+    highlight_rect = pygame.Rect(
+        knob_rect.x + 4,
+        knob_rect.y + 3,
+        max(3, knob_rect.width // 3),
+        max(3, knob_rect.height // 4),
+    )
+    pygame.draw.ellipse(screen, (255, 255, 255), highlight_rect)
+    pygame.draw.ellipse(screen, (107, 116, 132), knob_rect, 1)
+    try:
+        pygame.gfxdraw.aaellipse(
+            screen,
+            knob_rect.centerx,
+            knob_rect.centery,
+            max(1, knob_rect.width // 2),
+            max(1, knob_rect.height // 2),
+            (107, 116, 132, 255),
+        )
+    except Exception:
+        pass
+
+    groove_colour = _lerp_color((150, 158, 172), (79, 160, 105), e)
+    for groove_dx in (-3, 0, 3):
+        pygame.draw.line(
+            screen,
+            groove_colour,
+            (knob_x + groove_dx, visual_pill.centery - 4),
+            (knob_x + groove_dx, visual_pill.centery + 4),
+            1,
+        )
+    pygame.draw.circle(
+        screen,
+        state_accent,
+        (knob_x, visual_pill.centery),
+        2,
+    )
+    pygame.draw.circle(
+        screen,
+        (255, 255, 255),
+        (knob_x - 1, visual_pill.centery - 1),
+        1,
+    )
+    return pill
+
+
 def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(WIDTH // 2 - 220 + offset_x, 150 + offset_y, 440, 94)
 
@@ -8226,8 +8774,8 @@ def draw_settings_menu(screen):
 
             # Always on Top toggle, pinned to the bottom of the main menu
             aot_rect = get_always_on_top_rect(offset_x, open_slide)
-            draw_toggle_row(
-                screen, aot_rect, "Always on Top", None,
+            draw_polished_always_on_top_toggle(
+                screen, aot_rect,
                 always_on_top_enabled, always_on_top_anim,
                 transition_idle and aot_rect.collidepoint(mx, my),
             )
