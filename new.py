@@ -865,6 +865,11 @@ restart_icon_rotation = 0.0
 # while the medallion's orbit dot and external-link arrow animate.
 github_button_hover_amount = 0.0
 github_button_pulse_phase = 0.0
+# Settings header Close/X button polish. Hover eases in separately from a
+# short fold animation that runs while the Settings menu is closing.
+close_button_hover_amount = 0.0
+close_button_fold_amount = 0.0
+close_button_icon_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -8309,30 +8314,417 @@ def draw_polished_restart_button(screen, rect, hovered):
         screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 
-def draw_polished_close_button(screen, rect, hovered):
-    # Modern pill with X icon: subtle gradient, hover glow, AA circle
-    bg = (200, 60, 60) if hovered else (155, 55, 55)
-    # outer glow when hovered
-    if hovered:
-        glow = pygame.Surface((rect.width+12, rect.height+12), pygame.SRCALPHA)
-        pygame.draw.rect(glow, (255,80,80,45), glow.get_rect(), border_radius=12)
-        screen.blit(glow, (rect.x-6, rect.y-6))
-    pygame.draw.rect(screen, bg, rect, border_radius=14)
-    pygame.draw.rect(screen, (255,255,255,35) if hovered else MENU_BORDER_COLOR, rect, 1, border_radius=14)
-    # X icon — two diagonal lines with AA
-    cx, cy = rect.center
-    length = 8
-    thick = 2
-    col = (255,255,255) if hovered else (235,235,235)
-    # draw X with lines
-    pygame.draw.line(screen, col, (cx-length, cy-length), (cx+length, cy+length), thick)
-    pygame.draw.line(screen, col, (cx+length, cy-length), (cx-length, cy+length), thick)
-    # AA refinement via aalines
+def _draw_close_x_icon(
+    surface,
+    cx,
+    cy,
+    radius,
+    hover_amount=0.0,
+    fold_amount=0.0,
+    phase=0.0,
+    pressed=False,
+):
+    """Draw the Settings Close seal: a ringed socket with tapered X arms.
+
+    Hover lengthens and very slightly turns the arms. While Settings is
+    closing, ``fold_amount`` retracts and turns them toward the hub, so the
+    X appears to fold away with the menu instead of simply vanishing.
+    """
+    cx, cy, radius = int(cx), int(cy), max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, hover_amount))
+    fold_amount = max(0.0, min(1.0, fold_amount))
+
+    face_colour = _lerp_color((112, 44, 50), (143, 54, 59), hover_amount)
+    face_colour = _lerp_color(face_colour, (82, 34, 39), 0.45 * fold_amount)
+    inner_colour = _lerp_color((139, 59, 64), (177, 72, 76), hover_amount)
+    inner_colour = _lerp_color(
+        inner_colour, (100, 42, 48), 0.42 * fold_amount
+    )
+    rim_colour = _lerp_color((204, 116, 119), (255, 169, 169), hover_amount)
+    rim_colour = _lerp_color(rim_colour, (176, 91, 97), 0.35 * fold_amount)
+
+    # Layered circular socket/seal inside the pill.
+    pygame.draw.circle(surface, (45, 14, 18), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), max(5, radius - 1))
+    pygame.draw.circle(surface, inner_colour, (cx, cy), max(4, radius - 3))
     try:
-        pygame.draw.aaline(screen, col, (cx-length, cy-length), (cx+length, cy+length))
-        pygame.draw.aaline(screen, col, (cx+length, cy-length), (cx-length, cy+length))
+        pygame.gfxdraw.aacircle(surface, cx, cy, radius, (*rim_colour, 255))
+        pygame.gfxdraw.aacircle(
+            surface,
+            cx,
+            cy,
+            max(4, radius - 3),
+            (*_lerp_color(inner_colour, rim_colour, 0.45), 255),
+        )
     except Exception:
         pass
+
+    # A broken inner ring slowly turns on hover and faster while folding.
+    arc_radius = max(4, radius - 2)
+    arc_points = []
+    arc_steps = 22
+    arc_start = phase - 2.25
+    arc_end = phase + 2.25
+    for step in range(arc_steps + 1):
+        angle = arc_start + (arc_end - arc_start) * step / arc_steps
+        arc_points.append(
+            (
+                cx + arc_radius * math.cos(angle),
+                cy + arc_radius * math.sin(angle),
+            )
+        )
+    arc_colour = _lerp_color(rim_colour, (255, 255, 255), 0.28)
+    if len(arc_points) >= 2:
+        pygame.draw.lines(surface, arc_colour, False, arc_points, 2)
+        try:
+            pygame.draw.aalines(surface, arc_colour, False, arc_points)
+        except Exception:
+            pass
+
+    glint_x = int(cx - radius * 0.35)
+    glint_y = int(cy - radius * 0.36)
+    pygame.draw.circle(surface, (255, 255, 255), (glint_x, glint_y), 1)
+
+    # Four independently tapered rays form the X. Drawing rays rather than
+    # two crossed rectangles gives the fold a mechanical, petal-like feel
+    # and lets opposite rays carry slightly different shading.
+    rotation = 0.10 * hover_amount + 0.62 * fold_amount
+    arm_length = radius * (
+        0.62
+        + 0.08 * hover_amount
+        - 0.34 * fold_amount
+        - (0.03 if pressed else 0.0)
+    )
+    inner_gap = radius * (0.15 + 0.10 * fold_amount)
+    base_half = max(1.0, radius * 0.12 * (1.0 - 0.25 * fold_amount))
+    tip_half = max(0.55, radius * 0.075)
+    bright_arm = _lerp_color(
+        (242, 231, 231), (255, 255, 255), hover_amount
+    )
+    shaded_arm = _lerp_color((218, 200, 202), (246, 231, 231), hover_amount)
+    outline_colour = (107, 38, 44)
+
+    for arm_index in range(4):
+        angle = math.pi / 4.0 + arm_index * math.pi / 2.0 + rotation
+        direction = (math.cos(angle), math.sin(angle))
+        normal = (-direction[1], direction[0])
+        base_centre = (
+            cx + direction[0] * inner_gap,
+            cy + direction[1] * inner_gap,
+        )
+        tip_centre = (
+            cx + direction[0] * arm_length,
+            cy + direction[1] * arm_length,
+        )
+        points = [
+            (
+                base_centre[0] + normal[0] * base_half,
+                base_centre[1] + normal[1] * base_half,
+            ),
+            (
+                tip_centre[0] + normal[0] * tip_half,
+                tip_centre[1] + normal[1] * tip_half,
+            ),
+            (
+                tip_centre[0] - normal[0] * tip_half,
+                tip_centre[1] - normal[1] * tip_half,
+            ),
+            (
+                base_centre[0] - normal[0] * base_half,
+                base_centre[1] - normal[1] * base_half,
+            ),
+        ]
+        shadow_points = [(px, py + 1) for px, py in points]
+        arm_colour = bright_arm if arm_index % 2 == 0 else shaded_arm
+        pygame.draw.polygon(surface, (62, 20, 25), shadow_points)
+        pygame.draw.polygon(surface, arm_colour, points)
+        pygame.draw.polygon(surface, outline_colour, points, 1)
+        try:
+            pygame.gfxdraw.aapolygon(
+                surface, points, (*outline_colour, 255)
+            )
+        except Exception:
+            pass
+
+        # Fine centre highlight on each ray.
+        highlight_start = (
+            base_centre[0] - normal[0] * base_half * 0.35,
+            base_centre[1] - normal[1] * base_half * 0.35,
+        )
+        highlight_end = (
+            tip_centre[0] - normal[0] * tip_half * 0.35,
+            tip_centre[1] - normal[1] * tip_half * 0.35,
+        )
+        try:
+            pygame.draw.aaline(
+                surface, (255, 255, 255), highlight_start, highlight_end
+            )
+        except Exception:
+            pygame.draw.line(
+                surface, (255, 255, 255), highlight_start, highlight_end, 1
+            )
+
+    # Central hub covering the ray roots.
+    hub_radius = max(2, int(round(radius * 0.19)))
+    pygame.draw.circle(surface, (62, 20, 25), (cx, cy + 1), hub_radius)
+    pygame.draw.circle(surface, bright_arm, (cx, cy), hub_radius)
+    pygame.draw.circle(
+        surface, (154, 55, 62), (cx, cy), max(1, hub_radius - 1)
+    )
+    pygame.draw.circle(surface, (255, 226, 226), (cx - 1, cy - 1), 1)
+
+
+def draw_polished_close_button(screen, rect, hovered):
+    """Draw the Settings header Close/X button.
+
+    The caller retains the original 44x32 rect and click handling. This
+    renderer only adds eased hover, pressed and menu-closing visuals.
+    """
+    global close_button_hover_amount
+    global close_button_fold_amount, close_button_icon_phase
+
+    closing = bool(menu_anim_closing)
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered or closing else 0.0
+    close_button_hover_amount += (
+        hover_target - close_button_hover_amount
+    ) * 0.24
+    if abs(hover_target - close_button_hover_amount) < 0.01:
+        close_button_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, close_button_hover_amount))
+
+    fold_target = 1.0 if closing else 0.0
+    close_button_fold_amount += (
+        fold_target - close_button_fold_amount
+    ) * 0.34
+    if abs(fold_target - close_button_fold_amount) < 0.02:
+        close_button_fold_amount = fold_target
+    fold_amount = max(0.0, min(1.0, close_button_fold_amount))
+
+    if closing:
+        close_button_icon_phase = (
+            close_button_icon_phase + 0.28
+        ) % (2.0 * math.pi)
+    elif hovered:
+        close_button_icon_phase = (
+            close_button_icon_phase + (0.012 if pressed else 0.035)
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed or closing else 0)
+    active_amount = max(hover_amount, 0.72 * fold_amount)
+
+    # Layered ruby halo.
+    if active_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 18), (4, 28), (7, 42)):
+            pygame.draw.rect(
+                glow,
+                (255, 86, 92, int(alpha * active_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=20 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (35, 12, 16),
+        visual_rect.move(0, 1 if pressed or closing else 2),
+        border_radius=14,
+    )
+
+    if pressed or closing:
+        top_colour = (112, 48, 52)
+        bottom_colour = (76, 33, 38)
+        border_colour = (190, 105, 108)
+    elif hovered:
+        top_colour = (205, 78, 80)
+        bottom_colour = (138, 48, 54)
+        border_colour = (255, 169, 169)
+    else:
+        top_colour = (157, 67, 69)
+        bottom_colour = (105, 42, 47)
+        border_colour = (184, 105, 108)
+
+    # Ruby-metal pill, built through separate overlay/mask surfaces like
+    # the other polished controls so translucent glass blends correctly.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(11 + 17 * hover_amount)),
+        [
+            (-8, visual_rect.height),
+            (18, 0),
+            (29, 0),
+            (7, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(70 + 46 * hover_amount)),
+        (8, 1),
+        (visual_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 23),
+        (2, 6),
+        (2, visual_rect.height - 7),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 46 if pressed or closing else 31),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 25),
+        (visual_rect.width - 3, 5, 3, visual_rect.height - 10),
+        border_radius=2,
+    )
+    # Two hairline diagonal facets in the pill's end caps.
+    for facet_x in (4, visual_rect.width - 11):
+        pygame.draw.polygon(
+            overlay,
+            (255, 205, 190, 13),
+            [
+                (facet_x, visual_rect.height),
+                (facet_x + 8, 0),
+                (facet_x + 11, 0),
+                (facet_x + 3, visual_rect.height),
+            ],
+        )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=14,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=14)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=12,
+    )
+
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour, (255, 178, 166), hover_amount
+        )
+        accent_w = int(22 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    # Tiny end-cap rivets, clear of the central seal.
+    for rivet_x in (visual_rect.x + 6, visual_rect.right - 7):
+        rivet_centre = (rivet_x, visual_rect.centery)
+        pygame.draw.circle(
+            screen,
+            (43, 15, 19),
+            (rivet_centre[0], rivet_centre[1] + 1),
+            2,
+        )
+        pygame.draw.circle(
+            screen,
+            _lerp_color(border_colour, (255, 255, 255), 0.18),
+            rivet_centre,
+            2,
+        )
+        pygame.draw.circle(
+            screen,
+            _lerp_color(bottom_colour, (255, 255, 255), 0.25),
+            rivet_centre,
+            2,
+            1,
+        )
+        pygame.draw.line(
+            screen,
+            (74, 29, 34),
+            (rivet_centre[0] - 1, rivet_centre[1] + 1),
+            (rivet_centre[0] + 1, rivet_centre[1] - 1),
+            1,
+        )
+
+    _draw_close_x_icon(
+        screen,
+        visual_rect.centerx,
+        visual_rect.centery,
+        12,
+        hover_amount,
+        fold_amount,
+        close_button_icon_phase,
+        pressed,
+    )
+
+    # Below-button tooltip, clamped inside the right edge of the window.
+    if hovered and not pressed and not closing:
+        tip = font_tiny.render("Close Settings", True, TEXT_COLOR)
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(visual_rect.centerx - tip_w // 2, WIDTH - tip_w - 4),
+        )
+        tip_y = min(visual_rect.bottom + 7, HEIGHT - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (34, 18, 21), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen, (255, 169, 169), tip_rect, 1, border_radius=7
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (34, 18, 21),
+            [
+                (pointer_x - 5, tip_rect.y + 1),
+                (pointer_x + 5, tip_rect.y + 1),
+                (pointer_x, max(visual_rect.bottom + 1, tip_rect.y - 5)),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 def draw_polished_back_button(screen, rect, hovered):
     bg = (75, 75, 85) if hovered else (60, 60, 70)
