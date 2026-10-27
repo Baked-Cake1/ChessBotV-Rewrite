@@ -39,7 +39,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Board themes:** any folder under `pieces/<theme>/` (e.g. `classic`). Auto-discovered, `classic` pinned first
 - **Chess.com styles:** any subfolder in `pieces/chesscom/<style>/` (e.g. `8_bit`, `chesskid` → "8-Bit", "ChessKid")
 - **Info panel:** opening name (from `openings.json`), game status (`Check!` / `Draw — …`), stats, opening/rec-move row
-- **Top bar:** a polished emerald `New` button — rounded metal-gradient/glass body, circled-plus badge with hover sparkle, glow, pressed state and “Start a new game” tooltip — plus a polished metallic settings button with a supersampled cog featuring beveled teeth, rim, bolts and hub that slowly turns while hovered → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
+- **Top bar:** a polished brass **Flip** button — miniature board between chunky ivory/charcoal exchange arrows whose colours ease-swap with board orientation, plus hover/pressed states and a perspective tooltip — alongside a polished emerald `New` button with circled-plus badge and hover sparkle, and a polished metallic settings button with a supersampled cog featuring beveled teeth, rim, bolts and hub that slowly turns while hovered → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
 - **Settings pages:**
   - **Pieces Styles** — visual, scrollable style cards with sample pieces on board-coloured squares, source/current-state labels, hover highlighting, and a full 12-piece preview using the active board colours
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
@@ -101,6 +101,7 @@ python new.py --help
 | **Drag & drop** | Alternative: drag any of your pieces to a legal square |
 | **Pawn to last rank** | Promotion dialog — click Q/R/B/N (no pawn/king) |
 | **Space** (menu closed, not animating) | Play engine's `pv[0]` if legal |
+| **Flip** (top bar) or **F** | Flip the board perspective; the brass button's ivory/charcoal arrows ease-swap colours and its tooltip names the side you will view from |
 | **New** (top bar) | Smooth animated reset to starting position and clear eval; hovering shows its polished emerald glow/sparkle state and “Start a new game” tooltip |
 | **Gear** (top bar) | Open Settings overlay; hovering brightens the button, turns the detailed cog slowly, and shows a “Settings” tooltip |
 | **Mouse drag on slider** (Engine Settings) | Adjust Threads/Skill/Hash/Depth live |
@@ -223,7 +224,7 @@ ChessBotV-Rewrite/
 
 - Sound settings & audio playback (`audio/` placeholder)
 - Game Controls / Analysis Settings pages (currently inactive in menu, now have sliders for engine)
-- FEN/PGN export, takeback, flip board
+- FEN/PGN export and takeback
 - Per-theme board colors
 
 ---

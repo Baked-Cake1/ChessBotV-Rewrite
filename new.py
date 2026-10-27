@@ -849,6 +849,10 @@ settings_gear_hover_amount = 0.0
 # Matching visual-only hover/sparkle state for the New Game button.
 new_game_hover_amount = 0.0
 new_game_sparkle_phase = 0.0
+# Flip button polish: hover easing plus a 0..1 icon turn that eases toward
+# the current board orientation so its ivory/charcoal arrows swap smoothly.
+flip_button_hover_amount = 0.0
+flip_icon_turn = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -6971,35 +6975,316 @@ def draw_polished_back_button(screen, rect, hovered):
     except Exception:
         pass
 
+def _draw_flip_board_icon(surface, cx, cy, hover_amount, pressed, turn):
+    """Draw opposing ivory/charcoal arrows around a miniature board.
+
+    ``turn`` is the eased 0..1 board-orientation amount. The arrows keep
+    their up/down directions (the action is always “exchange ends”), while
+    their ivory/charcoal fills cross-fade to the opposite arrow as the
+    board flips. On hover they also travel one pixel apart.
+    """
+    cx, cy = int(cx), int(cy)
+    turn = max(0.0, min(1.0, float(turn)))
+    travel = hover_amount * (0.4 if pressed else 1.0)
+
+    # Miniature 2x2 board in the active board-theme colours.
+    board_size = 16
+    half = board_size // 2
+    board_rect = pygame.Rect(cx - half, cy - half, board_size, board_size)
+    pygame.draw.rect(
+        surface,
+        (28, 21, 12),
+        board_rect.move(0, 1),
+        border_radius=3,
+    )
+    for row in range(2):
+        for col in range(2):
+            colour = LIGHT_SQ if (row + col) % 2 == 0 else DARK_SQ
+            pygame.draw.rect(
+                surface,
+                colour,
+                (
+                    board_rect.x + col * half,
+                    board_rect.y + row * half,
+                    half,
+                    half,
+                ),
+            )
+    pygame.draw.line(
+        surface,
+        _lerp_color(LIGHT_SQ, (255, 255, 255), 0.45),
+        (board_rect.x + 2, board_rect.y + 1),
+        (board_rect.right - 3, board_rect.y + 1),
+        1,
+    )
+    pygame.draw.rect(
+        surface,
+        (24, 20, 16),
+        board_rect,
+        1,
+        border_radius=3,
+    )
+
+    ivory = (243, 234, 214)
+    charcoal = (35, 38, 46)
+    up_fill = _lerp_color(ivory, charcoal, turn)
+    down_fill = _lerp_color(charcoal, ivory, turn)
+    up_outline = _lerp_color((74, 58, 35), (218, 224, 235), turn)
+    down_outline = _lerp_color((218, 224, 235), (74, 58, 35), turn)
+    up_highlight = _lerp_color((255, 255, 255), (116, 124, 140), turn)
+    down_highlight = _lerp_color((116, 124, 140), (255, 255, 255), turn)
+
+    # Canonical chunky up-arrow. The down arrow is the same polygon
+    # reflected through the centre, giving the pair a balanced exchange
+    # silhouette instead of the old single line with mismatched heads.
+    canonical = [
+        (0, -10),
+        (5, -4),
+        (2, -4),
+        (2, 8),
+        (-2, 8),
+        (-2, -4),
+        (-5, -4),
+    ]
+
+    def draw_arrow(centre_x, pointing_down, fill, outline, highlight):
+        def transform(dx, dy):
+            if pointing_down:
+                return (centre_x + dx, cy - dy + travel)
+            return (centre_x + dx, cy + dy - travel)
+
+        points = [transform(dx, dy) for dx, dy in canonical]
+        shadow_points = [(px, py + 1) for px, py in points]
+        pygame.draw.polygon(surface, (28, 21, 12), shadow_points)
+        pygame.draw.polygon(surface, fill, points)
+        pygame.draw.polygon(surface, outline, points, 1)
+        try:
+            pygame.gfxdraw.aapolygon(surface, points, (*outline, 255))
+        except Exception:
+            pass
+        pygame.draw.line(
+            surface,
+            highlight,
+            transform(-1, 6),
+            transform(-1, -3),
+            1,
+        )
+
+    draw_arrow(cx - 14, False, up_fill, up_outline, up_highlight)
+    draw_arrow(cx + 14, True, down_fill, down_outline, down_highlight)
+
+    # Amber centre pivot ties the exchange arrows to the mini board and
+    # gives the eye a still point while their colours cross-fade.
+    pygame.draw.circle(surface, (55, 38, 8), (cx, cy + 1), 3)
+    pygame.draw.circle(surface, EVAL_MARKER_COLOR, (cx, cy), 3)
+    pygame.draw.circle(surface, (255, 246, 190), (cx - 1, cy - 1), 1)
+
+
 def draw_flip_button(screen, mouse_pos):
+    """Draw the polished brass Flip Board top-bar button."""
+    global flip_button_hover_amount, flip_icon_turn
     if menu_anim_progress != 0:
         return
-    hovered = flip_button_rect.collidepoint(mouse_pos)
-    bg = BUTTON_HOVER_COLOR if hovered else BUTTON_COLOR
-    pygame.draw.rect(screen, bg, flip_button_rect, border_radius=6)
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, flip_button_rect, 2, border_radius=6)
-    # Flip icon: two opposing arrows
-    cx, cy = flip_button_rect.center
-    col = GEAR_COLOR_HOVER if hovered else GEAR_COLOR
-    # simple flip icon: vertical line with arrows
-    pygame.draw.line(screen, col, (cx, cy-7), (cx, cy+7), 2)
-    pygame.draw.polygon(screen, col, [(cx-5, cy-4), (cx, cy-9), (cx+1, cy-5)])
-    pygame.draw.polygon(screen, col, [(cx+5, cy+4), (cx, cy+9), (cx-1, cy+5)])
-    # label tiny
-    txt = font_tiny.render("Flip", True, col)
-    # keep compact: only icon, tooltip on hover
-    if hovered:
-        tip = font_tiny.render("Flip board", True, TEXT_COLOR)
-        tip_bg = pygame.Surface((tip.get_width()+10, tip.get_height()+6), pygame.SRCALPHA)
-        tip_bg.fill((30,30,30,220))
-        pygame.draw.rect(tip_bg, MENU_BORDER_COLOR, tip_bg.get_rect(),1, border_radius=4)
-        # The button sits in the top bar (y=7), so a tooltip above it is
-        # clipped by the window edge. Draw it BELOW the button instead,
-        # clamped so it can never leave the window.
-        tip_x = max(4, min(flip_button_rect.centerx - tip_bg.get_width() // 2, WIDTH - tip_bg.get_width() - 4))
-        tip_y = min(flip_button_rect.bottom + 6, HEIGHT - tip_bg.get_height() - 4)
-        screen.blit(tip_bg, (tip_x, tip_y))
-        screen.blit(tip, (tip_x + 5, tip_y + 3))
+
+    rect = flip_button_rect
+    hovered = rect.collidepoint(mouse_pos)
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    flip_button_hover_amount += (
+        hover_target - flip_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - flip_button_hover_amount) < 0.01:
+        flip_button_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, flip_button_hover_amount))
+
+    turn_target = 1.0 if board_flipped else 0.0
+    flip_icon_turn += (turn_target - flip_icon_turn) * 0.20
+    if abs(turn_target - flip_icon_turn) < 0.01:
+        flip_icon_turn = turn_target
+    turn = cubic_ease_in_out(
+        max(0.0, min(1.0, flip_icon_turn))
+    )
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    # Warm amber halo on hover, matching the eval marker/board palette.
+    if hover_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 16, visual_rect.height + 16),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 17), (4, 27), (7, 40)):
+            pygame.draw.rect(
+                glow,
+                (255, 190, 80, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 8, visual_rect.y - 8))
+
+    pygame.draw.rect(
+        screen,
+        (24, 18, 10),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=9,
+    )
+
+    if pressed:
+        top_colour = (83, 67, 43)
+        bottom_colour = (56, 44, 29)
+        border_colour = (179, 144, 88)
+    elif hovered:
+        top_colour = (145, 118, 74)
+        bottom_colour = (91, 71, 44)
+        border_colour = (235, 192, 117)
+    else:
+        top_colour = (120, 97, 63)
+        bottom_colour = (73, 58, 38)
+        border_colour = (191, 155, 96)
+
+    # Rounded brass-metal body; translucent sheen/shading is composited
+    # through an overlay and clipped by the same rounded mask technique as
+    # the New/Settings buttons.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(11 + 18 * hover_amount)),
+        [
+            (-8, visual_rect.height),
+            (visual_rect.width * 0.44, 0),
+            (visual_rect.width * 0.67, 0),
+            (visual_rect.width * 0.13, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(74 + 48 * hover_amount)),
+        (6, 1),
+        (visual_rect.width - 7, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 23),
+        (2, 5),
+        (2, visual_rect.height - 6),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 46 if pressed else 31),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 25),
+        (visual_rect.width - 3, 4, 3, visual_rect.height - 8),
+        border_radius=2,
+    )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=9,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=9)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=7,
+    )
+
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour, (255, 207, 104), hover_amount
+        )
+        accent_w = int(26 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    _draw_flip_board_icon(
+        screen,
+        visual_rect.centerx,
+        visual_rect.centery,
+        hover_amount,
+        pressed,
+        turn,
+    )
+
+    # The button sits in the top bar, so the tooltip goes below it and is
+    # clamped inside the window. Its wording names the perspective the
+    # click will switch to. Suppress it under modal dialogs.
+    if (
+        hovered
+        and not pressed
+        and not show_newgame_confirm
+        and not show_game_over
+    ):
+        perspective = "White" if board_flipped else "Black"
+        tip = font_tiny.render(
+            f"Flip board — view from {perspective}", True, TEXT_COLOR
+        )
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(visual_rect.centerx - tip_w // 2, WIDTH - tip_w - 4),
+        )
+        tip_y = min(visual_rect.bottom + 7, HEIGHT - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (31, 26, 18), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen, (235, 192, 117), tip_rect, 1, border_radius=7
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (31, 26, 18),
+            [
+                (pointer_x - 5, tip_rect.y + 1),
+                (pointer_x + 5, tip_rect.y + 1),
+                (pointer_x, max(visual_rect.bottom + 1, tip_rect.y - 5)),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 def get_flip_button_rect():
     return flip_button_rect
