@@ -875,6 +875,11 @@ close_button_icon_phase = 0.0
 engine_settings_button_hover_amount = 0.0
 engine_settings_button_gear_rotation = 0.0
 engine_settings_button_pulse_phase = 0.0
+# Engine Settings Threads slider polish. Hover/pulse state is visual-only;
+# the staged draft, smoothed display value, limits and drag mapping remain
+# owned by the existing engine-slider state and helpers.
+threads_slider_hover_amount = 0.0
+threads_slider_pulse_phase = 0.0
 # Settings main-menu Board button polish. The phase drives only the
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
@@ -8948,6 +8953,855 @@ def apply_engine_settings():
     engine_has_changes=False
 
 
+def _threads_slider_values():
+    """Read staged/saved/display Threads values for the polished slider.
+
+    The renderer needs all three: the thumb and fill follow the existing
+    smoothed display float, the value chip shows the staged draft, and a
+    small marker can show where the currently saved value sits. Nothing
+    in this helper writes to ``engine_draft``, ``config`` or the display
+    lerp; ``set_engine_slider_value`` remains the only drag mapping.
+    """
+    try:
+        low_raw, high_raw = ENGINE_ROW_LIMITS.get(
+            "threads", (1, MAX_THREADS)
+        )
+        low = int(low_raw)
+        high = int(high_raw)
+    except Exception:
+        low = 1
+        high = max(1, int(MAX_THREADS))
+    high = max(low, high)
+
+    def draft_value(raw, default):
+        try:
+            value = int(round(float(raw)))
+        except (TypeError, ValueError):
+            value = int(default)
+        return max(low, min(high, value))
+
+    saved_default = ENGINE_DEFAULTS.get("threads", low)
+    saved = draft_value(config.get("threads", saved_default), saved_default)
+    draft = draft_value(engine_draft.get("threads", saved), saved)
+    try:
+        display = float(engine_slider_display.get("threads", float(draft)))
+    except (TypeError, ValueError):
+        display = float(draft)
+    display = max(float(low), min(float(high), display))
+
+    span = float(high - low)
+    if span <= 0:
+        display_fraction = 1.0
+        draft_fraction = 1.0
+        saved_fraction = 1.0
+    else:
+        display_fraction = (display - low) / span
+        draft_fraction = (draft - low) / span
+        saved_fraction = (saved - low) / span
+
+    return {
+        "low": low,
+        "high": high,
+        "draft": draft,
+        "saved": saved,
+        "display": display,
+        "dirty": draft != saved,
+        "display_fraction": max(0.0, min(1.0, display_fraction)),
+        "draft_fraction": max(0.0, min(1.0, draft_fraction)),
+        "saved_fraction": max(0.0, min(1.0, saved_fraction)),
+    }
+
+
+def _threads_slider_tick_values(low, high, max_intervals=24):
+    """Inclusive tick values for the Threads core bank.
+
+    Typical logical-CPU counts get one tick per thread. Very large safe
+    limits step by a round group size so the 180 px track stays legible;
+    both endpoints are always present.
+    """
+    try:
+        low = int(low)
+        high = int(high)
+        max_intervals = max(1, int(max_intervals))
+    except Exception:
+        return (1,)
+    if high <= low:
+        return (low,)
+
+    span = high - low
+    step = 1
+    for candidate in (
+        1, 2, 4, 5, 8, 10, 16, 20, 25, 32, 50, 64, 100, 128, 200,
+        250, 500, 1000,
+    ):
+        step = candidate
+        if (span + candidate - 1) // candidate <= max_intervals:
+            break
+    values = list(range(low, high + 1, step))
+    if values[-1] != high:
+        values.append(high)
+    return tuple(values)
+
+
+def _draw_threads_cpu_icon(
+    surface,
+    cx,
+    cy,
+    size,
+    hover_amount=0.0,
+    phase=0.0,
+    fraction=0.0,
+):
+    """Draw a pinned CPU chip whose four core cells light with Threads."""
+    cx, cy = int(cx), int(cy)
+    size = max(14, int(size))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    fraction = max(0.0, min(1.0, float(fraction)))
+
+    body_size = max(10, int(round(size * 0.72)))
+    body = pygame.Rect(0, 0, body_size, body_size)
+    body.center = (cx, cy)
+    pin_length = max(2, int(round(size * 0.13)))
+    pin_width = max(1, int(round(size / 16.0)))
+    pin_colour = _lerp_color(
+        (112, 126, 158), (190, 215, 255), hover_amount
+    )
+    pin_offsets = (-size * 0.20, 0.0, size * 0.20)
+    for offset in pin_offsets:
+        pin_x = int(round(cx + offset))
+        pin_y = int(round(cy + offset))
+        pygame.draw.line(
+            surface,
+            pin_colour,
+            (pin_x, body.top - pin_length),
+            (pin_x, body.top),
+            pin_width,
+        )
+        pygame.draw.line(
+            surface,
+            pin_colour,
+            (pin_x, body.bottom),
+            (pin_x, body.bottom + pin_length),
+            pin_width,
+        )
+        pygame.draw.line(
+            surface,
+            pin_colour,
+            (body.left - pin_length, pin_y),
+            (body.left, pin_y),
+            pin_width,
+        )
+        pygame.draw.line(
+            surface,
+            pin_colour,
+            (body.right, pin_y),
+            (body.right + pin_length, pin_y),
+            pin_width,
+        )
+
+    pygame.draw.rect(
+        surface, (15, 20, 34), body.move(0, 1), border_radius=max(2, size // 8)
+    )
+    body_colour = _lerp_color(
+        (43, 52, 78), (58, 70, 102), hover_amount
+    )
+    border_colour = _lerp_color(
+        (126, 140, 180), (190, 215, 255), hover_amount
+    )
+    pygame.draw.rect(
+        surface, body_colour, body, border_radius=max(2, size // 8)
+    )
+    pygame.draw.rect(
+        surface, border_colour, body, 1, border_radius=max(2, size // 8)
+    )
+
+    inner = body.inflate(-max(4, size // 6), -max(4, size // 6))
+    pygame.draw.rect(
+        surface, (24, 32, 52), inner, border_radius=max(1, size // 12)
+    )
+
+    gap = max(1, int(round(size * 0.05)))
+    cell_w = max(1, (inner.width - gap) // 2)
+    cell_h = max(1, (inner.height - gap) // 2)
+    active_cells = 1 if fraction <= 0.0 else min(
+        4, max(1, int(math.ceil(fraction * 4.0)))
+    )
+    active_colour = _lerp_color(
+        (96, 174, 255), (170, 225, 255), hover_amount
+    )
+    for cell_index, (cell_x, cell_y) in enumerate(
+        ((0, 0), (1, 0), (0, 1), (1, 1))
+    ):
+        cell = pygame.Rect(
+            inner.x + cell_x * (cell_w + gap),
+            inner.y + cell_y * (cell_h + gap),
+            cell_w,
+            cell_h,
+        )
+        pygame.draw.rect(
+            surface,
+            active_colour if cell_index < active_cells else (48, 58, 82),
+            cell,
+            border_radius=max(1, min(cell_w, cell_h) // 3),
+        )
+
+    hub_radius = max(1, int(round(size * 0.07)))
+    pygame.draw.circle(surface, (16, 23, 39), (cx, cy + 1), hub_radius)
+    pygame.draw.circle(surface, (225, 240, 255), (cx, cy), hub_radius)
+
+    if hover_amount > 0.03:
+        orbit_radius = size * 0.50
+        orbit = (
+            int(round(cx + orbit_radius * math.cos(phase - 0.8))),
+            int(round(cy + orbit_radius * math.sin(phase - 0.8))),
+        )
+        pygame.draw.circle(surface, (18, 26, 44), orbit, 3)
+        pygame.draw.circle(surface, (112, 211, 255), orbit, 2)
+        pygame.draw.circle(
+            surface, (255, 255, 255), (orbit[0] - 1, orbit[1] - 1), 1
+        )
+
+
+def _draw_threads_slider_thumb(
+    surface,
+    cx,
+    cy,
+    radius,
+    hover_amount=0.0,
+    dragging=False,
+    phase=0.0,
+):
+    """Draw the Threads thumb as a small four-core grip knob."""
+    cx, cy = int(cx), int(cy)
+    radius = max(7, int(radius))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    active_amount = 1.0 if dragging else hover_amount
+
+    rim_colour = _lerp_color(
+        (151, 170, 210), (220, 235, 255), active_amount
+    )
+    face_colour = _lerp_color(
+        (55, 66, 94), (76, 91, 124), active_amount
+    )
+    inner_colour = _lerp_color(
+        (38, 48, 74), (54, 68, 98), active_amount
+    )
+
+    pygame.draw.circle(surface, (13, 18, 30), (cx, cy + 2), radius)
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), max(1, radius - 2))
+    pygame.draw.circle(surface, inner_colour, (cx, cy), max(1, radius - 3))
+
+    # Four slowly turning core lights in the knob face.
+    core_distance = max(2.0, radius * 0.43)
+    core_radius = max(1, int(round(radius * 0.14)))
+    for core_index in range(4):
+        angle = phase * 0.35 + core_index * (math.tau / 4.0) + math.pi / 4.0
+        core = (
+            int(round(cx + core_distance * math.cos(angle))),
+            int(round(cy + core_distance * math.sin(angle))),
+        )
+        pygame.draw.circle(
+            surface,
+            (112, 211, 255) if core_index % 2 == 0 else (150, 190, 240),
+            core,
+            core_radius,
+        )
+
+    grip_extent = max(2, radius - 5)
+    pygame.draw.line(
+        surface,
+        (24, 32, 52),
+        (cx, cy - grip_extent),
+        (cx, cy + grip_extent),
+        1,
+    )
+    hub_radius = max(3, int(round(radius * 0.18)))
+    hub_core_radius = max(2, int(round(radius * 0.12)))
+    pygame.draw.circle(
+        surface, (18, 26, 44), (cx, cy + 1), hub_radius
+    )
+    pygame.draw.circle(surface, (225, 240, 255), (cx, cy), hub_radius)
+    pygame.draw.circle(
+        surface, (96, 174, 255), (cx, cy), hub_core_radius
+    )
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (cx - max(1, hub_core_radius // 2), cy - max(1, hub_core_radius // 2)),
+        max(1, int(round(radius * 0.045))),
+    )
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (30, 38, 58, 255)
+        )
+    except Exception:
+        pass
+
+
+def _draw_polished_threads_slider(
+    screen, row_rect, track_rect, value_rect, mx, my
+):
+    """Draw the Engine Settings Threads row inside its original rects.
+
+    ``track_rect`` remains the exact 180x6 mapping track used by clicks
+    and mouse-drag updates. The socket drawn around it, the CPU icon,
+    core ticks/pips, value chip and bubble are presentation only. The
+    thumb centre still uses the smoothed display value exactly as the
+    generic slider did, while the chip/bubble show the staged draft.
+    """
+    global threads_slider_hover_amount, threads_slider_pulse_phase
+
+    values = _threads_slider_values()
+    low = values["low"]
+    high = values["high"]
+    draft = values["draft"]
+    saved = values["saved"]
+    display = values["display"]
+    is_dirty = values["dirty"]
+
+    display_fraction = values["display_fraction"]
+    thumb_x = track_rect.x + int(display_fraction * track_rect.width)
+    thumb_y = track_rect.centery
+    is_dragging = engine_slider_dragging == "threads"
+    thumb_hover = bool(
+        is_dragging
+        or (abs(mx - thumb_x) < 14 and abs(my - thumb_y) < 14)
+        or track_rect.collidepoint(mx, my)
+    )
+
+    hover_target = 1.0 if thumb_hover else 0.0
+    threads_slider_hover_amount += (
+        hover_target - threads_slider_hover_amount
+    ) * 0.24
+    if abs(hover_target - threads_slider_hover_amount) < 0.01:
+        threads_slider_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, threads_slider_hover_amount)
+    )
+    if is_dragging:
+        phase_step = 0.16
+    elif thumb_hover:
+        phase_step = 0.11
+    elif is_dirty:
+        phase_step = 0.025
+    else:
+        phase_step = 0.0
+    if phase_step:
+        threads_slider_pulse_phase = (
+            threads_slider_pulse_phase + phase_step
+        ) % (2.0 * math.pi)
+    phase = threads_slider_pulse_phase
+    active_amount = 1.0 if is_dragging else hover_amount
+
+    # Halo and indigo-steel row body, tinted amber when the staged value
+    # differs from the saved one.
+    glow_colour = (255, 196, 92) if is_dirty else (96, 174, 255)
+    glow_strength = max(hover_amount, 0.20 if is_dirty else 0.0)
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (row_rect.width + 16, row_rect.height + 16), pygame.SRCALPHA
+        )
+        for inset, alpha in ((1, 13), (4, 21), (7, 31)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (row_rect.x - 8, row_rect.y - 8))
+
+    pygame.draw.rect(
+        screen, (17, 21, 34), row_rect.move(0, 2), border_radius=6
+    )
+    if is_dragging:
+        top_colour, bottom_colour = (74, 84, 112), (46, 53, 76)
+        border_colour = (174, 203, 255)
+    elif thumb_hover:
+        top_colour, bottom_colour = (84, 94, 124), (52, 60, 88)
+        border_colour = (174, 203, 255)
+    else:
+        top_colour, bottom_colour = (67, 74, 96), (43, 48, 68)
+        border_colour = (126, 140, 180)
+    if is_dirty:
+        border_colour = _lerp_color(
+            border_colour, (255, 200, 104), 0.38
+        )
+
+    body = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    denom = max(1, row_rect.height - 1)
+    for body_row in range(row_rect.height):
+        colour = _lerp_color(
+            top_colour, bottom_colour, body_row / denom
+        )
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, body_row),
+            (row_rect.width - 1, body_row),
+        )
+
+    overlay = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(8 + 13 * hover_amount)),
+        [
+            (-18, row_rect.height),
+            (row_rect.width * 0.38, 0),
+            (row_rect.width * 0.56, 0),
+            (row_rect.width * 0.16, row_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(58 + 40 * hover_amount)),
+        (8, 1),
+        (row_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 20),
+        (2, 7),
+        (2, row_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 30),
+        (0, row_rect.height - 4, row_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 23),
+        (row_rect.width - 3, 6, 3, row_rect.height - 12),
+        border_radius=2,
+    )
+    trace_alpha = int(17 + 23 * hover_amount)
+    trace_colour = (170, 214, 255, trace_alpha)
+    for trace in (
+        [(112, 9), (138, 9), (147, 16), (171, 16)],
+        [(112, 54), (136, 54), (145, 47), (169, 47)],
+        [(418, 9), (443, 9), (452, 16), (468, 16)],
+    ):
+        pygame.draw.lines(overlay, trace_colour, False, trace, 1)
+        for node in (trace[0], trace[-1]):
+            pygame.draw.circle(overlay, trace_colour, node, 2)
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask, (255, 255, 255, 255), mask.get_rect(), border_radius=6
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, row_rect.topleft)
+    pygame.draw.rect(screen, border_colour, row_rect, 2, border_radius=6)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        row_rect.inflate(-3, -3),
+        1,
+        border_radius=5,
+    )
+
+    _draw_threads_cpu_icon(
+        screen,
+        row_rect.x + 27,
+        row_rect.centery,
+        31,
+        hover_amount=active_amount,
+        phase=phase,
+        fraction=display_fraction,
+    )
+    label_colour = _lerp_color(
+        (232, 238, 250), (255, 255, 255), hover_amount
+    )
+    label = font_small.render("Threads", True, label_colour)
+    label_rect = label.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery - 10)
+    )
+    label_shadow = font_small.render("Threads", True, (18, 22, 36))
+    screen.blit(label_shadow, label_rect.move(0, 1))
+    screen.blit(label, label_rect)
+    subtitle = font_tiny.render(
+        "CPU cores",
+        True,
+        _lerp_color((150, 170, 205), (190, 220, 255), hover_amount),
+    )
+    subtitle_rect = subtitle.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery + 13)
+    )
+    subtitle_shadow = font_tiny.render("CPU cores", True, (18, 22, 36))
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    # A deeper socket and groove are drawn around, but never replace, the
+    # original 180x6 mapping track.
+    socket_rect = track_rect.inflate(10, 10)
+    groove_rect = track_rect.inflate(4, 4)
+    pygame.draw.rect(
+        screen,
+        (13, 18, 30),
+        socket_rect.move(0, 1),
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (25, 31, 48), socket_rect, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color((82, 96, 130), (165, 195, 240), hover_amount),
+        socket_rect,
+        1,
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (38, 45, 64), groove_rect, border_radius=5)
+    pygame.draw.rect(
+        screen, (18, 24, 40), groove_rect, 1, border_radius=5
+    )
+
+    fill_end_x = max(groove_rect.x + 4, thumb_x)
+    fill_width = max(
+        0, min(groove_rect.width, fill_end_x - groove_rect.x)
+    )
+    if fill_width > 0:
+        fill_surface = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_denom = max(1, groove_rect.width - 1)
+        for fill_x in range(groove_rect.width):
+            colour = _lerp_color(
+                (64, 124, 240),
+                (112, 211, 255),
+                fill_x / fill_denom,
+            )
+            pygame.draw.line(
+                fill_surface,
+                (*colour, 255),
+                (fill_x, 0),
+                (fill_x, groove_rect.height - 1),
+            )
+        fill_overlay = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        pygame.draw.line(
+            fill_overlay,
+            (255, 255, 255, int(80 + 45 * hover_amount)),
+            (2, 1),
+            (groove_rect.width - 3, 1),
+            1,
+        )
+        pygame.draw.rect(
+            fill_overlay,
+            (0, 0, 0, 42),
+            (0, groove_rect.height - 3, groove_rect.width, 3),
+        )
+        fill_surface.blit(fill_overlay, (0, 0))
+        fill_mask = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_mask.fill((0, 0, 0, 0))
+        pygame.draw.rect(
+            fill_mask,
+            (255, 255, 255, 255),
+            fill_mask.get_rect(),
+            border_radius=5,
+        )
+        fill_surface.blit(
+            fill_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT
+        )
+        screen.blit(
+            fill_surface,
+            groove_rect.topleft,
+            area=pygame.Rect(0, 0, fill_width, groove_rect.height),
+        )
+
+    def fraction_to_x(fraction):
+        return track_rect.x + int(fraction * track_rect.width)
+
+    saved_x = fraction_to_x(values["saved_fraction"])
+    draft_x = fraction_to_x(values["draft_fraction"])
+
+    # Core-bank dividers in the groove and matching pips underneath. The
+    # pips light from the same smoothed display value as the fill/thumb.
+    for tick_value in _threads_slider_tick_values(low, high):
+        tick_fraction = (
+            1.0 if high <= low else (tick_value - low) / (high - low)
+        )
+        tick_x = fraction_to_x(tick_fraction)
+        tick_active = tick_value <= display + 1e-9
+        pygame.draw.line(
+            screen,
+            (30, 67, 118) if tick_active else (79, 92, 118),
+            (tick_x, groove_rect.y + 2),
+            (tick_x, groove_rect.bottom - 3),
+            1,
+        )
+        pip_centre = (tick_x, track_rect.centery + 17)
+        pygame.draw.circle(
+            screen, (13, 18, 30), (pip_centre[0], pip_centre[1] + 1), 2
+        )
+        pip_colour = (
+            _lerp_color(
+                (96, 174, 255), (190, 230, 255), hover_amount
+            )
+            if tick_active
+            else (76, 88, 112)
+        )
+        pygame.draw.circle(screen, pip_colour, pip_centre, 2)
+
+    # Travelling data pulses on three lanes of the active fill.
+    if hover_amount > 0.03 and fill_width > 8:
+        for lane in range(3):
+            pulse_t = (phase / (2.0 * math.pi) + lane / 3.0) % 1.0
+            pulse_x = int(
+                groove_rect.x + 2 + pulse_t * max(1, fill_width - 4)
+            )
+            pulse_y = track_rect.centery + (lane - 1) * 3
+            pygame.draw.circle(
+                screen,
+                _lerp_color(
+                    (150, 215, 255), (255, 255, 255), hover_amount
+                ),
+                (pulse_x, pulse_y),
+                1,
+            )
+
+    # Saved value: a small ivory diamond above the socket. Staged target:
+    # an amber needle when it differs from saved or the smoothed thumb is
+    # still travelling toward it.
+    saved_marker_y = socket_rect.y - 4
+    pygame.draw.polygon(
+        screen,
+        (18, 24, 40),
+        [
+            (saved_x, saved_marker_y - 3),
+            (saved_x + 3, saved_marker_y),
+            (saved_x, saved_marker_y + 3),
+            (saved_x - 3, saved_marker_y),
+        ],
+    )
+    pygame.draw.polygon(
+        screen,
+        (235, 240, 248),
+        [
+            (saved_x, saved_marker_y - 2),
+            (saved_x + 2, saved_marker_y),
+            (saved_x, saved_marker_y + 2),
+            (saved_x - 2, saved_marker_y),
+        ],
+    )
+    if is_dirty or abs(draft_x - thumb_x) > 2:
+        pygame.draw.line(
+            screen,
+            (255, 200, 104),
+            (draft_x, socket_rect.y - 1),
+            (draft_x, socket_rect.bottom),
+            1,
+        )
+        pygame.draw.polygon(
+            screen,
+            (255, 200, 104),
+            [
+                (draft_x - 3, socket_rect.bottom + 4),
+                (draft_x + 3, socket_rect.bottom + 4),
+                (draft_x, socket_rect.bottom),
+            ],
+        )
+
+    if hover_amount > 0.01:
+        thumb_glow = pygame.Surface((42, 42), pygame.SRCALPHA)
+        for glow_radius, glow_alpha in ((18, 18), (15, 28), (12, 40)):
+            pygame.draw.circle(
+                thumb_glow,
+                (96, 174, 255, int(glow_alpha * hover_amount)),
+                (21, 21),
+                glow_radius,
+            )
+        screen.blit(
+            thumb_glow, thumb_glow.get_rect(center=(thumb_x, thumb_y))
+        )
+    thumb_radius = 11 + (1 if is_dragging else int(round(hover_amount)))
+    _draw_threads_slider_thumb(
+        screen,
+        thumb_x,
+        thumb_y,
+        thumb_radius,
+        hover_amount=hover_amount,
+        dragging=is_dragging,
+        phase=phase,
+    )
+
+    # Staged-value chip inside the original value rect, with the existing
+    # dirty-dot position upgraded to a small amber badge on its corner.
+    chip_rect = pygame.Rect(
+        value_rect.x + 3, row_rect.y + 13, value_rect.width - 6, 38
+    )
+    pygame.draw.rect(
+        screen, (14, 19, 32), chip_rect.move(0, 1), border_radius=8
+    )
+    chip_bg = (48, 58, 84) if thumb_hover else (38, 46, 68)
+    chip_border = (
+        (255, 200, 104)
+        if is_dirty
+        else (165, 195, 240)
+        if thumb_hover
+        else (105, 120, 155)
+    )
+    pygame.draw.rect(screen, chip_bg, chip_rect, border_radius=8)
+    pygame.draw.rect(screen, chip_border, chip_rect, 1, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(chip_border, (255, 255, 255), 0.28),
+        chip_rect.inflate(-3, -3),
+        1,
+        border_radius=6,
+    )
+    value_colour = (
+        TEXT_ACCENT
+        if is_dirty
+        else (255, 255, 255)
+        if thumb_hover or is_dragging
+        else TEXT_COLOR
+    )
+    value_text = str(draft)
+    value_font = font_small
+    value_surface = value_font.render(value_text, True, value_colour)
+    if value_surface.get_width() > chip_rect.width - 10:
+        value_font = font_tiny
+        value_surface = value_font.render(value_text, True, value_colour)
+    screen.blit(
+        value_surface,
+        value_surface.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery - 7)
+        ),
+    )
+    denominator = font_tiny.render(
+        f"of {high}",
+        True,
+        _lerp_color((145, 165, 200), (190, 220, 255), hover_amount),
+    )
+    screen.blit(
+        denominator,
+        denominator.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery + 11)
+        ),
+    )
+    if is_dirty:
+        badge = (value_rect.right - 6, value_rect.centery - 14)
+        pygame.draw.circle(screen, (43, 29, 9), (badge[0], badge[1] + 1), 4)
+        pygame.draw.circle(screen, (255, 200, 80), badge, 4)
+        pygame.draw.circle(screen, (255, 236, 178), badge, 4, 1)
+        pygame.draw.circle(
+            screen, (255, 255, 255), (badge[0] - 1, badge[1] - 1), 1
+        )
+
+    # Three short parallel lanes fill the row's spare right-hand space and
+    # light progressively as the smoothed Threads fraction rises.
+    lane_x0 = chip_rect.right + 10
+    lane_x1 = row_rect.right - 16
+    if lane_x1 > lane_x0 + 12:
+        for lane in range(3):
+            lane_y = row_rect.centery + (lane - 1) * 12
+            lane_active = display_fraction >= lane / 3.0
+            lane_colour = (
+                _lerp_color(
+                    (96, 174, 255), (170, 225, 255), hover_amount
+                )
+                if lane_active
+                else (58, 68, 92)
+            )
+            pygame.draw.line(
+                screen,
+                (15, 20, 34),
+                (lane_x0, lane_y + 1),
+                (lane_x1, lane_y + 1),
+                3,
+            )
+            pygame.draw.line(
+                screen,
+                (43, 52, 76),
+                (lane_x0, lane_y),
+                (lane_x1, lane_y),
+                3,
+            )
+            if lane_active:
+                pygame.draw.line(
+                    screen,
+                    lane_colour,
+                    (lane_x0, lane_y),
+                    (lane_x1, lane_y),
+                    2,
+                )
+                if hover_amount > 0.03:
+                    pulse_t = (
+                        phase / (2.0 * math.pi) + lane * 0.21
+                    ) % 1.0
+                    pulse_x = int(
+                        lane_x0 + pulse_t * (lane_x1 - lane_x0)
+                    )
+                    pygame.draw.circle(
+                        screen,
+                        (255, 255, 255),
+                        (pulse_x, lane_y),
+                        1,
+                    )
+            pygame.draw.circle(
+                screen, (15, 20, 34), (lane_x1, lane_y + 1), 3
+            )
+            pygame.draw.circle(screen, lane_colour, (lane_x1, lane_y), 3)
+            pygame.draw.circle(
+                screen,
+                (18, 26, 44),
+                (lane_x1, lane_y),
+                3,
+                1,
+            )
+
+    # A compact bubble above the thumb while hovering/dragging. It stays
+    # inside the Threads row, so it cannot cover the safe-limits header or
+    # the Skill row below.
+    if thumb_hover or is_dragging:
+        if is_dirty:
+            bubble_text = f"Unsaved · {draft} of {high} · saved {saved}"
+        else:
+            bubble_text = f"{draft} of {high} threads"
+        bubble_text = _elide_text(bubble_text, font_tiny, 210)
+        bubble = font_tiny.render(bubble_text, True, TEXT_COLOR)
+        tip_w = bubble.get_width() + 14
+        tip_h = 20
+        min_tip_x = row_rect.x + 116
+        max_tip_x = max(min_tip_x, chip_rect.x - tip_w - 6)
+        tip_x = max(
+            min_tip_x,
+            min(thumb_x - tip_w // 2, max_tip_x),
+        )
+        tip_rect = pygame.Rect(tip_x, row_rect.y + 3, tip_w, tip_h)
+        pygame.draw.rect(
+            screen, (18, 24, 40), tip_rect, border_radius=6
+        )
+        pygame.draw.rect(
+            screen, chip_border, tip_rect, 1, border_radius=6
+        )
+        pointer_x = max(
+            tip_rect.x + 7,
+            min(thumb_x, tip_rect.right - 7),
+        )
+        pygame.draw.polygon(
+            screen,
+            (18, 24, 40),
+            [
+                (pointer_x - 4, tip_rect.bottom - 1),
+                (pointer_x + 4, tip_rect.bottom - 1),
+                (
+                    pointer_x,
+                    min(socket_rect.y - 1, tip_rect.bottom + 5),
+                ),
+            ],
+        )
+        screen.blit(bubble, bubble.get_rect(center=tip_rect.center))
+
+    return thumb_x, thumb_y
+
+
 def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
 
@@ -8957,6 +9811,12 @@ def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
 
     for i, key in enumerate(ENGINE_ROW_KEYS):
         row_rect, track_rect, value_rect = get_engine_slider_rects(i, offset_x, offset_y)
+
+        if key == "threads":
+            _draw_polished_threads_slider(
+                screen, row_rect, track_rect, value_rect, mx, my
+            )
+            continue
 
         pygame.draw.rect(screen, (55, 55, 55), row_rect, border_radius=6)
         pygame.draw.rect(screen, MENU_BORDER_COLOR, row_rect, 2, border_radius=6)
