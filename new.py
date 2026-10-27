@@ -846,6 +846,9 @@ flip_button_rect = pygame.Rect(
 # change settings_button_rect (the actual click target).
 settings_gear_rotation = 0.0
 settings_gear_hover_amount = 0.0
+# Matching visual-only hover/sparkle state for the New Game button.
+new_game_hover_amount = 0.0
+new_game_sparkle_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -2891,21 +2894,307 @@ def draw_gear_icon(surface, cx, cy, size, color, thickness=2, rotation=0.0):
     surface.blit(icon, icon.get_rect(center=(int(cx), int(cy))))
 
 
-def draw_new_game_button(screen, mouse_pos):
-    if menu_anim_progress == 0:
-        color = (
-            BUTTON_HOVER_COLOR
-            if new_game_button_rect.collidepoint(mouse_pos)
-            else BUTTON_COLOR
+def _draw_new_game_icon(surface, cx, cy, radius, hover_amount, sparkle_phase):
+    """Draw the New button's circled-plus badge and tiny hover sparkle."""
+    cx, cy, radius = int(cx), int(cy), max(5, int(radius))
+
+    # Layered badge: offset shadow, pale face, inner ring and dark rim.
+    pygame.draw.circle(surface, (17, 45, 27), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, (233, 250, 237), (cx, cy), radius)
+    pygame.draw.circle(
+        surface, (196, 238, 207), (cx, cy), max(3, radius - 2)
+    )
+    pygame.draw.circle(surface, (24, 82, 43), (cx, cy), radius, 1)
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (24, 82, 43, 255)
         )
-        pygame.draw.rect(screen, color, new_game_button_rect, border_radius=4)
-        pygame.draw.rect(
-            screen, MENU_BORDER_COLOR, new_game_button_rect, 2, border_radius=4
+        pygame.gfxdraw.aacircle(
+            surface,
+            cx,
+            cy,
+            max(3, radius - 2),
+            (112, 190, 132, 255),
+        )
+    except Exception:
+        pass
+
+    # A fine upper-left glint makes the badge read as a little enamelled
+    # disc rather than a flat white circle.
+    glint_x = cx - max(2, radius // 3)
+    glint_y = cy - max(2, radius // 3)
+    pygame.draw.circle(surface, (255, 255, 255), (glint_x, glint_y), 1)
+
+    # Plus sign with a one-pixel lower shadow for a lightly embossed feel.
+    arm = max(3, radius - 3)
+    for y_offset, colour in ((1, (151, 205, 165)), (0, (24, 96, 49))):
+        pygame.draw.line(
+            surface,
+            colour,
+            (cx - arm, cy + y_offset),
+            (cx + arm, cy + y_offset),
+            2,
+        )
+        pygame.draw.line(
+            surface,
+            colour,
+            (cx, cy - arm + y_offset),
+            (cx, cy + arm + y_offset),
+            2,
         )
 
-        text = font_small.render("New", True, TEXT_COLOR)
-        text_rect = text.get_rect(center=new_game_button_rect.center)
-        screen.blit(text, text_rect)
+    # A four-point sparkle perched on the badge's upper-right rim. It is
+    # just a dot at rest and gently grows/pulses during hover.
+    sparkle_cx = cx + radius - 1
+    sparkle_cy = cy - radius + 1
+    sparkle_r = 1.6 + 1.5 * hover_amount + (
+        0.35 * math.sin(sparkle_phase) if hover_amount > 0.02 else 0.0
+    )
+    if sparkle_r >= 2.0:
+        waist = sparkle_r * 0.30
+        points = [
+            (sparkle_cx, sparkle_cy - sparkle_r),
+            (sparkle_cx + waist, sparkle_cy - waist),
+            (sparkle_cx + sparkle_r, sparkle_cy),
+            (sparkle_cx + waist, sparkle_cy + waist),
+            (sparkle_cx, sparkle_cy + sparkle_r),
+            (sparkle_cx - waist, sparkle_cy + waist),
+            (sparkle_cx - sparkle_r, sparkle_cy),
+            (sparkle_cx - waist, sparkle_cy - waist),
+        ]
+        pygame.draw.polygon(surface, (255, 239, 157), points)
+        pygame.draw.polygon(surface, (122, 96, 22), points, 1)
+    else:
+        pygame.draw.circle(
+            surface, (255, 239, 157), (sparkle_cx, sparkle_cy), 1
+        )
+
+
+def draw_new_game_button(screen, mouse_pos):
+    """Draw the polished emerald New Game top-bar button."""
+    global new_game_hover_amount, new_game_sparkle_phase
+    if menu_anim_progress != 0:
+        return
+
+    rect = new_game_button_rect
+    hovered = rect.collidepoint(mouse_pos)
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    new_game_hover_amount += (hover_target - new_game_hover_amount) * 0.22
+    if abs(hover_target - new_game_hover_amount) < 0.01:
+        new_game_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, new_game_hover_amount))
+    if hovered:
+        new_game_sparkle_phase = (
+            new_game_sparkle_phase + 0.12
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    # Emerald halo behind the primary action on hover.
+    if hover_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 16, visual_rect.height + 16),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 17), (4, 27), (7, 40)):
+            pygame.draw.rect(
+                glow,
+                (74, 205, 120, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 8, visual_rect.y - 8))
+
+    # Ground shadow, tightened in the pressed state.
+    pygame.draw.rect(
+        screen,
+        (14, 27, 19),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=9,
+    )
+
+    if pressed:
+        top_colour = (45, 86, 59)
+        bottom_colour = (31, 61, 42)
+        border_colour = (105, 190, 129)
+    elif hovered:
+        top_colour = (94, 143, 109)
+        bottom_colour = (52, 94, 67)
+        border_colour = (152, 226, 172)
+    else:
+        top_colour = (73, 112, 87)
+        bottom_colour = (42, 71, 54)
+        border_colour = (116, 164, 132)
+
+    # Rounded emerald-metal body. As with the settings button, translucent
+    # sheen/shading is composited via an overlay to preserve the gradient's
+    # alpha correctly, then everything is clipped with a rounded mask.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(11 + 18 * hover_amount)),
+        [
+            (-8, visual_rect.height),
+            (visual_rect.width * 0.43, 0),
+            (visual_rect.width * 0.66, 0),
+            (visual_rect.width * 0.12, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(76 + 46 * hover_amount)),
+        (6, 1),
+        (visual_rect.width - 7, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 24),
+        (2, 5),
+        (2, visual_rect.height - 6),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 46 if pressed else 31),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 25),
+        (visual_rect.width - 3, 4, 3, visual_rect.height - 8),
+        border_radius=2,
+    )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=9,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=9)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=7,
+    )
+
+    # Brightening bottom accent, drawn behind the badge/text.
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour, (142, 237, 171), hover_amount
+        )
+        accent_w = int(26 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    # Badge + label are laid out as one centred group. The fallback steps
+    # keep the group inside the fixed 50 px button with wider system fonts.
+    text_colour = _lerp_color(
+        (226, 246, 231), (255, 255, 255), hover_amount
+    )
+    text = font_small.render("New", True, text_colour)
+    icon_radius = 7
+    gap = 4
+    group_w = icon_radius * 2 + gap + text.get_width()
+    if group_w > visual_rect.width - 5:
+        icon_radius = 6
+        gap = 2
+        group_w = icon_radius * 2 + gap + text.get_width()
+    if group_w > visual_rect.width - 4:
+        text = font_tiny.render("New", True, text_colour)
+        group_w = icon_radius * 2 + gap + text.get_width()
+
+    group_x = visual_rect.centerx - group_w // 2
+    icon_cx = group_x + icon_radius
+    _draw_new_game_icon(
+        screen,
+        icon_cx,
+        visual_rect.centery,
+        icon_radius,
+        hover_amount,
+        new_game_sparkle_phase,
+    )
+
+    text_rect = text.get_rect(
+        midleft=(group_x + icon_radius * 2 + gap, visual_rect.centery)
+    )
+    shadow_text = font_small.render("New", True, (17, 45, 27))
+    if shadow_text.get_width() != text.get_width():
+        shadow_text = font_tiny.render("New", True, (17, 45, 27))
+    screen.blit(shadow_text, text_rect.move(0, 1))
+    screen.blit(text, text_rect)
+
+    # Tooltip below the top bar, matching Settings/Flip. Suppressed while
+    # the New Game confirmation or game-over dialog owns the screen.
+    if (
+        hovered
+        and not pressed
+        and not show_newgame_confirm
+        and not show_game_over
+    ):
+        tip = font_tiny.render("Start a new game", True, TEXT_COLOR)
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(visual_rect.centerx - tip_w // 2, WIDTH - tip_w - 4),
+        )
+        tip_y = min(visual_rect.bottom + 7, HEIGHT - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (22, 28, 24), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen, (152, 226, 172), tip_rect, 1, border_radius=7
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (22, 28, 24),
+            [
+                (pointer_x - 5, tip_rect.y + 1),
+                (pointer_x + 5, tip_rect.y + 1),
+                (pointer_x, max(visual_rect.bottom + 1, tip_rect.y - 5)),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 
 def draw_settings_button(screen, mouse_pos):
