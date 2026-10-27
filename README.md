@@ -41,6 +41,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Info panel:** opening name (from `openings.json`), game status (`Check!` / `Draw — …`), stats, opening/rec-move row
 - **Top bar:** a polished brass **Flip** button — miniature board between chunky ivory/charcoal exchange arrows whose colours ease-swap with board orientation, plus hover/pressed states and a perspective tooltip — alongside a polished emerald `New` button with circled-plus badge and hover sparkle, and a polished metallic settings button with a supersampled cog featuring beveled teeth, rim, bolts and hub that slowly turns while hovered → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
 - **Settings pages:**
+  - **Header Close/X** — polished ruby pill with a ringed central seal and tapered X arms; hover eases in its halo and “Close Settings” tooltip, while the X folds inward as the overlay closes
   - **Pieces Styles** — visual, scrollable style cards with sample pieces on board-coloured squares, source/current-state labels, hover highlighting, and a full 12-piece preview using the active board colours
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
   - **Engine Settings** — sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), and `MultiPV` (1-5); saving a changed MultiPV value immediately recalculates the current board
@@ -104,6 +105,7 @@ python new.py --help
 | **Flip** (top bar) or **F** | Flip the board perspective; the brass button's ivory/charcoal arrows ease-swap colours and its tooltip names the side you will view from |
 | **New** (top bar) | Smooth animated reset to starting position and clear eval; hovering shows its polished emerald glow/sparkle state and “Start a new game” tooltip |
 | **Gear** (top bar) | Open Settings overlay; hovering brightens the button, turns the detailed cog slowly, and shows a “Settings” tooltip |
+| **X** (Settings header) | Close Settings; hovering shows the polished ruby seal/button state and a right-edge-clamped “Close Settings” tooltip, and the X folds as the overlay closes |
 | **Mouse drag on slider** (Engine Settings) | Adjust Threads/Skill/Hash/Depth live |
 | **Github / Restart** (About) | Open repo in browser / restart via start.bat; hovering GitHub animates its cat medallion and external-link arrow, while hovering Restart turns its circular-arrow medallion, lights the status dots, and clicking it briefly shows “Restarting…” |
 | **Always on Top** (Settings main menu) | Toggle whether the ChessBotV window stays above other windows; the stacked-window icon, row and switch track cross-fade between slate/off and emerald/on |
