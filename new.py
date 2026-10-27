@@ -888,8 +888,16 @@ analysis_settings_button_pulse_phase = 0.0
 menu_anim_progress = 0.0
 menu_anim_opening = False
 menu_anim_closing = False
-menu_anim_speed = 0.09
-menu_anim_close_speed = 0.11
+menu_anim_speed = 0.075
+menu_anim_close_speed = 0.09
+# Visual-only choreography for the whole Settings shell. ``progress`` above
+# remains the behavioural open/closed amount; these values remember which
+# way the shell is travelling, where its reveal rings should anchor, and how
+# far its gear/ring accents have turned. They never alter click handling:
+# menu interactions still wait for a fully settled, transition-idle page.
+settings_menu_anim_direction = "none"  # "none" | "opening" | "closing"
+settings_menu_anim_origin = settings_button_rect.center
+settings_menu_anim_phase = 0.0
 restart_requested = False
 
 # --- Opening Tracking ---
@@ -1019,6 +1027,20 @@ def cubic_ease_in(t):
     """Cubic ease-in: starts slowly, then accelerates into place."""
     t = max(0.0, min(1.0, float(t)))
     return t * t * t
+
+
+def cubic_ease_out(t):
+    """Cubic ease-out: arrives quickly, then settles gently."""
+    t = max(0.0, min(1.0, float(t)))
+    return 1.0 - (1.0 - t) ** 3
+
+
+def cubic_ease_out_back(t, overshoot=1.25):
+    """Cubic ease-out with a restrained overshoot just before settling."""
+    t = max(0.0, min(1.0, float(t)))
+    c1 = float(overshoot)
+    c3 = c1 + 1.0
+    return 1.0 + c3 * (t - 1.0) ** 3 + c1 * (t - 1.0) ** 2
 
 
 def cubic_ease_in_out(t):
@@ -1584,23 +1606,322 @@ def get_game_result(board):
     return None
 
 
+def begin_settings_menu_open():
+    """Start the Settings shell's opening choreography from the gear."""
+    global menu_anim_opening, menu_anim_closing
+    global settings_menu_anim_direction, settings_menu_anim_origin
+    global settings_menu_anim_phase
+
+    if menu_anim_opening or (menu_anim_progress >= 1.0 and not menu_anim_closing):
+        return False
+    menu_anim_opening = True
+    menu_anim_closing = False
+    settings_menu_anim_direction = "opening"
+    settings_menu_anim_origin = settings_button_rect.center
+    settings_menu_anim_phase = 0.0
+    return True
+
+
+def begin_settings_menu_close(origin=None):
+    """Start the Settings shell's dedicated closing choreography.
+
+    ``origin`` is only the visual anchor for the contracting reveal rings;
+    the Close/X passes its own centre, while Esc/restart/Auto-play exits
+    return toward the top-bar Settings gear by default.
+    """
+    global menu_anim_opening, menu_anim_closing
+    global settings_menu_anim_direction, settings_menu_anim_origin
+    global settings_menu_anim_phase
+
+    if menu_anim_closing or menu_anim_progress <= 0.0:
+        return False
+    menu_anim_opening = False
+    menu_anim_closing = True
+    settings_menu_anim_direction = "closing"
+    settings_menu_anim_phase = 0.0
+    try:
+        origin_x, origin_y = origin
+        settings_menu_anim_origin = (int(origin_x), int(origin_y))
+    except Exception:
+        settings_menu_anim_origin = settings_button_rect.center
+    return True
+
+
+def _settings_menu_presentation(progress=None, opening=None, closing=None):
+    """Visual shell values for one Settings open/close frame.
+
+    Opening uses a fast-arriving cubic-out presence: the backdrop and
+    reveal rings lead slightly, then the content scales/fades up into
+    place. Closing is not merely that curve played backwards at the raw
+    progress level; its presence holds for a beat and then accelerates
+    away with a cubic-in exit, a smaller scale change and a shorter sink.
+    At rest this returns the identity transform, so settled rendering and
+    every click rect remain exactly as before.
+    """
+    try:
+        raw = float(menu_anim_progress if progress is None else progress)
+    except Exception:
+        raw = 0.0
+    raw = max(0.0, min(1.0, raw))
+
+    opening_flag = bool(menu_anim_opening if opening is None else opening)
+    closing_flag = bool(menu_anim_closing if closing is None else closing)
+    if opening_flag and closing_flag:
+        if settings_menu_anim_direction == "closing":
+            opening_flag = False
+        else:
+            closing_flag = False
+
+    if closing_flag:
+        direction = "closing"
+    elif opening_flag:
+        direction = "opening"
+    elif raw < 1.0:
+        direction = (
+            settings_menu_anim_direction
+            if settings_menu_anim_direction in ("opening", "closing")
+            else "opening"
+        )
+    else:
+        direction = "none"
+
+    if direction == "closing":
+        presence = 1.0 - cubic_ease_in(1.0 - raw)
+        backdrop = presence
+        reveal = presence
+        content_alpha = int(round(255 * presence))
+        content_scale = 0.972 + 0.028 * presence
+        content_y_offset = int(round((1.0 - presence) * 20))
+    elif direction == "opening":
+        presence = cubic_ease_out(raw)
+        backdrop = cubic_ease_out(min(1.0, raw * 1.08))
+        reveal = cubic_ease_out(min(1.0, raw * 1.22))
+        content_alpha = int(
+            round(255 * min(1.0, 0.16 + 0.84 * presence))
+        )
+        content_scale = 0.962 + 0.038 * presence
+        content_y_offset = int(round((1.0 - presence) * 30))
+    else:
+        presence = 1.0
+        backdrop = 1.0
+        reveal = 1.0
+        content_alpha = 255
+        content_scale = 1.0
+        content_y_offset = 0
+
+    try:
+        origin_x, origin_y = settings_menu_anim_origin
+        origin = (int(origin_x), int(origin_y))
+    except Exception:
+        origin = settings_button_rect.center
+
+    return {
+        "raw": raw,
+        "direction": direction,
+        "animating": direction != "none",
+        "presence": max(0.0, min(1.0, presence)),
+        "backdrop_alpha": int(round(180 * backdrop)),
+        "reveal": max(0.0, min(1.0, reveal)),
+        "content_alpha": max(0, min(255, content_alpha)),
+        "content_scale": max(0.1, min(1.0, content_scale)),
+        "content_y_offset": content_y_offset,
+        "origin": origin,
+        "phase": settings_menu_anim_phase,
+    }
+
+
+def _settings_main_item_slide(index, count, presentation):
+    """Per-row cascade offset for the Settings main menu.
+
+    Rows arrive top-to-bottom with a slight overshoot. On close the same
+    local-presence ordering makes the last-arriving lower rows leave
+    first, while the first row remains anchored for a moment longer.
+    """
+    if not presentation.get("animating"):
+        return 0
+    try:
+        index = int(index)
+        count = max(1, int(count))
+    except Exception:
+        return 0
+    index = max(0, min(count - 1, index))
+    # Use raw shell progress for the cascade itself. The shell's eased
+    # presence is deliberately front-loaded for scale/fade, and using it
+    # here too would make all four rows arrive in the first few frames.
+    raw = max(0.0, min(1.0, float(presentation.get("raw", 1.0))))
+
+    if presentation.get("direction") == "closing":
+        local = max(
+            0.0,
+            min(1.0, (raw - index * 0.05) / 0.85),
+        )
+        eased = cubic_ease_in_out(local)
+        return int(round((1.0 - eased) * 18))
+
+    local = max(
+        0.0,
+        min(1.0, (raw - index * 0.06) / 0.78),
+    )
+    eased = cubic_ease_out_back(local, overshoot=1.25)
+    return int(round((1.0 - eased) * 20))
+
+
+def _draw_settings_menu_reveal(surface, presentation):
+    """Draw the shell's expanding/contracting rings and gear echo."""
+    if not presentation.get("animating"):
+        return
+
+    presence = max(0.0, min(1.0, float(presentation.get("presence", 1.0))))
+    reveal = max(0.0, min(1.0, float(presentation.get("reveal", presence))))
+    strength = 1.0 - presence
+    if strength <= 0.01:
+        return
+
+    origin = presentation.get("origin", settings_button_rect.center)
+    try:
+        origin_x, origin_y = int(origin[0]), int(origin[1])
+    except Exception:
+        origin_x, origin_y = settings_button_rect.center
+    phase = float(presentation.get("phase", settings_menu_anim_phase))
+
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+
+    # Two soft sonar-like rings expand from (or collect back toward) the
+    # anchor while the content itself performs the scale/fade. Keeping
+    # these as rings rather than a faux panel avoids a stray rectangular
+    # edge crossing pages whose content already spans the whole window.
+    max_radius = math.hypot(
+        max(origin_x, WIDTH - origin_x),
+        max(origin_y, HEIGHT - origin_y),
+    )
+    for radius_factor, alpha_factor in ((1.0, 54), (0.68, 30)):
+        radius = int(round(max_radius * reveal * radius_factor))
+        if radius > 10:
+            pygame.draw.circle(
+                overlay,
+                (120, 165, 255, int(alpha_factor * strength)),
+                (origin_x, origin_y),
+                radius,
+                2,
+            )
+
+    # Short rotating ticks around the anchor give the first/last frames a
+    # mechanical link to the Settings cog without moving any click target.
+    tick_radius = 23.0 + 3.0 * math.sin(phase)
+    tick_alpha = int(132 * strength)
+    if tick_alpha > 0:
+        for tick_index in range(8):
+            angle = phase + tick_index * (math.tau / 8.0)
+            start = (
+                origin_x + (tick_radius - 3.0) * math.cos(angle),
+                origin_y + (tick_radius - 3.0) * math.sin(angle),
+            )
+            end = (
+                origin_x + (tick_radius + 3.0) * math.cos(angle),
+                origin_y + (tick_radius + 3.0) * math.sin(angle),
+            )
+            pygame.draw.aaline(
+                overlay,
+                (175, 205, 255, tick_alpha),
+                start,
+                end,
+            )
+    surface.blit(overlay, (0, 0))
+
+    # The actual top-bar cog is hidden while Settings owns the screen, so
+    # echo it beneath the transforming content. It spins out on open and
+    # becomes the landing point that the real button replaces on close.
+    gear_alpha = int(205 * strength)
+    if gear_alpha > 4:
+        gear_surface = pygame.Surface((58, 58), pygame.SRCALPHA)
+        gear_colour = _lerp_color(
+            GEAR_COLOR,
+            GEAR_COLOR_HOVER,
+            max(0.0, min(1.0, settings_gear_hover_amount)),
+        )
+        draw_gear_icon(
+            gear_surface,
+            29,
+            29,
+            11.0 + 3.5 * strength,
+            gear_colour,
+            thickness=2,
+            rotation=settings_gear_rotation,
+        )
+        gear_surface.fill(
+            (255, 255, 255, gear_alpha),
+            special_flags=pygame.BLEND_RGBA_MULT,
+        )
+        surface.blit(
+            gear_surface,
+            gear_surface.get_rect(center=settings_button_rect.center),
+        )
+
+
+def _composite_settings_menu_content(destination, content, presentation):
+    """Fade/scale one offscreen Settings frame onto the real screen."""
+    alpha = max(0, min(255, int(presentation.get("content_alpha", 255))))
+    if alpha <= 0:
+        return
+
+    scale = max(0.1, min(1.0, float(presentation.get("content_scale", 1.0))))
+    scaled = content
+    if scale < 0.999:
+        scaled_size = (
+            max(1, int(round(WIDTH * scale))),
+            max(1, int(round(HEIGHT * scale))),
+        )
+        # The shell only travels through the final few percent of scale,
+        # so the fast scaler is visually indistinguishable here while
+        # leaving ample frame budget for the board underneath. Likewise,
+        # SDL's global alpha modulation avoids a second full-window
+        # multiply pass; the surface's per-pixel alpha still applies.
+        scaled = pygame.transform.scale(content, scaled_size)
+    if alpha < 255:
+        scaled.set_alpha(alpha)
+
+    centre = (
+        WIDTH // 2,
+        HEIGHT // 2 + int(presentation.get("content_y_offset", 0)),
+    )
+    destination.blit(scaled, scaled.get_rect(center=centre))
+
+
 def update_menu_animation():
     global menu_anim_progress, menu_anim_opening, menu_anim_closing, settings_menu_open
     global settings_menu_state, settings_menu_target, settings_menu_from
     global menu_transition_progress, menu_transition_direction
+    global settings_menu_anim_direction, settings_menu_anim_phase
+    global settings_gear_rotation
     global theme_scroll_offset
 
     if menu_anim_opening:
+        settings_menu_anim_direction = "opening"
+        settings_menu_anim_phase = (
+            settings_menu_anim_phase + 0.14
+        ) % (2.0 * math.pi)
+        settings_gear_rotation = (
+            settings_gear_rotation + 0.045
+        ) % (2.0 * math.pi)
         menu_anim_progress = min(1.0, menu_anim_progress + menu_anim_speed)
         if menu_anim_progress >= 1.0:
             menu_anim_progress = 1.0
             menu_anim_opening = False
+            settings_menu_anim_direction = "none"
             settings_menu_open = True
     elif menu_anim_closing:
+        settings_menu_anim_direction = "closing"
+        settings_menu_anim_phase = (
+            settings_menu_anim_phase - 0.16
+        ) % (2.0 * math.pi)
+        settings_gear_rotation = (
+            settings_gear_rotation - 0.055
+        ) % (2.0 * math.pi)
         menu_anim_progress = max(0.0, menu_anim_progress - menu_anim_close_speed)
         if menu_anim_progress <= 0.0:
             menu_anim_progress = 0.0
             menu_anim_closing = False
+            settings_menu_anim_direction = "none"
             settings_menu_open = False
             settings_menu_state = "main"
             settings_menu_target = "main"
@@ -6419,7 +6740,7 @@ def start_autoplay_scan(side=None):
         f"Scanning the full board as {side.capitalize()}..."
     )
     try:
-        menu_anim_closing = True
+        begin_settings_menu_close()
     except Exception:
         pass
     thread = threading.Thread(
@@ -10826,19 +11147,39 @@ def draw_settings_menu(screen):
     if menu_anim_progress <= 0.01:
         return
 
+    # During the shell's open/close choreography, render the existing
+    # pages once to an offscreen surface at their settled coordinates and
+    # composite that surface with the presentation scale/fade. At rest
+    # ``screen`` remains the real destination, so final pixels, hover
+    # positions and click rects are exactly the established ones.
+    destination = screen
+    presentation = _settings_menu_presentation()
+    shell_animating = bool(presentation["animating"])
+    content_surface = None
+    if shell_animating:
+        content_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        screen = content_surface
+
     update_menu_transition()
 
     mx, my = pygame.mouse.get_pos()
-    transition_idle = menu_transition_direction == "none" and menu_anim_progress >= 0.99
+    transition_idle = (
+        menu_transition_direction == "none"
+        and menu_anim_progress >= 0.99
+        and not shell_animating
+    )
 
-    # --- Unified eased open/close: single backdrop + slide for all content ---
-    eased = cubic_ease_in_out(max(0.0, min(1.0, menu_anim_progress)))
-    backdrop_alpha = int(eased * 180)
+    # --- Choreographed shell open/close: backdrop, reveal, then pages ---
+    eased = presentation["presence"]
+    backdrop_alpha = presentation["backdrop_alpha"]
     overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, backdrop_alpha))
-    screen.blit(overlay, (0, 0))
-    # Content entrance: slide up and settle as the menu opens.
-    open_slide = int((1 - eased) * 22)
+    destination.blit(overlay, (0, 0))
+    _draw_settings_menu_reveal(destination, presentation)
+    # The composite transform supplies the shared rise/sink. Individual
+    # main-menu rows add only their staggered cascade below, avoiding the
+    # old double-slide where every element shared one 22 px offset.
+    open_slide = 0
 
     # --- Page switching ---
     # The outgoing and incoming pages are drawn at the same time and slide
@@ -10872,11 +11213,13 @@ def draw_settings_menu(screen):
             start_y = (HEIGHT - total_menu_height) // 2
 
             for i, item in enumerate(menu_items):
-                # Staggered entrance while the menu itself is opening.
-                item_delay = i * 0.06
-                item_eased = max(0.0, min(1.0, (eased - item_delay) / 0.82)) if eased > item_delay else 0.0
-                item_slide = int((1 - (cubic_ease_in_out(item_eased) if item_eased > 0 else 0)) * 14) if eased < 0.99 else 0
-                y_slide = open_slide + item_slide if eased < 1.0 else 0
+                # Rows cascade in on open and collect back out in reverse
+                # arrival order on close; the shell composite handles the
+                # shared scale/fade/rise around these local offsets.
+                item_slide = _settings_main_item_slide(
+                    i, len(menu_items), presentation
+                )
+                y_slide = open_slide + item_slide
                 item_rect = pygame.Rect(
                     WIDTH // 2 - 200 + offset_x,
                     start_y + i * (item_height + 20) + y_slide,
@@ -11012,6 +11355,11 @@ def draw_settings_menu(screen):
         back_hovered = transition_idle and back_button_rect.collidepoint(mx, my)
         draw_polished_back_button(screen, back_button_rect, back_hovered)
 
+    if content_surface is not None:
+        _composite_settings_menu_content(
+            destination, content_surface, presentation
+        )
+
 def handle_menu_click(mx, my):
     global menu_anim_closing, settings_menu_state, menu_transition_direction
     global current_theme, images, theme_scroll_offset, settings_menu_target
@@ -11023,7 +11371,7 @@ def handle_menu_click(mx, my):
 
     close_button_rect = pygame.Rect(WIDTH - 60, 14, 44, 32)
     if close_button_rect.collidepoint(mx, my):
-        menu_anim_closing = True
+        begin_settings_menu_close(close_button_rect.center)
         return True
 
     if settings_menu_state != "main":
@@ -11146,7 +11494,7 @@ def handle_menu_click(mx, my):
             return True
         if get_restart_button_rect(0, about_y).collidepoint(mx, my):
             restart_requested = True
-            menu_anim_closing = True
+            begin_settings_menu_close()
             return True
 
     return True
@@ -12477,7 +12825,7 @@ def main():
             if menu_anim_progress == 0 and not menu_anim_opening and not menu_anim_closing:
                 running = False
             elif menu_anim_progress > 0 and not menu_anim_closing and not menu_anim_opening:
-                menu_anim_closing = True
+                begin_settings_menu_close()
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
@@ -12595,7 +12943,7 @@ def main():
                         continue
 
                     elif settings_button_rect.collidepoint(mx, my):
-                        menu_anim_opening = True
+                        begin_settings_menu_open()
 
                     elif not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
                         if not board.is_game_over(claim_draw=True):
@@ -12740,7 +13088,7 @@ def main():
                         elif settings_menu_state != "main":
                             navigate_back()
                         else:
-                            menu_anim_closing = True
+                            begin_settings_menu_close()
                     else:
                         selected_sq = None
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and not show_auto_color_dialog and promotion_pending is None and not dragging and not anim_mgr.board_reset_anims:
