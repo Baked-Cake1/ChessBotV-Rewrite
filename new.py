@@ -879,6 +879,11 @@ engine_settings_button_pulse_phase = 0.0
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
 board_button_pulse_phase = 0.0
+# Settings main-menu Analysis Settings button polish. Its phase drives the
+# scope sweep/status glints only; Auto-Move, detection and Auto-play state
+# remains owned by their existing runtime variables.
+analysis_settings_button_hover_amount = 0.0
+analysis_settings_button_pulse_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -7548,6 +7553,791 @@ def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(bd_rect.x, bd_rect.bottom + 42, bd_rect.width, 94)
 
 
+def _analysis_settings_button_summary():
+    """Read-only Analysis status summary for the Settings main menu.
+
+    This mirrors the Analysis page's *shown* Auto-Move/Auto-play states,
+    including their setup dialogs, but never starts, stops or persists any
+    of those features. The returned short labels are shared by the row's
+    subtitle, its three status rails and its hover tooltip.
+    """
+    try:
+        auto_depth = int(get_auto_move_depth())
+    except Exception:
+        try:
+            auto_depth = int(ANALYSIS_DEPTH)
+        except Exception:
+            auto_depth = 0
+    auto_colour = {
+        "white": "White",
+        "black": "Black",
+        "both": "Both",
+    }.get(str(auto_move_color or "both").strip().lower(), "Both")
+    if show_auto_color_dialog:
+        auto_state = "setup"
+        auto_label = "Auto-Move choosing colour"
+        auto_subtitle = "Auto-Move · choose a colour"
+    elif auto_move_enabled:
+        auto_state = "on"
+        auto_label = f"Auto-Move on ({auto_colour}, depth {auto_depth})"
+        auto_subtitle = f"Auto-Move · {auto_colour} · depth {auto_depth}"
+    else:
+        auto_state = "off"
+        auto_label = "Auto-Move off"
+        auto_subtitle = ""
+
+    picker_purpose = str(board_detection_picker_purpose or "detect").lower()
+    detection_picker_open = bool(
+        show_board_detection_dialog and picker_purpose != "autoplay"
+    )
+    if board_detection_running:
+        detection_state = "working"
+        detection_label = "Detection working"
+        detection_subtitle = "Detecting board…"
+    elif detection_picker_open:
+        detection_state = "setup"
+        detection_label = "Detection choosing window"
+        detection_subtitle = "Detection · choose a window"
+    elif str(board_detection_error or "").strip():
+        detection_state = "error"
+        detection_label = "Detection needs attention"
+        detection_subtitle = ""
+    elif str(board_detection_last_summary or "").strip() or board_detection_result_ready:
+        detection_state = "ready"
+        detection_label = "Detection complete"
+        detection_subtitle = "Board detection complete"
+    else:
+        detection_state = "idle"
+        detection_label = "Detection idle"
+        detection_subtitle = ""
+
+    autoplay = _autoplay if isinstance(_autoplay, dict) else {}
+    autoplay_picker_open = bool(
+        show_board_detection_dialog and picker_purpose == "autoplay"
+    )
+    autoplay_setup = bool(show_autoplay_side_dialog or autoplay_picker_open)
+    autoplay_scan = bool(autoplay.get("scan_running"))
+    autoplay_running = bool(autoplay.get("running"))
+    autoplay_enabled = bool(autoplay.get("enabled"))
+    autoplay_phase_text = str(autoplay.get("state") or "").strip().lower()
+    autoplay_error_text = str(autoplay.get("error") or "").strip()
+    try:
+        autoplay_side = _autoplay_side_name(
+            autoplay.get("side", "white")
+        ).capitalize()
+    except Exception:
+        autoplay_side = "White"
+    autoplay_detail = f"({autoplay_side}, depth {int(AUTOPLAY_DEPTH)})"
+    if autoplay_error_text and not (autoplay_scan or autoplay_running):
+        autoplay_state = "error"
+        autoplay_label = "Auto-play needs attention"
+        autoplay_subtitle = ""
+    elif autoplay_scan or autoplay_phase_text in ("scanning", "importing"):
+        autoplay_state = "working"
+        autoplay_label = f"Auto-play working {autoplay_detail}"
+        autoplay_subtitle = "Auto-play scanning…"
+    elif autoplay_setup or autoplay_phase_text in (
+        "choosing_side",
+        "choosing_window",
+    ):
+        autoplay_state = "setup"
+        autoplay_label = "Auto-play setup"
+        autoplay_subtitle = "Auto-play setup in progress"
+    elif autoplay_phase_text == "game_over" and autoplay_enabled:
+        autoplay_state = "ready"
+        autoplay_label = f"Auto-play finished {autoplay_detail}"
+        autoplay_subtitle = "Auto-play finished"
+    elif autoplay_enabled or autoplay_running:
+        autoplay_state = "on"
+        autoplay_label = f"Auto-play on {autoplay_detail}"
+        autoplay_subtitle = (
+            f"Auto-play · {autoplay_side} · depth {int(AUTOPLAY_DEPTH)}"
+        )
+    else:
+        autoplay_state = "off"
+        autoplay_label = "Auto-play off"
+        autoplay_subtitle = ""
+
+    statuses = (
+        {"key": "auto_move", "state": auto_state, "label": auto_label},
+        {
+            "key": "board_detection",
+            "state": detection_state,
+            "label": detection_label,
+        },
+        {"key": "autoplay", "state": autoplay_state, "label": autoplay_label},
+    )
+    alert = any(status["state"] == "error" for status in statuses)
+    live = any(status["state"] == "working" for status in statuses)
+    active = any(
+        status["state"] in ("on", "setup", "working") for status in statuses
+    )
+
+    if alert:
+        subtitle = "Needs attention"
+    elif detection_state == "working":
+        subtitle = detection_subtitle
+    elif autoplay_state == "working":
+        subtitle = autoplay_subtitle
+    elif autoplay_state == "setup":
+        subtitle = autoplay_subtitle
+    elif detection_state == "setup":
+        subtitle = detection_subtitle
+    elif autoplay_state == "on":
+        subtitle = autoplay_subtitle
+    elif autoplay_state == "ready":
+        subtitle = autoplay_subtitle
+    elif auto_state == "setup":
+        subtitle = auto_subtitle
+    elif auto_state == "on":
+        subtitle = auto_subtitle
+    elif detection_state == "ready":
+        subtitle = detection_subtitle
+    else:
+        subtitle = "Auto-Move · Detection · Auto-play"
+
+    return {
+        "statuses": statuses,
+        "subtitle": subtitle,
+        "tooltip": "; ".join(status["label"] for status in statuses),
+        "alert": alert,
+        "live": live,
+        "active": active,
+        "animated": bool(active or live),
+    }
+
+
+def _analysis_settings_status_fraction(state, phase, index=0):
+    """Small status-rail fill for one Analysis feature state."""
+    if state in ("off", "idle"):
+        return 0.14
+    if state == "ready":
+        return 0.72
+    if state == "setup":
+        return 0.52 + 0.07 * math.sin(phase + index * 0.9)
+    if state == "working":
+        return 0.34 + 0.32 * (
+            0.5 + 0.5 * math.sin(phase + index * 0.9)
+        )
+    if state == "error":
+        return 0.82
+    if state == "on":
+        return 0.92
+    return 0.14
+
+
+def _analysis_settings_status_colour(key, state, hover_amount=0.0):
+    """Stable per-feature colour, with setup/error kept unmistakable."""
+    colours = {
+        "auto_move": (100, 220, 145),
+        "board_detection": (86, 196, 255),
+        "autoplay": (174, 140, 255),
+    }
+    colour = colours.get(key, (120, 200, 220))
+    if state == "error":
+        return TEXT_STATUS
+    if state == "setup":
+        return (255, 196, 102)
+    if state in ("off", "idle"):
+        return _lerp_color(colour, (91, 103, 116), 0.62)
+    return _lerp_color(
+        colour, (255, 255, 255), 0.08 + 0.18 * hover_amount
+    )
+
+
+def _draw_analysis_settings_status_marker(surface, centre, key, colour):
+    """Tiny feature glyph at the start of one Analysis status rail."""
+    cx, cy = int(centre[0]), int(centre[1])
+    pygame.draw.circle(surface, (17, 25, 34), (cx, cy + 1), 4)
+    if key == "auto_move":
+        pygame.draw.polygon(
+            surface,
+            colour,
+            [(cx - 2, cy - 3), (cx - 2, cy + 3), (cx + 3, cy)],
+        )
+    elif key == "board_detection":
+        marker = pygame.Rect(cx - 3, cy - 3, 7, 7)
+        pygame.draw.rect(surface, colour, marker, 1, border_radius=1)
+        pygame.draw.circle(surface, colour, (cx, cy), 1)
+    elif key == "autoplay":
+        pygame.draw.polygon(
+            surface,
+            colour,
+            [(cx, cy - 4), (cx + 3, cy), (cx, cy + 4), (cx - 3, cy)],
+            1,
+        )
+        pygame.draw.circle(surface, colour, (cx, cy), 1)
+    else:
+        pygame.draw.circle(surface, colour, (cx, cy), 2)
+
+
+def _draw_analysis_settings_icon(
+    surface,
+    cx,
+    cy,
+    radius,
+    hover_amount=0.0,
+    phase=0.0,
+    alert=False,
+    live=False,
+):
+    """Draw the Analysis scope: eval waveform inside a scanning reticle."""
+    cx, cy = int(cx), int(cy)
+    radius = max(9, int(radius))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    activity = max(hover_amount, 0.46 if live else 0.0)
+    rim_colour = (
+        (255, 132, 116)
+        if alert
+        else _lerp_color((92, 166, 178), (150, 226, 232), hover_amount)
+    )
+    disc_colour = _lerp_color(
+        (27, 45, 58), (39, 68, 78), hover_amount
+    )
+
+    pygame.draw.circle(surface, (13, 20, 29), (cx, cy + 2), radius)
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius)
+    pygame.draw.circle(surface, disc_colour, (cx, cy), max(1, radius - 2))
+    pygame.draw.circle(
+        surface, (14, 26, 36), (cx, cy), max(1, radius - 4)
+    )
+
+    # Radar-style sweep. Keep all alpha work on a disposable overlay so the
+    # opaque scope face underneath cannot lose its alpha on SRCALPHA targets.
+    if activity > 0.02:
+        overlay_size = radius * 2 + 3
+        overlay = pygame.Surface(
+            (overlay_size, overlay_size), pygame.SRCALPHA
+        )
+        local_cx = local_cy = radius + 1
+        sweep_radius = max(2, radius - 4)
+        sweep_points = [(local_cx, local_cy)]
+        for step in range(9):
+            angle = phase - 0.68 + step * (0.68 / 8.0)
+            sweep_points.append(
+                (
+                    local_cx + int(round(math.cos(angle) * sweep_radius)),
+                    local_cy + int(round(math.sin(angle) * sweep_radius)),
+                )
+            )
+        pygame.draw.polygon(
+            overlay,
+            (86, 210, 225, int(58 * activity)),
+            sweep_points,
+        )
+        sweep_end = (
+            local_cx + int(round(math.cos(phase) * sweep_radius)),
+            local_cy + int(round(math.sin(phase) * sweep_radius)),
+        )
+        pygame.draw.line(
+            overlay,
+            (170, 240, 248, int(150 * activity)),
+            (local_cx, local_cy),
+            sweep_end,
+            1,
+        )
+        surface.blit(overlay, (cx - radius - 1, cy - radius - 1))
+
+    grid_colour = _lerp_color(
+        (52, 91, 103), (78, 132, 143), hover_amount
+    )
+    for fraction in (0.44, 0.72):
+        grid_radius = max(2, int(round((radius - 4) * fraction)))
+        pygame.draw.circle(surface, grid_colour, (cx, cy), grid_radius, 1)
+    inner_extent = max(2, radius - 5)
+    pygame.draw.line(
+        surface, grid_colour, (cx - inner_extent, cy), (cx + inner_extent, cy), 1
+    )
+    pygame.draw.line(
+        surface, grid_colour, (cx, cy - inner_extent), (cx, cy + inner_extent), 1
+    )
+
+    # Twelve rim pips and four detection-style corner brackets.
+    for index in range(12):
+        angle = index * (math.tau / 12.0)
+        pip = (
+            cx + int(round(math.cos(angle) * (radius - 3))),
+            cy + int(round(math.sin(angle) * (radius - 3))),
+        )
+        pygame.draw.circle(surface, (88, 139, 151), pip, 1)
+    bracket_extent = max(4, int(round(radius * 0.62)))
+    bracket_arm = max(3, int(round(radius * 0.24)))
+    bracket_colour = _lerp_color(
+        (86, 196, 220), (170, 240, 248), hover_amount
+    )
+    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        corner_x = cx + sx * bracket_extent
+        corner_y = cy + sy * bracket_extent
+        pygame.draw.lines(
+            surface,
+            bracket_colour,
+            False,
+            [
+                (corner_x - sx * bracket_arm, corner_y),
+                (corner_x, corner_y),
+                (corner_x, corner_y - sy * bracket_arm),
+            ],
+            1,
+        )
+
+    wave_offsets = (-0.68, -0.45, -0.22, 0.0, 0.22, 0.45, 0.68)
+    wave_shape = (0.18, -0.12, 0.05, -0.27, 0.02, 0.22, -0.04)
+    wave_points = []
+    for x_fraction, y_fraction in zip(wave_offsets, wave_shape):
+        animated_y = y_fraction + 0.05 * activity * math.sin(
+            phase + x_fraction * 5.0
+        )
+        wave_points.append(
+            (
+                cx + int(round(x_fraction * radius)),
+                cy + int(round(animated_y * radius)),
+            )
+        )
+    pygame.draw.aalines(
+        surface,
+        (10, 18, 27),
+        False,
+        [(x, y + 1) for x, y in wave_points],
+    )
+    pygame.draw.lines(
+        surface,
+        (103, 222, 242),
+        False,
+        wave_points,
+        max(2, radius // 10),
+    )
+    pygame.draw.aalines(surface, (205, 250, 255), False, wave_points)
+    for point in wave_points[1:-1]:
+        pygame.draw.circle(surface, (190, 244, 252), point, 1)
+
+    # Amber eval marker on the trace and a bright scope hub.
+    marker_x, marker_y = wave_points[4]
+    marker_radius = max(2, radius // 7)
+    pygame.draw.polygon(
+        surface,
+        EVAL_MARKER_COLOR,
+        [
+            (marker_x, marker_y - marker_radius),
+            (marker_x + marker_radius, marker_y),
+            (marker_x, marker_y + marker_radius),
+            (marker_x - marker_radius, marker_y),
+        ],
+    )
+    pygame.draw.circle(surface, (16, 29, 39), (cx, cy), 2)
+    pygame.draw.circle(surface, (215, 250, 255), (cx, cy), 1)
+
+    glint_centre = (
+        cx - int(round(radius * 0.38)),
+        cy - int(round(radius * 0.42)),
+    )
+    pygame.draw.circle(
+        surface,
+        (143, 191, 201),
+        glint_centre,
+        max(1, int(round(radius * 0.07))),
+    )
+    pygame.draw.circle(surface, (225, 250, 255), glint_centre, 1)
+
+
+def _draw_analysis_settings_chevron(surface, centre, colour, scale=1.0):
+    """Small two-stroke navigation chevron for the Analysis menu row."""
+    cx, cy = centre
+    arm = max(4.0, 7.0 * scale)
+    points = [(cx - arm * 0.55, cy - arm), (cx + arm, cy), (cx - arm * 0.55, cy + arm)]
+    pygame.draw.aalines(surface, (17, 29, 36), False, [(x, y + 1) for x, y in points])
+    pygame.draw.aalines(surface, colour, False, points)
+
+
+def draw_polished_analysis_settings_button(screen, rect, hovered):
+    """Draw the Settings-main Analysis Settings navigation row.
+
+    The caller supplies the original 400x50 row, including entrance and
+    page-transition offsets, and retains click/navigation behaviour. This
+    renderer only reads Auto-Move, Board Detection and Auto-play state so
+    its scope, subtitle and three status rails can summarise that page.
+    """
+    global analysis_settings_button_hover_amount
+    global analysis_settings_button_pulse_phase
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    summary = _analysis_settings_button_summary()
+    status_by_key = {
+        status["key"]: status for status in summary["statuses"]
+    }
+
+    hover_target = 1.0 if hovered else 0.0
+    analysis_settings_button_hover_amount += (
+        hover_target - analysis_settings_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - analysis_settings_button_hover_amount) < 0.01:
+        analysis_settings_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, analysis_settings_button_hover_amount)
+    )
+    if hovered or summary["animated"]:
+        if pressed:
+            phase_step = 0.038
+        elif hovered:
+            phase_step = 0.082
+        else:
+            phase_step = 0.055
+        analysis_settings_button_pulse_phase = (
+            analysis_settings_button_pulse_phase + phase_step
+        ) % (2.0 * math.pi)
+    phase = analysis_settings_button_pulse_phase
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    if summary["alert"]:
+        glow_colour = TEXT_STATUS
+    elif status_by_key["autoplay"]["state"] in ("on", "working", "setup"):
+        glow_colour = (174, 140, 255)
+    elif status_by_key["board_detection"]["state"] == "working":
+        glow_colour = (86, 196, 255)
+    elif status_by_key["auto_move"]["state"] in ("on", "setup"):
+        glow_colour = (100, 220, 145)
+    else:
+        glow_colour = (94, 190, 200)
+    glow_strength = max(
+        hover_amount,
+        0.30 if summary["live"] else 0.15 if summary["active"] else 0.0,
+    )
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 15), (4, 24), (7, 36)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=16 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (15, 23, 31),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=10,
+    )
+
+    if pressed:
+        top_colour = (55, 79, 88)
+        bottom_colour = (40, 43, 70)
+        border_colour = (104, 151, 160)
+    elif hovered:
+        top_colour = (82, 124, 130)
+        bottom_colour = (57, 64, 104)
+        border_colour = (158, 220, 224)
+    else:
+        top_colour = (64, 98, 104)
+        bottom_colour = (46, 51, 82)
+        border_colour = (116, 172, 180)
+    if summary["alert"]:
+        border_colour = _lerp_color(border_colour, TEXT_STATUS, 0.38)
+    elif summary["active"]:
+        border_colour = _lerp_color(border_colour, glow_colour, 0.22)
+
+    # Teal-to-violet glass body. The graph-paper/waveform traces sit on an
+    # overlay and are clipped by the same rounded mask as earlier rows.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(9 + 14 * hover_amount)),
+        [
+            (-20, visual_rect.height),
+            (visual_rect.width * 0.36, 0),
+            (visual_rect.width * 0.55, 0),
+            (visual_rect.width * 0.13, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(62 + 44 * hover_amount)),
+        (9, 1),
+        (visual_rect.width - 10, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 21),
+        (2, 7),
+        (2, visual_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 42 if pressed else 29),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 24),
+        (visual_rect.width - 3, 6, 3, visual_rect.height - 12),
+        border_radius=2,
+    )
+
+    grid_alpha = int(8 + 10 * hover_amount)
+    for x_start, x_end in ((58, 118), (282, 342)):
+        for grid_x in range(x_start, x_end + 1, 10):
+            pygame.draw.line(
+                overlay,
+                (190, 240, 248, grid_alpha),
+                (grid_x, 6),
+                (grid_x, visual_rect.height - 7),
+                1,
+            )
+        for grid_y in (10, 20, 30, 40):
+            pygame.draw.line(
+                overlay,
+                (190, 240, 248, grid_alpha),
+                (x_start, grid_y),
+                (x_end, grid_y),
+                1,
+            )
+    trace_alpha = int(20 + 30 * hover_amount)
+    waveform_traces = (
+        (
+            (103, 222, 242, trace_alpha),
+            [(58, 31), (70, 24), (80, 35), (92, 18), (104, 28), (118, 22)],
+        ),
+        (
+            (174, 140, 255, trace_alpha),
+            [(282, 20), (294, 29), (304, 15), (316, 32), (328, 22), (342, 27)],
+        ),
+    )
+    for trace_colour, trace_points in waveform_traces:
+        pygame.draw.lines(overlay, trace_colour, False, trace_points, 1)
+        for point in trace_points[1:-1]:
+            pygame.draw.circle(overlay, trace_colour, point, 1)
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=10,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=10)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=8,
+    )
+
+    # Short tri-colour telemetry inlays along the bottom, split around the
+    # centred subtitle and coloured after the row's three feature rails.
+    inlay_y = visual_rect.bottom - 5
+    inlay_colours = ((100, 220, 145), (86, 196, 255), (174, 140, 255))
+    for segment_x in (visual_rect.x + 56, visual_rect.x + 304):
+        for index in range(8):
+            colour = _lerp_color(
+                bottom_colour, inlay_colours[index % 3], 0.38
+            )
+            pygame.draw.rect(
+                screen,
+                colour,
+                (segment_x + index * 5, inlay_y, 5, 3),
+            )
+
+    icon_centre = (visual_rect.x + 31, visual_rect.centery)
+    icon_hover_amount = max(
+        hover_amount, 0.28 if summary["active"] else 0.0
+    )
+    _draw_analysis_settings_icon(
+        screen,
+        icon_centre[0],
+        icon_centre[1],
+        17,
+        hover_amount=icon_hover_amount,
+        phase=phase,
+        alert=summary["alert"],
+        live=summary["live"],
+    )
+    if summary["alert"]:
+        badge = (icon_centre[0] + 14, icon_centre[1] - 14)
+        pygame.draw.circle(screen, (43, 20, 18), (badge[0], badge[1] + 1), 5)
+        pygame.draw.circle(screen, TEXT_STATUS, badge, 5)
+        pygame.draw.circle(screen, (255, 205, 195), badge, 5, 1)
+        pygame.draw.line(
+            screen,
+            (255, 255, 255),
+            (badge[0], badge[1] - 2),
+            (badge[0], badge[1] + 1),
+            1,
+        )
+        pygame.draw.circle(
+            screen, (255, 255, 255), (badge[0], badge[1] + 3), 1
+        )
+
+    # Two-line centred label: destination above, highest-priority live
+    # Analysis state below (or the page's three features when all idle).
+    label = "Analysis Settings"
+    title_colour = _lerp_color(
+        (237, 247, 248), (255, 255, 255), hover_amount
+    )
+    title = font_large.render(label, True, title_colour)
+    title_rect = title.get_rect(
+        center=(visual_rect.centerx, visual_rect.centery - 9)
+    )
+    title_shadow = font_large.render(label, True, (16, 26, 35))
+    screen.blit(title_shadow, title_rect.move(0, 1))
+    screen.blit(title, title_rect)
+
+    subtitle_text = _elide_text(summary["subtitle"], font_tiny, 204)
+    if summary["alert"]:
+        subtitle_colour = (255, 166, 156)
+    elif summary["live"]:
+        subtitle_colour = (153, 224, 255)
+    else:
+        subtitle_colour = _lerp_color(
+            (183, 211, 215), (225, 250, 252), hover_amount
+        )
+    subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
+    subtitle_rect = subtitle.get_rect(
+        center=(visual_rect.centerx, visual_rect.centery + 15)
+    )
+    subtitle_shadow = font_tiny.render(subtitle_text, True, (16, 26, 35))
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    # Three read-only status rails, top-to-bottom in Analysis-page order:
+    # Auto-Move, Board Detection, then external Auto-play.
+    detail_x = visual_rect.right - 96
+    rail_x = detail_x + 11
+    rail_width = 31
+    for index, status in enumerate(summary["statuses"]):
+        rail_y = visual_rect.centery + (index - 1) * 14
+        colour = _analysis_settings_status_colour(
+            status["key"], status["state"], hover_amount
+        )
+        _draw_analysis_settings_status_marker(
+            screen, (detail_x + 3, rail_y), status["key"], colour
+        )
+        pygame.draw.line(
+            screen,
+            (17, 25, 34),
+            (rail_x, rail_y + 1),
+            (rail_x + rail_width, rail_y + 1),
+            3,
+        )
+        pygame.draw.line(
+            screen,
+            (43, 59, 70),
+            (rail_x, rail_y),
+            (rail_x + rail_width, rail_y),
+            3,
+        )
+        fraction = _analysis_settings_status_fraction(
+            status["state"], phase, index
+        )
+        endpoint_x = int(round(rail_x + fraction * rail_width))
+        if endpoint_x > rail_x:
+            pygame.draw.line(
+                screen, colour, (rail_x, rail_y), (endpoint_x, rail_y), 3
+            )
+        if hover_amount > 0.03 or status["state"] == "working":
+            scan_t = (phase / (2.0 * math.pi) + index * 0.19) % 1.0
+            scan_x = int(round(rail_x + scan_t * rail_width))
+            pygame.draw.circle(
+                screen,
+                _lerp_color(colour, (255, 255, 255), 0.55),
+                (scan_x, rail_y),
+                1,
+            )
+        pygame.draw.circle(screen, (17, 25, 34), (endpoint_x, rail_y + 1), 3)
+        pygame.draw.circle(
+            screen,
+            _lerp_color(colour, (255, 255, 255), 0.42),
+            (endpoint_x, rail_y),
+            3,
+        )
+        pygame.draw.circle(screen, colour, (endpoint_x, rail_y), 2)
+        pygame.draw.circle(
+            screen, (255, 255, 255), (endpoint_x - 1, rail_y - 1), 1
+        )
+
+    chevron_colour = _lerp_color(
+        (190, 220, 224), (255, 255, 255), hover_amount
+    )
+    chevron_x = (
+        visual_rect.right
+        - 24
+        + int(round(2 * hover_amount))
+        - (1 if pressed else 0)
+    )
+    _draw_analysis_settings_chevron(
+        screen,
+        (chevron_x, visual_rect.centery),
+        chevron_colour,
+    )
+
+    # Detailed feature states below the row. The fourth main-menu row is
+    # followed by clear space before "About", so this stays unoccluded.
+    if hovered and not pressed:
+        tooltip_text = _elide_text(summary["tooltip"], font_tiny, 560)
+        tip = font_tiny.render(tooltip_text, True, TEXT_COLOR)
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(visual_rect.centerx - tip_w // 2, WIDTH - tip_w - 4),
+        )
+        tip_y = min(visual_rect.bottom + 7, HEIGHT - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (17, 28, 34), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen,
+            TEXT_STATUS if summary["alert"] else (126, 204, 214),
+            tip_rect,
+            1,
+            border_radius=7,
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (17, 28, 34),
+            [
+                (pointer_x - 5, tip_rect.y + 1),
+                (pointer_x + 5, tip_rect.y + 1),
+                (pointer_x, max(visual_rect.bottom + 1, tip_rect.y - 5)),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
+
+
 def draw_analysis_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
@@ -10106,6 +10896,10 @@ def draw_settings_menu(screen):
                     )
                 elif item == "Board":
                     draw_polished_board_button(
+                        screen, item_rect, is_hovered
+                    )
+                elif item == "Analysis Settings":
+                    draw_polished_analysis_settings_button(
                         screen, item_rect, is_hovered
                     )
                 else:
