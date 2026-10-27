@@ -857,6 +857,10 @@ flip_icon_turn = 0.0
 # and spins faster after a restart has been requested while the menu closes.
 restart_button_hover_amount = 0.0
 restart_icon_rotation = 0.0
+# Settings > About > Github button polish. Hover eases the sapphire body in
+# while the medallion's orbit dot and external-link arrow animate.
+github_button_hover_amount = 0.0
+github_button_pulse_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -6935,6 +6939,469 @@ def get_restart_button_rect(offset_x=0, about_y=0):
     return pygame.Rect(x, y, w, h)
 
 
+def _draw_github_icon(
+    surface, cx, cy, radius, hover_amount=0.0, pulse_phase=0.0
+):
+    """Draw a compact cat medallion for the Github repository button.
+
+    The mark is built from scalable primitives so the same helper can be
+    rendered at the button's 24 px size or enlarged in tests. On hover the
+    pupils glance toward the external-link arrow and a small orbit dot
+    travels around the medallion rim.
+    """
+    cx, cy, radius = int(cx), int(cy), max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, hover_amount))
+    unit = radius / 12.0
+
+    def point(dx, dy):
+        return (cx + dx * unit, cy + dy * unit)
+
+    def scaled(value):
+        return max(1, int(round(value * unit)))
+
+    # Layered pale-blue enamel disc, matching Restart's medallion depth.
+    pygame.draw.circle(surface, (13, 21, 39), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, (239, 245, 255), (cx, cy), radius)
+    pygame.draw.circle(
+        surface, (211, 225, 250), (cx, cy), max(5, radius - scaled(2))
+    )
+    pygame.draw.circle(surface, (37, 55, 94), (cx, cy), radius, 1)
+    try:
+        pygame.gfxdraw.aacircle(surface, cx, cy, radius, (37, 55, 94, 255))
+        pygame.gfxdraw.aacircle(
+            surface,
+            cx,
+            cy,
+            max(5, radius - scaled(2)),
+            (116, 145, 190, 255),
+        )
+    except Exception:
+        pass
+
+    glint = point(-4.0, -4.2)
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (int(glint[0]), int(glint[1])),
+        scaled(0.9),
+    )
+
+    ink = (31, 45, 76)
+    ink_light = (73, 98, 143)
+    inner_ear = (126, 158, 205)
+
+    # Ears and a curled tail sit behind the head silhouette.
+    for sign in (-1, 1):
+        ear = [
+            point(sign * 6.0, -3.0),
+            point(sign * 7.7, -9.0),
+            point(sign * 2.0, -6.0),
+        ]
+        pygame.draw.polygon(surface, ink, ear)
+        try:
+            pygame.gfxdraw.aapolygon(surface, ear, (*ink, 255))
+        except Exception:
+            pass
+        inner = [
+            point(sign * 5.7, -4.3),
+            point(sign * 6.4, -7.3),
+            point(sign * 3.7, -5.8),
+        ]
+        pygame.draw.polygon(surface, inner_ear, inner)
+
+    tail_points = []
+    tail_steps = 10
+    for step in range(tail_steps + 1):
+        t = step / tail_steps
+        x = (
+            (1.0 - t) ** 2 * 3.0
+            + 2.0 * (1.0 - t) * t * 10.0
+            + t**2 * 8.0
+        )
+        y = (
+            (1.0 - t) ** 2 * 5.0
+            + 2.0 * (1.0 - t) * t * 6.0
+            + t**2 * -1.0
+        )
+        tail_points.append(point(x, y))
+    if len(tail_points) >= 2:
+        pygame.draw.lines(
+            surface, ink, False, tail_points, scaled(2.0)
+        )
+        try:
+            pygame.draw.aalines(surface, ink, False, tail_points)
+        except Exception:
+            pass
+
+    # Three tiny foot/tentacle nubs peek out below the head.
+    for dx, dy in ((-4.0, 7.0), (0.0, 7.8), (4.0, 7.0)):
+        nub = point(dx, dy)
+        pygame.draw.circle(
+            surface,
+            ink,
+            (int(nub[0]), int(nub[1])),
+            scaled(1.25),
+        )
+
+    head_rect = pygame.Rect(
+        int(round(cx - 7.0 * unit)),
+        int(round(cy - 6.0 * unit)),
+        max(2, int(round(14.0 * unit))),
+        max(2, int(round(13.0 * unit))),
+    )
+    pygame.draw.ellipse(surface, ink, head_rect)
+    try:
+        pygame.gfxdraw.aaellipse(
+            surface,
+            cx,
+            int(round(cy + 0.5 * unit)),
+            scaled(7.0),
+            scaled(6.5),
+            (*ink, 255),
+        )
+    except Exception:
+        pass
+
+    # Soft brow and muzzle shading give the tiny silhouette some modelling.
+    brow_rect = pygame.Rect(
+        int(round(cx - 5.0 * unit)),
+        int(round(cy - 5.2 * unit)),
+        max(2, int(round(6.0 * unit))),
+        max(2, int(round(3.0 * unit))),
+    )
+    pygame.draw.ellipse(surface, ink_light, brow_rect)
+    muzzle_rect = pygame.Rect(
+        int(round(cx - 3.0 * unit)),
+        int(round(cy + 1.8 * unit)),
+        max(2, int(round(6.0 * unit))),
+        max(2, int(round(3.8 * unit))),
+    )
+    pygame.draw.ellipse(surface, (86, 111, 153), muzzle_rect)
+
+    # The pupils ease up/right with hover, toward the external-link glyph.
+    look_x = hover_amount * 0.9
+    look_y = -hover_amount * 0.8
+    for eye_dx in (-3.0, 3.0):
+        eye_rect = pygame.Rect(
+            int(round(cx + (eye_dx - 1.65) * unit)),
+            int(round(cy - 2.5 * unit)),
+            max(2, int(round(3.3 * unit))),
+            max(2, int(round(3.9 * unit))),
+        )
+        pygame.draw.ellipse(surface, (240, 247, 255), eye_rect)
+        pupil = point(eye_dx + look_x, -0.55 + look_y)
+        pygame.draw.circle(
+            surface,
+            ink,
+            (int(round(pupil[0])), int(round(pupil[1]))),
+            scaled(0.85),
+        )
+
+    nose_y = cy + 2.45 * unit
+    pygame.draw.line(
+        surface,
+        (226, 238, 255),
+        (cx - 0.75 * unit, nose_y),
+        (cx + 0.75 * unit, nose_y),
+        1,
+    )
+    for whisker_dx in (-5.1, 5.1):
+        whisker = point(whisker_dx, 3.0)
+        pygame.draw.circle(
+            surface,
+            (173, 199, 235),
+            (int(round(whisker[0])), int(round(whisker[1]))),
+            scaled(0.65),
+        )
+
+    # A cyan orbit dot rides the rim only while the button is hovered.
+    if hover_amount > 0.03:
+        orbit_angle = -0.85 + pulse_phase
+        orbit_radius = max(4, radius - scaled(1))
+        orbit = (
+            int(round(cx + orbit_radius * math.cos(orbit_angle))),
+            int(round(cy + orbit_radius * math.sin(orbit_angle))),
+        )
+        pygame.draw.circle(surface, (37, 55, 94), orbit, scaled(1.7))
+        pygame.draw.circle(surface, (126, 211, 255), orbit, scaled(1.2))
+        pygame.draw.circle(
+            surface,
+            (255, 255, 255),
+            (orbit[0] - scaled(0.4), orbit[1] - scaled(0.4)),
+            scaled(0.45),
+        )
+
+
+def _draw_external_link_icon(surface, cx, cy, colour, shift=0):
+    """Draw the small box-and-arrow 'opens externally' glyph."""
+    cx, cy, shift = int(cx), int(cy), int(shift)
+    box_path = [
+        (cx - 1, cy - 5),
+        (cx - 6, cy - 5),
+        (cx - 6, cy + 6),
+        (cx + 6, cy + 6),
+        (cx + 6, cy + 1),
+    ]
+    pygame.draw.lines(surface, colour, False, box_path, 2)
+    try:
+        pygame.draw.aalines(surface, colour, False, box_path)
+    except Exception:
+        pass
+
+    tip = (cx + 6 + shift, cy - 6 - shift)
+    shaft = [(cx - 1, cy + 1), tip]
+    pygame.draw.lines(surface, colour, False, shaft, 2)
+    try:
+        pygame.draw.aalines(surface, colour, False, shaft)
+    except Exception:
+        pass
+    for head_end in (
+        (tip[0] - 4, tip[1]),
+        (tip[0], tip[1] + 4),
+    ):
+        pygame.draw.line(surface, colour, tip, head_end, 2)
+        try:
+            pygame.draw.aaline(surface, colour, tip, head_end)
+        except Exception:
+            pass
+
+
+def draw_polished_github_button(screen, rect, hovered):
+    """Draw Settings > About > Github as a polished sapphire link button.
+
+    The click rectangle and web-browser behaviour are unchanged. This
+    helper owns only visual hover/orbit animation state.
+    """
+    global github_button_hover_amount, github_button_pulse_phase
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    github_button_hover_amount += (
+        hover_target - github_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - github_button_hover_amount) < 0.01:
+        github_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, github_button_hover_amount)
+    )
+    if hovered:
+        github_button_pulse_phase = (
+            github_button_pulse_phase
+            + (0.018 if pressed else 0.055)
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    # Sapphire halo easing in behind the button.
+    if hover_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 18), (4, 28), (7, 42)):
+            pygame.draw.rect(
+                glow,
+                (82, 144, 255, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=15 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (13, 20, 38),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=10,
+    )
+
+    if pressed:
+        top_colour = (57, 73, 112)
+        bottom_colour = (38, 50, 84)
+        border_colour = (124, 151, 196)
+    elif hovered:
+        top_colour = (91, 118, 174)
+        bottom_colour = (56, 76, 125)
+        border_colour = (168, 198, 255)
+    else:
+        top_colour = (72, 91, 139)
+        bottom_colour = (45, 59, 98)
+        border_colour = (124, 145, 190)
+
+    # Rounded sapphire-metal body, using the same overlay-and-mask
+    # construction as the neighbouring polished Restart button.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(10 + 17 * hover_amount)),
+        [
+            (-12, visual_rect.height),
+            (visual_rect.width * 0.42, 0),
+            (visual_rect.width * 0.62, 0),
+            (visual_rect.width * 0.14, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(70 + 48 * hover_amount)),
+        (8, 1),
+        (visual_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 23),
+        (2, 6),
+        (2, visual_rect.height - 7),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 46 if pressed else 31),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 25),
+        (visual_rect.width - 3, 5, 3, visual_rect.height - 10),
+        border_radius=2,
+    )
+    for stripe_x in (10, 18):
+        pygame.draw.polygon(
+            overlay,
+            (190, 225, 255, 12),
+            [
+                (stripe_x, visual_rect.height),
+                (stripe_x + 12, 0),
+                (stripe_x + 17, 0),
+                (stripe_x + 5, visual_rect.height),
+            ],
+        )
+        pygame.draw.polygon(
+            overlay,
+            (190, 225, 255, 12),
+            [
+                (visual_rect.width - stripe_x - 17, visual_rect.height),
+                (visual_rect.width - stripe_x - 5, 0),
+                (visual_rect.width - stripe_x, 0),
+                (visual_rect.width - stripe_x - 12, visual_rect.height),
+            ],
+        )
+
+    # Faint source-branch traces in the open space at either edge. They
+    # brighten with hover and sit beneath the medallion/external glyph.
+    branch_alpha = int(22 + 30 * hover_amount)
+    branch_colour = (180, 220, 255, branch_alpha)
+    left_branch = [(12, 29), (27, 29), (36, 21), (51, 21)]
+    right_branch = [(169, 15), (184, 15), (193, 7), (208, 7)]
+    for branch in (left_branch, right_branch):
+        pygame.draw.lines(overlay, branch_colour, False, branch, 1)
+        for node in (branch[0], branch[-1]):
+            pygame.draw.circle(overlay, branch_colour, node, 2)
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=10,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=10)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=8,
+    )
+
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour, (150, 215, 255), hover_amount
+        )
+        accent_w = int(92 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    # External-link indicator: the arrow eases one pixel up/right on hover
+    # while its box stays anchored, making the browser action explicit.
+    external_cx = visual_rect.right - 24
+    external_shift = int(round(hover_amount))
+    _draw_external_link_icon(
+        screen,
+        external_cx,
+        visual_rect.centery + 1,
+        (17, 27, 50),
+        external_shift,
+    )
+    _draw_external_link_icon(
+        screen,
+        external_cx,
+        visual_rect.centery,
+        _lerp_color(
+            (165, 190, 226), (235, 247, 255), hover_amount
+        ),
+        external_shift,
+    )
+
+    # Medallion + label as one centred group, shifted to leave the
+    # external-link glyph clear—matching Restart's status-dot layout.
+    label = "GitHub"
+    text_colour = _lerp_color(
+        (226, 236, 255), (255, 255, 255), hover_amount
+    )
+    text = font_small.render(label, True, text_colour)
+    icon_radius = 12
+    gap = 8
+    group_w = icon_radius * 2 + gap + text.get_width()
+    group_x = visual_rect.centerx - group_w // 2 - 8
+    icon_cx = group_x + icon_radius
+    _draw_github_icon(
+        screen,
+        icon_cx,
+        visual_rect.centery,
+        icon_radius,
+        hover_amount,
+        github_button_pulse_phase,
+    )
+    text_rect = text.get_rect(
+        midleft=(group_x + icon_radius * 2 + gap, visual_rect.centery)
+    )
+    shadow_text = font_small.render(label, True, (17, 27, 50))
+    screen.blit(shadow_text, text_rect.move(0, 1))
+    screen.blit(text, text_rect)
+
+
 def _draw_restart_icon(surface, cx, cy, radius, rotation):
     """Draw twin circular arrows on a small pale Restart medallion."""
     cx, cy, radius = int(cx), int(cy), max(8, int(radius))
@@ -7751,10 +8218,7 @@ def draw_settings_menu(screen):
 
             github_rect = get_github_button_rect(offset_x, about_y)
             github_hovered = transition_idle and github_rect.collidepoint(mx, my)
-            pygame.draw.rect(screen, (45, 85, 155) if github_hovered else (55, 75, 145), github_rect, border_radius=6)
-            pygame.draw.rect(screen, MENU_BORDER_COLOR, github_rect, 2, border_radius=6)
-            github_text = font_small.render("Github", True, TEXT_COLOR)
-            screen.blit(github_text, github_text.get_rect(center=github_rect.center))
+            draw_polished_github_button(screen, github_rect, github_hovered)
 
             restart_rect = get_restart_button_rect(offset_x, about_y)
             restart_hovered = transition_idle and restart_rect.collidepoint(mx, my)
