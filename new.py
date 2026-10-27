@@ -870,6 +870,11 @@ github_button_pulse_phase = 0.0
 close_button_hover_amount = 0.0
 close_button_fold_amount = 0.0
 close_button_icon_phase = 0.0
+# Settings main-menu Engine Settings button polish. These values animate
+# only its gear/telemetry visuals; navigation and engine drafts are unchanged.
+engine_settings_button_hover_amount = 0.0
+engine_settings_button_gear_rotation = 0.0
+engine_settings_button_pulse_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -7478,6 +7483,496 @@ def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
         screen.blit(dirty_note, (WIDTH // 2 - dirty_note.get_width()//2, reset_rect.bottom + 28))
 
 
+def _engine_settings_button_values():
+    """Return ``(draft_values, has_unsaved_changes)`` for the menu button.
+
+    The main-menu button is only a visual summary. It reads the same staged
+    ``engine_draft`` shown by the Engine Settings sliders and compares it
+    with ``config`` in the same way ``update_slider_display`` does; it never
+    writes either mapping.
+    """
+    values = {}
+    for key in ENGINE_ROW_KEYS:
+        raw = engine_draft.get(
+            key, config.get(key, ENGINE_DEFAULTS.get(key, 0))
+        )
+        try:
+            values[key] = int(round(float(raw)))
+        except (TypeError, ValueError):
+            values[key] = int(ENGINE_DEFAULTS.get(key, 0))
+
+    dirty = False
+    for key in ENGINE_ROW_KEYS:
+        saved_raw = config.get(key, ENGINE_DEFAULTS.get(key, 0))
+        try:
+            saved = int(round(float(saved_raw)))
+        except (TypeError, ValueError):
+            saved = int(ENGINE_DEFAULTS.get(key, 0))
+        if values[key] != saved:
+            dirty = True
+            break
+    return values, dirty
+
+
+def _engine_settings_fraction(key, value):
+    """Normalise one staged engine value for a miniature slider track."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(ENGINE_DEFAULTS.get(key, 0))
+
+    if key == "hash" and HASH_STEPS:
+        if len(HASH_STEPS) == 1 or numeric <= HASH_STEPS[0]:
+            return 0.0
+        if numeric >= HASH_STEPS[-1]:
+            return 1.0
+        for index in range(len(HASH_STEPS) - 1):
+            low = HASH_STEPS[index]
+            high = HASH_STEPS[index + 1]
+            if low <= numeric <= high:
+                inner = (numeric - low) / max(1.0, high - low)
+                return (index + inner) / (len(HASH_STEPS) - 1)
+        return 0.0
+
+    low, high = ENGINE_ROW_LIMITS.get(key, (0, 1))
+    if high <= low:
+        return 0.0
+    return max(0.0, min(1.0, (numeric - low) / (high - low)))
+
+
+def _draw_engine_settings_chevron(surface, cx, cy, colour):
+    """Draw the Engine Settings row's forward chevron with a soft shadow."""
+    points = [(cx - 4, cy - 7), (cx + 3, cy), (cx - 4, cy + 7)]
+    shadow = [(px, py + 1) for px, py in points]
+    pygame.draw.lines(surface, (20, 24, 38), False, shadow, 3)
+    pygame.draw.lines(surface, colour, False, points, 3)
+    try:
+        pygame.draw.aalines(surface, colour, False, points)
+    except Exception:
+        pass
+
+
+def draw_polished_engine_settings_button(screen, rect, hovered):
+    """Draw the Settings-main Engine Settings navigation row.
+
+    The caller supplies the original 400x50 row (including menu entrance
+    offsets) and retains all click/navigation behaviour. This renderer adds
+    an indigo-steel body, detailed gear medallion, five miniature staged
+    slider tracks, unsaved-change indication and a values tooltip.
+    """
+    global engine_settings_button_hover_amount
+    global engine_settings_button_gear_rotation
+    global engine_settings_button_pulse_phase
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    engine_settings_button_hover_amount += (
+        hover_target - engine_settings_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - engine_settings_button_hover_amount) < 0.01:
+        engine_settings_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, engine_settings_button_hover_amount)
+    )
+    if hovered:
+        engine_settings_button_gear_rotation = (
+            engine_settings_button_gear_rotation
+            + (0.006 if pressed else 0.018)
+        ) % (2.0 * math.pi)
+        engine_settings_button_pulse_phase = (
+            engine_settings_button_pulse_phase
+            + (0.035 if pressed else 0.075)
+        ) % (2.0 * math.pi)
+
+    values, has_unsaved = _engine_settings_button_values()
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    # Indigo/cyan halo; an unsaved draft warms a small part of it amber.
+    if hover_amount > 0.01:
+        glow_colour = (
+            (255, 190, 92) if has_unsaved else (92, 156, 255)
+        )
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 15), (4, 24), (7, 36)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=16 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (17, 20, 32),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=10,
+    )
+
+    if pressed:
+        top_colour = (59, 65, 91)
+        bottom_colour = (39, 43, 64)
+        border_colour = (126, 140, 180)
+    elif hovered:
+        top_colour = (96, 108, 148)
+        bottom_colour = (61, 70, 106)
+        border_colour = (174, 203, 255)
+    else:
+        top_colour = (76, 82, 112)
+        bottom_colour = (48, 53, 78)
+        border_colour = (126, 140, 180)
+    if has_unsaved:
+        border_colour = _lerp_color(
+            border_colour, (255, 200, 104), 0.38
+        )
+
+    # Indigo-steel body. Translucent glass/circuit detail is built on an
+    # overlay and clipped by a rounded mask, matching recent controls.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(9 + 14 * hover_amount)),
+        [
+            (-20, visual_rect.height),
+            (visual_rect.width * 0.36, 0),
+            (visual_rect.width * 0.55, 0),
+            (visual_rect.width * 0.13, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(62 + 44 * hover_amount)),
+        (9, 1),
+        (visual_rect.width - 10, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 21),
+        (2, 7),
+        (2, visual_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 42 if pressed else 29),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 24),
+        (visual_rect.width - 3, 6, 3, visual_rect.height - 12),
+        border_radius=2,
+    )
+
+    # Fine circuit traces at the top/bottom edges, mostly visible in the
+    # spaces between medallion, label and miniature slider bank.
+    trace_alpha = int(18 + 24 * hover_amount)
+    trace_colour = (170, 214, 255, trace_alpha)
+    for trace in (
+        [(54, 8), (92, 8), (104, 15), (142, 15)],
+        [(258, 35), (292, 35), (303, 42), (338, 42)],
+    ):
+        pygame.draw.lines(overlay, trace_colour, False, trace, 1)
+        for node in (trace[0], trace[-1]):
+            pygame.draw.circle(overlay, trace_colour, node, 2)
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=10,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=10)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=8,
+    )
+
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour,
+            (255, 200, 104) if has_unsaved else (142, 205, 255),
+            hover_amount,
+        )
+        accent_w = int(132 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    # Layered medallion carrying the same supersampled detailed cog as the
+    # top-bar Settings button, but at main-menu scale and on a dark socket.
+    medallion_centre = (visual_rect.x + 31, visual_rect.centery)
+    medallion_radius = 17
+    pygame.draw.circle(
+        screen,
+        (14, 17, 28),
+        (medallion_centre[0], medallion_centre[1] + 1),
+        medallion_radius,
+    )
+    pygame.draw.circle(
+        screen,
+        _lerp_color((151, 170, 210), (210, 229, 255), hover_amount),
+        medallion_centre,
+        medallion_radius,
+    )
+    pygame.draw.circle(
+        screen,
+        _lerp_color((38, 46, 70), (48, 59, 88), hover_amount),
+        medallion_centre,
+        medallion_radius - 1,
+    )
+    pygame.draw.circle(
+        screen,
+        _lerp_color((55, 66, 94), (72, 85, 116), hover_amount),
+        medallion_centre,
+        medallion_radius - 4,
+    )
+    try:
+        pygame.gfxdraw.aacircle(
+            screen,
+            medallion_centre[0],
+            medallion_centre[1],
+            medallion_radius,
+            (*border_colour, 255),
+        )
+        pygame.gfxdraw.aacircle(
+            screen,
+            medallion_centre[0],
+            medallion_centre[1],
+            medallion_radius - 4,
+            (126, 145, 184, 255),
+        )
+    except Exception:
+        pass
+
+    # Quantise the cog colour a little so its rotated-icon cache stays
+    # compact while hover is easing; size/rotation are already quantised
+    # inside draw_gear_icon's cache key.
+    gear_hover = round(hover_amount * 4.0) / 4.0
+    gear_colour = _lerp_color(
+        (192, 207, 235), GEAR_COLOR_HOVER, gear_hover
+    )
+    draw_gear_icon(
+        screen,
+        medallion_centre[0],
+        medallion_centre[1],
+        13.5 + 0.5 * hover_amount - (0.25 if pressed else 0.0),
+        gear_colour,
+        thickness=2,
+        rotation=engine_settings_button_gear_rotation,
+    )
+
+    # Orbiting telemetry dot on the medallion rim while hovered.
+    if hover_amount > 0.03:
+        orbit_angle = -0.9 + engine_settings_button_pulse_phase
+        orbit = (
+            int(
+                round(
+                    medallion_centre[0]
+                    + (medallion_radius - 1) * math.cos(orbit_angle)
+                )
+            ),
+            int(
+                round(
+                    medallion_centre[1]
+                    + (medallion_radius - 1) * math.sin(orbit_angle)
+                )
+            ),
+        )
+        pygame.draw.circle(screen, (24, 31, 49), orbit, 3)
+        pygame.draw.circle(screen, (126, 211, 255), orbit, 2)
+        pygame.draw.circle(
+            screen, (255, 255, 255), (orbit[0] - 1, orbit[1] - 1), 1
+        )
+
+    # Amber notification badge for staged-but-unsaved engine changes.
+    if has_unsaved:
+        badge = (
+            medallion_centre[0] + medallion_radius - 3,
+            medallion_centre[1] - medallion_radius + 3,
+        )
+        pygame.draw.circle(screen, (43, 29, 9), (badge[0], badge[1] + 1), 5)
+        pygame.draw.circle(screen, (255, 196, 92), badge, 5)
+        pygame.draw.circle(screen, (255, 236, 178), badge, 5, 1)
+        pygame.draw.circle(
+            screen, (255, 255, 255), (badge[0] - 1, badge[1] - 1), 1
+        )
+
+    # Keep the original centred large label so the main menu's rhythm is
+    # retained; the medallion and slider bank occupy its side spaces.
+    label = "Engine Settings"
+    title_colour = _lerp_color(
+        (232, 238, 250), (255, 255, 255), hover_amount
+    )
+    title = font_large.render(label, True, title_colour)
+    title_rect = title.get_rect(center=visual_rect.center)
+    title_shadow = font_large.render(label, True, (18, 21, 34))
+    screen.blit(title_shadow, title_rect.move(0, 1))
+    screen.blit(title, title_rect)
+
+    # Five miniature staged-slider tracks, in Engine Settings page order.
+    # Their thumbs stay at the true normalised draft values; only a tiny
+    # scan glint travels on hover, so the visual summary remains honest.
+    slider_x = visual_rect.right - 96
+    slider_w = 40
+    slider_colours = {
+        "threads": (96, 174, 255),
+        "skill": (150, 140, 255),
+        "hash": (82, 211, 190),
+        "depth": (100, 220, 145),
+        "multipv": (255, 196, 102),
+    }
+    for index, key in enumerate(ENGINE_ROW_KEYS):
+        track_y = visual_rect.centery + (index - 2) * 7
+        fraction = _engine_settings_fraction(key, values[key])
+        thumb_x = int(round(slider_x + fraction * slider_w))
+        colour = slider_colours.get(key, (150, 180, 255))
+        pygame.draw.line(
+            screen,
+            (19, 23, 36),
+            (slider_x, track_y + 1),
+            (slider_x + slider_w, track_y + 1),
+            3,
+        )
+        pygame.draw.line(
+            screen,
+            (43, 50, 72),
+            (slider_x, track_y),
+            (slider_x + slider_w, track_y),
+            3,
+        )
+        if thumb_x > slider_x:
+            pygame.draw.line(
+                screen,
+                colour,
+                (slider_x, track_y),
+                (thumb_x, track_y),
+                3,
+            )
+        if hover_amount > 0.03:
+            scan_t = (
+                engine_settings_button_pulse_phase / (2.0 * math.pi)
+                + index * 0.17
+            ) % 1.0
+            scan_x = int(slider_x + scan_t * slider_w)
+            pygame.draw.circle(
+                screen,
+                _lerp_color(colour, (255, 255, 255), 0.55),
+                (scan_x, track_y),
+                1,
+            )
+        pygame.draw.circle(screen, (20, 24, 38), (thumb_x, track_y + 1), 3)
+        pygame.draw.circle(screen, (238, 244, 255), (thumb_x, track_y), 3)
+        pygame.draw.circle(screen, colour, (thumb_x, track_y), 2)
+        pygame.draw.circle(
+            screen,
+            (255, 255, 255),
+            (thumb_x - 1, track_y - 1),
+            1,
+        )
+
+    chevron_colour = _lerp_color(
+        (188, 201, 228), (255, 255, 255), hover_amount
+    )
+    chevron_x = (
+        visual_rect.right
+        - 24
+        + int(round(2 * hover_amount))
+        - (1 if pressed else 0)
+    )
+    _draw_engine_settings_chevron(
+        screen,
+        chevron_x,
+        visual_rect.centery,
+        chevron_colour,
+    )
+
+    # Current staged values in a tooltip above the row, where the main
+    # menu has clear space. It is suppressed while pressed so the click
+    # feedback remains clean during the page transition.
+    if hovered and not pressed:
+        summary = (
+            f"Threads {values['threads']} · Skill {values['skill']} · "
+            f"Hash {values['hash']} MB · Depth {values['depth']} · "
+            f"MultiPV {values['multipv']}"
+        )
+        if has_unsaved:
+            summary = "Unsaved · " + summary
+        summary = _elide_text(summary, font_tiny, 560)
+        tip = font_tiny.render(summary, True, TEXT_COLOR)
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(visual_rect.centerx - tip_w // 2, WIDTH - tip_w - 4),
+        )
+        tip_y = max(4, visual_rect.y - tip_h - 7)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (20, 24, 38), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen,
+            (255, 200, 104) if has_unsaved else (157, 183, 255),
+            tip_rect,
+            1,
+            border_radius=7,
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (20, 24, 38),
+            [
+                (pointer_x - 5, tip_rect.bottom - 1),
+                (pointer_x + 5, tip_rect.bottom - 1),
+                (
+                    pointer_x,
+                    min(visual_rect.y - 1, tip_rect.bottom + 5),
+                ),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
+
+
 def get_github_button_rect(offset_x=0, about_y=0):
     w, h = 220, 36
     x = WIDTH // 2 - w // 2 + offset_x
@@ -9132,19 +9627,24 @@ def draw_settings_menu(screen):
                     and transition_idle
                     and item_rect.collidepoint(mx, my)
                 )
-                bg = (80, 80, 120) if is_hovered else (60, 60, 60)
-                pygame.draw.rect(screen, bg, item_rect, border_radius=10)
-                pygame.draw.rect(
-                    screen,
-                    (150, 170, 255) if is_hovered else MENU_BORDER_COLOR,
-                    item_rect, 1, border_radius=10,
-                )
-                text_color = TEXT_COLOR if is_interactive else (150, 150, 150)
-                item_text = font_large.render(item, True, text_color)
-                screen.blit(item_text, item_text.get_rect(center=item_rect.center))
-                if is_interactive:
-                    chev = font_large.render("›", True, (200, 210, 255) if is_hovered else TEXT_MUTED)
-                    screen.blit(chev, chev.get_rect(center=(item_rect.right - 24, item_rect.centery)))
+                if item == "Engine Settings":
+                    draw_polished_engine_settings_button(
+                        screen, item_rect, is_hovered
+                    )
+                else:
+                    bg = (80, 80, 120) if is_hovered else (60, 60, 60)
+                    pygame.draw.rect(screen, bg, item_rect, border_radius=10)
+                    pygame.draw.rect(
+                        screen,
+                        (150, 170, 255) if is_hovered else MENU_BORDER_COLOR,
+                        item_rect, 1, border_radius=10,
+                    )
+                    text_color = TEXT_COLOR if is_interactive else (150, 150, 150)
+                    item_text = font_large.render(item, True, text_color)
+                    screen.blit(item_text, item_text.get_rect(center=item_rect.center))
+                    if is_interactive:
+                        chev = font_large.render("›", True, (200, 210, 255) if is_hovered else TEXT_MUTED)
+                        screen.blit(chev, chev.get_rect(center=(item_rect.right - 24, item_rect.centery)))
 
             about_y = start_y + len(menu_items) * (item_height + 20) + 40 + open_slide
 
