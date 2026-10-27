@@ -39,7 +39,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Board themes:** any folder under `pieces/<theme>/` (e.g. `classic`). Auto-discovered, `classic` pinned first
 - **Chess.com styles:** any subfolder in `pieces/chesscom/<style>/` (e.g. `8_bit`, `chesskid` → "8-Bit", "ChessKid")
 - **Info panel:** opening name (from `openings.json`), game status (`Check!` / `Draw — …`), stats, opening/rec-move row
-- **Top bar:** `New` + detailed gear icon → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
+- **Top bar:** `New` + a polished metallic settings button — rounded gradient/glass body, hover glow and tooltip, and a supersampled cog with beveled teeth, rim, bolts and hub that slowly turns while hovered → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
 - **Settings pages:**
   - **Pieces Styles** — visual, scrollable style cards with sample pieces on board-coloured squares, source/current-state labels, hover highlighting, and a full 12-piece preview using the active board colours
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
@@ -102,7 +102,7 @@ python new.py --help
 | **Pawn to last rank** | Promotion dialog — click Q/R/B/N (no pawn/king) |
 | **Space** (menu closed, not animating) | Play engine's `pv[0]` if legal |
 | **New** (top bar) | Smooth animated reset to starting position, clear eval |
-| **Gear** (top bar) | Open Settings overlay (detailed cog with spokes) |
+| **Gear** (top bar) | Open Settings overlay; hovering brightens the button, turns the detailed cog slowly, and shows a “Settings” tooltip |
 | **Mouse drag on slider** (Engine Settings) | Adjust Threads/Skill/Hash/Depth live |
 | **Github / Restart** (About) | Open repo in browser / restart via start.bat |
 | **Mouse wheel** (Pieces Styles) | Scroll the visual style cards; hover a card to preview all 12 pieces, click to apply |
