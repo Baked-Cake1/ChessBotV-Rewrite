@@ -274,7 +274,7 @@ MAX_THREADS = max(1, os.cpu_count() or 1)
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both"}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0}
 _STRING_CONFIG_KEYS = ("theme", "board_theme", "auto_move_color")
 
 
@@ -301,7 +301,14 @@ def _clamp_config_limits(cfg):
     color = str(cfg.get("auto_move_color", "both")).strip().lower()
     cfg["auto_move_color"] = color if color in ("white", "black", "both") else "both"
     cfg["always_on_top"] = 1 if cfg.get("always_on_top", 1) else 0
-    cfg["auto_move"] = 1 if cfg.get("auto_move", 0) else 0
+    # Auto-Move's on/off state is deliberately session-only. Even if an
+    # older configuration file still contains ``auto_move=1``, startup must
+    # ignore it and leave the feature off until the user enables it again.
+    cfg["auto_move"] = 0
+    try:
+        cfg["auto_move_depth"] = max(0, min(int(cfg.get("auto_move_depth", 0)), 40))
+    except Exception:
+        cfg["auto_move_depth"] = 0
     return cfg
 
 
@@ -342,7 +349,12 @@ def load_config():
 
 
 def save_config():
-    """Persist engine settings to configuration.cfg."""
+    """Persist preferences to configuration.cfg.
+
+    Auto-Move's enabled state is intentionally *not* written: it is a
+    per-session safety choice and always starts off on the next launch.
+    Its colour/depth preferences may still be remembered.
+    """
     try:
         with open("configuration.cfg", "w") as f:
             f.write(f"hash={config['hash']}\n")
@@ -353,8 +365,8 @@ def save_config():
             f.write(f"theme={config.get('theme', current_theme)}\n")
             f.write(f"board_theme={config.get('board_theme', current_board_theme)}\n")
             f.write(f"always_on_top={1 if config.get('always_on_top', 1) else 0}\n")
-            f.write(f"auto_move={1 if config.get('auto_move', 0) else 0}\n")
             f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
+            f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
 
@@ -369,6 +381,7 @@ def save_theme_config(theme_id):
 always_on_top_enabled = True
 auto_move_enabled = False
 auto_move_color = "both"  # "white" | "black" | "both"
+auto_move_depth = 0  # 0 means "use the configured Depth Limit"
 auto_move_arm_reset = False  # main() consumes this to re-arm Auto-Move
 auto_move_status_text = ""  # human-readable arming state for the Analysis page
 show_auto_color_dialog = False
@@ -451,18 +464,55 @@ def apply_always_on_top(enabled, persist=False):
 
 def set_auto_move(enabled, color=None, persist=True):
     """Enable/disable Auto-Move (optionally choosing its colour) and ask
-    main() to restart its arming sequence."""
+    main() to restart its arming sequence.
+
+    The enabled flag itself is runtime-only. Calling ``save_config`` here
+    is safe because that function deliberately omits it; only harmless
+    preferences such as colour and target depth are written to disk.
+    """
     global auto_move_enabled, auto_move_color, auto_move_arm_reset
     if color is not None:
         c = str(color).strip().lower()
         auto_move_color = c if c in ("white", "black", "both") else "both"
     auto_move_enabled = bool(enabled)
-    config["auto_move"] = 1 if auto_move_enabled else 0
+    config["auto_move"] = 0
     config["auto_move_color"] = auto_move_color
     auto_move_arm_reset = True
     if persist:
         save_config()
     return auto_move_enabled
+
+
+def get_auto_move_depth():
+    """Return the depth at which internal Auto-Move should play.
+
+    ``auto_move_depth == 0`` is the documented sentinel for the current
+    Engine Settings Depth Limit. A positive choice is also capped at that
+    limit because the analysis search never goes deeper than it.
+    """
+    try:
+        limit = int(globals().get("ANALYSIS_DEPTH", config.get("depth", 25)))
+    except Exception:
+        limit = 25
+    limit = max(1, limit)
+    try:
+        chosen = int(auto_move_depth)
+    except Exception:
+        chosen = 0
+    return limit if chosen <= 0 else min(chosen, limit)
+
+
+def set_auto_move_depth(depth, persist=True):
+    """Set Auto-Move's target depth (0..40; 0 means Depth Limit)."""
+    global auto_move_depth
+    try:
+        auto_move_depth = max(0, min(int(depth), 40))
+    except Exception:
+        auto_move_depth = 0
+    config["auto_move_depth"] = auto_move_depth
+    if persist:
+        save_config()
+    return auto_move_depth
 
 
 def normalise_board_theme(value):
@@ -644,17 +694,26 @@ if _desired_on_top:
 else:
     set_always_on_top(False)
     always_on_top_enabled = False
-auto_move_enabled = bool(config.get("auto_move", 0))
+# Do not restore Auto-Move from disk. It always starts off; the user must
+# explicitly switch it on during this session. Colour/depth are ordinary
+# preferences and can be restored without enabling the feature.
+auto_move_enabled = False
+config["auto_move"] = 0
 auto_move_color = config.get("auto_move_color", "both")
+try:
+    auto_move_depth = max(0, min(int(config.get("auto_move_depth", 0)), 40))
+except Exception:
+    auto_move_depth = 0
 auto_move_arm_reset = True
 
-# Pieces Style (board theme) menu layout & scrolling — compact 2-column + preview
-# Container was clipping second row of preview pieces (44 + 34 + 28 =106 >92); enlarge to fit
-THEME_PREVIEW_H = 116
+# Pieces Style menu layout & scrolling — two columns of visual style cards
+# below a larger live preview. Cards are tall enough to show sample pieces,
+# the style name and its source instead of being text-only buttons.
+THEME_PREVIEW_H = 126
 THEME_PREVIEW_Y = 82
-THEME_LIST_TOP = 212
-THEME_ITEM_HEIGHT = 36
-THEME_ITEM_GAP = 8
+THEME_LIST_TOP = 238
+THEME_ITEM_HEIGHT = 62
+THEME_ITEM_GAP = 10
 THEME_ITEM_WIDTH = 190
 THEME_COL_GAP = 12
 THEME_LIST_BOTTOM = HEIGHT - 40
@@ -698,6 +757,10 @@ auto_move_anim = 1.0 if auto_move_enabled else 0.0
 autoplay_anim = 0.0
 # Smoothed depth progress-bar fill (0..1 of the target depth)
 depth_bar_fraction = 0.0
+# One-shot opening animation for the in-window title. It advances once per
+# frame in update_global_anims() and is never reset during the session.
+title_slide_progress = 0.0
+TITLE_SLIDE_SPEED = 1.0 / 48.0  # about 0.8 seconds at 60 FPS
 
 images = get_piece_images(current_theme)
 openings = load_openings()
@@ -855,6 +918,9 @@ def update_global_anims():
     global always_on_top_anim, auto_move_anim, auto_color_dialog_anim
     global board_detection_dialog_anim, autoplay_anim
     global autoplay_side_dialog_anim, autoplay_gameover_dialog_anim
+    global title_slide_progress
+    if title_slide_progress < 1.0:
+        title_slide_progress = min(1.0, title_slide_progress + TITLE_SLIDE_SPEED)
     legal_pulse_t += 0.08
     eval_highlight_pulse += 0.06
     if show_newgame_confirm:
@@ -899,6 +965,12 @@ def update_global_anims():
         globals()[name] = target if abs(cur - target) < 0.02 else cur + (target - cur) * 0.25
 
 # --- Math & Animations ---
+def cubic_ease_in(t):
+    """Cubic ease-in: starts slowly, then accelerates into place."""
+    t = max(0.0, min(1.0, float(t)))
+    return t * t * t
+
+
 def cubic_ease_in_out(t):
     if t < 0.5:
         return 4 * t * t * t
@@ -1631,6 +1703,20 @@ class EngineThread:
         """Queue UCI options to apply before the next engine search."""
         with self.lock:
             self.pending_params.update(params)
+
+    def recalculate_current(self):
+        """Force the current board to be searched again.
+
+        Re-publishing the same board is intentional: it stops any running
+        search, bumps ``search_token`` and clears the old readout. Without
+        the token bump, applying a new MultiPV value would leave the loop
+        idle because the FEN still matches ``last_searched_fen``.
+        Pending UCI options remain queued and are applied by the loop
+        immediately before this fresh search starts.
+        """
+        with self.lock:
+            current = self.board.copy()
+        self.update_position(current)
 
     def _analyze_loop(self):
         last_searched_fen = None
@@ -2522,6 +2608,53 @@ def update_menu_transition():
             menu_transition_direction = "none"
 
 
+def _pieces_style_source(theme_id):
+    return "Chess.com" if str(theme_id).startswith("chesscom/") else "Built-in"
+
+
+def _pieces_style_layout(themes, offset_x=0, offset_y=0):
+    """Shared Pieces Styles geometry for drawing, clicking and scrolling.
+
+    Keeping these calculations in one place prevents the visual cards and
+    their hit-boxes drifting apart when the menu layout changes.
+    """
+    cols = 2
+    rows = (len(themes) + cols - 1) // cols
+    viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
+    total_h = max(
+        1,
+        rows * THEME_ITEM_HEIGHT + max(0, rows - 1) * THEME_ITEM_GAP,
+    )
+    max_scroll = max(0, total_h - viewport_h)
+    scroll = max(0.0, min(float(theme_scroll_offset), float(max_scroll)))
+    top = THEME_LIST_TOP + offset_y
+    viewport = pygame.Rect(WIDTH // 2 - 200 + offset_x, top, 400, viewport_h)
+    rects = []
+    for i, (theme_id, display_name) in enumerate(themes):
+        row, col = divmod(i, cols)
+        rect = pygame.Rect(
+            viewport.x + col * (THEME_ITEM_WIDTH + THEME_COL_GAP),
+            top + row * (THEME_ITEM_HEIGHT + THEME_ITEM_GAP) - int(scroll),
+            THEME_ITEM_WIDTH,
+            THEME_ITEM_HEIGHT,
+        )
+        rects.append((theme_id, display_name, rect))
+    return viewport, rects, total_h, max_scroll, scroll
+
+
+def _draw_style_mini_preview(screen, theme_id, x, y):
+    """Draw a white queen / black knight sample on two board squares."""
+    previews = get_preview_images(theme_id)
+    samples = (("wq", LIGHT_SQ), ("bn", DARK_SQ))
+    for index, (piece_key, square_colour) in enumerate(samples):
+        square = pygame.Rect(x + index * 31, y, 30, 30)
+        pygame.draw.rect(screen, square_colour, square, border_radius=5)
+        pygame.draw.rect(screen, (28, 28, 32), square, 1, border_radius=5)
+        image = previews.get(piece_key)
+        if image is not None:
+            screen.blit(image, (square.x + 1, square.y + 1))
+
+
 def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
     global current_theme, theme_scroll_offset
 
@@ -2529,52 +2662,71 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
     themes = get_available_themes()
 
     # --- Preview panel (reserved section) ---
-    preview_rect = pygame.Rect(WIDTH // 2 - 200 + offset_x, THEME_PREVIEW_Y + offset_y, 400, THEME_PREVIEW_H)
-    pygame.draw.rect(screen, (45, 45, 50), preview_rect, border_radius=8)
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, preview_rect, 2, border_radius=8)
+    preview_rect = pygame.Rect(
+        WIDTH // 2 - 200 + offset_x,
+        THEME_PREVIEW_Y + offset_y,
+        400,
+        THEME_PREVIEW_H,
+    )
+    pygame.draw.rect(screen, (34, 34, 40), preview_rect.move(0, 3), border_radius=12)
+    pygame.draw.rect(screen, (48, 48, 58), preview_rect, border_radius=12)
+    pygame.draw.rect(screen, (120, 150, 220), preview_rect, 2, border_radius=12)
 
-    # Determine hovered theme for preview
-    # Need to compute grid to know hover, but we can first do quick hover check using same grid logic
-    # For preview we need to know hovered theme; we'll compute after we know layout, but preview should be drawn first
-    # So temporarily find hovered by scanning with current scroll (compact grid)
-    item_h = THEME_ITEM_HEIGHT
-    gap = THEME_ITEM_GAP
-    top = THEME_LIST_TOP + offset_y
-    cols = 2
-    rows = (len(themes) + cols - 1) // cols
-    viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
-    total_h = max(1, rows * item_h + max(0, rows - 1) * gap)
-    max_scroll = max(0, total_h - viewport_h)
-    theme_scroll_offset = max(0.0, min(theme_scroll_offset, max_scroll))
-    viewport = pygame.Rect(WIDTH // 2 - 200 + offset_x, top, 400, viewport_h)
+    viewport, style_rects, total_h, max_scroll, scroll = _pieces_style_layout(
+        themes, offset_x, offset_y
+    )
+    theme_scroll_offset = scroll
+    top = viewport.y
+    viewport_h = viewport.height
 
     hovered_theme = None
     hovered_display = None
-    for i, (tid, dname) in enumerate(themes):
-        row = i // cols
-        col = i % cols
-        x = viewport.x + col * (THEME_ITEM_WIDTH + THEME_COL_GAP)
-        y = top + row * (item_h + gap) - int(theme_scroll_offset)
-        r = pygame.Rect(x, y, THEME_ITEM_WIDTH, item_h)
-        if viewport.collidepoint(mx, my) and r.collidepoint(mx, my) and menu_transition_direction == "none":
-            hovered_theme = tid
-            hovered_display = dname
-            break
+    if viewport.collidepoint(mx, my) and menu_transition_direction == "none":
+        for tid, dname, rect in style_rects:
+            if rect.collidepoint(mx, my):
+                hovered_theme = tid
+                hovered_display = dname
+                break
 
     preview_theme = hovered_theme if hovered_theme is not None else current_theme
     preview_display = hovered_display if hovered_display is not None else next((d for tid, d in themes if tid == current_theme), current_theme)
-    # Title in preview
-    title_s = font_tiny.render("Preview — Hover a style to see pieces", True, TEXT_MUTED)
-    screen.blit(title_s, (preview_rect.centerx - title_s.get_width() // 2, preview_rect.y + 6))
-    name_s = font_small.render(preview_display, True, TEXT_ACCENT if hovered_theme else TEXT_COLOR)
-    screen.blit(name_s, (preview_rect.centerx - name_s.get_width() // 2, preview_rect.y + 22))
-    # Draw 12 pieces in 2 rows of 6
+    # The preview follows the hovered card, falling back to the active
+    # style. A status pill makes it clear whether clicking would change it.
+    title_s = font_tiny.render("STYLE PREVIEW", True, TEXT_MUTED)
+    screen.blit(title_s, (preview_rect.x + 16, preview_rect.y + 10))
+    preview_is_current = preview_theme == current_theme
+    status_text = "Current style" if preview_is_current else "Click card to apply"
+    status_s = font_tiny.render(status_text, True, (20, 34, 24) if preview_is_current else TEXT_COLOR)
+    status_rect = pygame.Rect(
+        preview_rect.right - status_s.get_width() - 24,
+        preview_rect.y + 8,
+        status_s.get_width() + 16,
+        20,
+    )
+    pygame.draw.rect(
+        screen,
+        (126, 214, 148) if preview_is_current else (82, 82, 108),
+        status_rect,
+        border_radius=10,
+    )
+    screen.blit(status_s, status_s.get_rect(center=status_rect.center))
+
+    display_text = _elide_text(preview_display, font_small, 245)
+    name_s = font_small.render(display_text, True, TEXT_ACCENT if hovered_theme else TEXT_COLOR)
+    screen.blit(name_s, (preview_rect.x + 16, preview_rect.y + 28))
+    source_s = font_tiny.render(
+        f"{_pieces_style_source(preview_theme)} piece set",
+        True,
+        TEXT_MUTED,
+    )
+    screen.blit(source_s, (preview_rect.x + 16, preview_rect.y + 48))
+
+    # Draw all 12 piece types on miniature board-coloured squares. Using
+    # the active board palette shows how the set will actually look in play.
     prev_imgs = get_preview_images(preview_theme)
-    # order: white K Q R B N P / black K Q R B N P
     order = ["wk", "wq", "wr", "wb", "wn", "wp", "bk", "bq", "br", "bb", "bn", "bp"]
-    # Layout
     piece_sz = 28
-    gap_px = 6
+    gap_px = 5
     per_row = 6
     row_w = per_row * piece_sz + (per_row - 1) * gap_px
     start_x = preview_rect.centerx - row_w // 2
@@ -2582,52 +2734,84 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
         row = idx // per_row
         col = idx % per_row
         px = start_x + col * (piece_sz + gap_px)
-        py = preview_rect.y + 44 + row * (piece_sz + gap_px)
-        # small square bg for each piece
-        bg = (60, 60, 60) if (row + col) % 2 == 0 else (70, 70, 70)
-        # alternate light/dark like board for preview
-        pygame.draw.rect(screen, bg, (px, py, piece_sz, piece_sz), border_radius=3)
-        pygame.draw.rect(screen, (90, 90, 90), (px, py, piece_sz, piece_sz), 1, border_radius=3)
+        py = preview_rect.y + 64 + row * (piece_sz + gap_px)
+        bg = LIGHT_SQ if (row + col) % 2 == 0 else DARK_SQ
+        pygame.draw.rect(screen, bg, (px, py, piece_sz, piece_sz), border_radius=4)
+        pygame.draw.rect(screen, (25, 25, 30), (px, py, piece_sz, piece_sz), 1, border_radius=4)
         if pkey in prev_imgs:
             screen.blit(prev_imgs[pkey], (px, py))
 
-    # --- Compact 2-column grid ---
+    count_text = f"{len(themes)} style{'s' if len(themes) != 1 else ''} available"
+    count_s = font_tiny.render(count_text, True, TEXT_MUTED)
+    screen.blit(count_s, (preview_rect.x, preview_rect.bottom + 8))
+    if max_scroll > 0:
+        scroll_s = font_tiny.render("Scroll to browse", True, TEXT_MUTED)
+        screen.blit(
+            scroll_s,
+            (
+                preview_rect.right - scroll_s.get_width(),
+                preview_rect.bottom + 8,
+            ),
+        )
+
+    # --- Two-column visual style cards ---
     screen.set_clip(viewport)
-    for i, (theme_id, display_name) in enumerate(themes):
-        row = i // cols
-        col = i % cols
-        x = viewport.x + col * (THEME_ITEM_WIDTH + THEME_COL_GAP)
-        y = top + row * (item_h + gap) - int(theme_scroll_offset)
-        theme_rect = pygame.Rect(x, y, THEME_ITEM_WIDTH, item_h)
-        if theme_rect.bottom < top or theme_rect.top > top + viewport_h:
+    for theme_id, display_name, theme_rect in style_rects:
+        if not theme_rect.colliderect(viewport):
             continue
 
         is_current = theme_id == current_theme
         is_hovered = (
-            theme_rect.collidepoint(mx, my)
+            theme_id == hovered_theme
             and viewport.collidepoint(mx, my)
             and menu_transition_direction == "none"
         )
 
         if is_current:
-            bg_color = (80, 80, 120)
-            if is_hovered:
-                bg_color = (100, 100, 150)
+            bg_color = (79, 94, 116) if is_hovered else (64, 78, 98)
+            border_color = (126, 214, 148)
+        elif is_hovered:
+            bg_color = (76, 76, 102)
+            border_color = (150, 170, 255)
         else:
-            bg_color = (60, 60, 60)
-            if is_hovered:
-                bg_color = (80, 80, 80)
+            bg_color = (55, 55, 65)
+            border_color = MENU_BORDER_COLOR
 
-        pygame.draw.rect(screen, bg_color, theme_rect, border_radius=4)
-        pygame.draw.rect(screen, MENU_BORDER_COLOR, theme_rect, 1, border_radius=4)
-
-        # Use small font for compact
-        theme_text = font_small.render(display_name, True, TEXT_COLOR)
-        theme_text_rect = theme_text.get_rect(center=theme_rect.center)
-        screen.blit(theme_text, theme_text_rect)
-        # current indicator dot
+        # A subtle offset shadow plus a stronger selected border gives the
+        # cards depth without changing their click geometry.
+        pygame.draw.rect(screen, (28, 28, 33), theme_rect.move(0, 2), border_radius=10)
+        pygame.draw.rect(screen, bg_color, theme_rect, border_radius=10)
+        pygame.draw.rect(
+            screen,
+            border_color,
+            theme_rect,
+            2 if is_current or is_hovered else 1,
+            border_radius=10,
+        )
         if is_current:
-            pygame.draw.circle(screen, (120, 200, 120), (theme_rect.right - 10, theme_rect.centery), 4)
+            accent = pygame.Rect(theme_rect.x, theme_rect.y + 10, 4, theme_rect.height - 20)
+            pygame.draw.rect(screen, (126, 214, 148), accent, border_radius=2)
+
+        _draw_style_mini_preview(
+            screen,
+            theme_id,
+            theme_rect.x + 10,
+            theme_rect.centery - 15,
+        )
+
+        text_x = theme_rect.x + 82
+        name_text = _elide_text(display_name, font_small, theme_rect.right - text_x - 8)
+        name_s = font_small.render(name_text, True, TEXT_COLOR)
+        screen.blit(name_s, (text_x, theme_rect.y + 10))
+
+        detail = "Current style" if is_current else _pieces_style_source(theme_id)
+        detail_colour = (
+            (126, 214, 148)
+            if is_current
+            else TEXT_ACCENT if is_hovered else TEXT_MUTED
+        )
+        detail_s = font_tiny.render(detail, True, detail_colour)
+        screen.blit(detail_s, (text_x, theme_rect.y + 35))
     screen.set_clip(None)
 
     # Scrollbar + hint (only when the list overflows the viewport)
@@ -2652,14 +2836,11 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
 
 
 def scroll_theme_list(delta):
-    """Scroll the board theme list (positive delta scrolls towards the end)."""
+    """Scroll the Pieces Styles cards (positive delta moves towards the end)."""
     global theme_scroll_offset
-    themes = get_available_themes()
-    cols = 2
-    rows = (len(themes) + cols - 1) // cols
-    total_h = rows * THEME_ITEM_HEIGHT + max(0, rows - 1) * THEME_ITEM_GAP
-    viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
-    max_scroll = max(0, total_h - viewport_h)
+    _viewport, _rects, _total_h, max_scroll, _scroll = _pieces_style_layout(
+        get_available_themes()
+    )
     theme_scroll_offset = max(0.0, min(theme_scroll_offset + delta, max_scroll))
 
 
@@ -5081,9 +5262,9 @@ def handle_autoplay_gameover_click(mx, my):
 
 
 def get_board_detection_button_rect(offset_x=0, offset_y=0):
-    # Sit below the Auto-Move colour/status controls when they are shown;
-    # otherwise keep the Analysis page compact.
-    y = 452 if (auto_move_enabled or show_auto_color_dialog) else 330
+    # Sit below the always-visible Auto-Move depth row, and below the
+    # colour/status controls too when Auto-Move is enabled.
+    y = 494 if auto_move_enabled else 386
     return pygame.Rect(WIDTH // 2 - 220 + offset_x, y + offset_y, 440, 88)
 
 
@@ -5402,12 +5583,77 @@ def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(WIDTH // 2 - 220 + offset_x, 150 + offset_y, 440, 94)
 
 
+def get_auto_move_depth_rects(offset_x=0, offset_y=0):
+    """Row and − / value / + controls for Auto-Move's target depth."""
+    row = pygame.Rect(WIDTH // 2 - 220 + offset_x, 304 + offset_y, 440, 58)
+    minus = pygame.Rect(row.right - 178, row.centery - 18, 42, 36)
+    value = pygame.Rect(minus.right + 8, row.centery - 18, 72, 36)
+    plus = pygame.Rect(value.right + 8, row.centery - 18, 42, 36)
+    return row, minus, value, plus
+
+
+def _draw_auto_move_depth_row(screen, offset_x=0, offset_y=0, idle=True):
+    row, minus, value_rect, plus = get_auto_move_depth_rects(offset_x, offset_y)
+    mx, my = pygame.mouse.get_pos()
+    row_hovered = idle and row.collidepoint(mx, my)
+    pygame.draw.rect(
+        screen,
+        (68, 68, 88) if row_hovered else (54, 54, 64),
+        row,
+        border_radius=10,
+    )
+    pygame.draw.rect(
+        screen,
+        (150, 170, 255) if row_hovered else MENU_BORDER_COLOR,
+        row,
+        2,
+        border_radius=10,
+    )
+
+    label = font_small.render("Auto-Move Depth", True, TEXT_COLOR)
+    screen.blit(label, (row.x + 18, row.y + 8))
+    effective = get_auto_move_depth()
+    if auto_move_depth == 0:
+        detail = f"0 = Depth Limit ({effective})"
+    elif auto_move_depth > effective:
+        detail = f"Plays at Depth Limit ({effective})"
+    else:
+        detail = f"Plays at depth {effective}"
+    detail_s = font_tiny.render(detail, True, TEXT_MUTED)
+    screen.blit(detail_s, (row.x + 18, row.y + 34))
+
+    for rect, symbol, enabled in (
+        (minus, "−", auto_move_depth > 0),
+        (plus, "+", auto_move_depth < 40),
+    ):
+        hovered = idle and enabled and rect.collidepoint(mx, my)
+        bg = (92, 92, 120) if hovered else (70, 70, 82) if enabled else (48, 48, 56)
+        pygame.draw.rect(screen, bg, rect, border_radius=8)
+        pygame.draw.rect(
+            screen,
+            (150, 170, 255) if hovered else MENU_BORDER_COLOR,
+            rect,
+            1,
+            border_radius=8,
+        )
+        symbol_s = font_small.render(
+            symbol, True, TEXT_COLOR if enabled else TEXT_MUTED
+        )
+        screen.blit(symbol_s, symbol_s.get_rect(center=rect.center))
+
+    pygame.draw.rect(screen, (38, 38, 46), value_rect, border_radius=8)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, value_rect, 1, border_radius=8)
+    value_s = font_small.render(str(auto_move_depth), True, TEXT_ACCENT)
+    screen.blit(value_s, value_s.get_rect(center=value_rect.center))
+    return row, minus, value_rect, plus
+
+
 def get_auto_move_color_rects(offset_x=0, offset_y=0):
     colors = ("white", "black", "both")
     w, h, gap = 140, 46, 10
     total = 3 * w + 2 * gap
     x0 = WIDTH // 2 - total // 2 + offset_x
-    return {c: pygame.Rect(x0 + i * (w + gap), 332 + offset_y, w, h) for i, c in enumerate(colors)}
+    return {c: pygame.Rect(x0 + i * (w + gap), 402 + offset_y, w, h) for i, c in enumerate(colors)}
 
 
 def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
@@ -5422,7 +5668,7 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
     intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
     screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 112 + offset_y))
 
-    threshold = min(20, ANALYSIS_DEPTH)
+    threshold = get_auto_move_depth()
     rect = get_auto_move_toggle_rect(offset_x, offset_y)
     shown_on = auto_move_enabled or show_auto_color_dialog
     draw_toggle_row(
@@ -5433,12 +5679,14 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
 
     line1 = font_tiny.render("When on, the engine's best move is played for you", True, TEXT_MUTED)
     line2 = font_tiny.render(f"as soon as the search reaches depth {threshold}.", True, TEXT_MUTED)
-    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, 258 + offset_y))
-    screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, 278 + offset_y))
+    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, 254 + offset_y))
+    screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, 272 + offset_y))
+
+    _draw_auto_move_depth_row(screen, offset_x, offset_y, idle=idle)
 
     if auto_move_enabled:
         label = font_small.render("Auto-move for", True, TEXT_COLOR)
-        screen.blit(label, (WIDTH // 2 - label.get_width() // 2 + offset_x, 306 + offset_y))
+        screen.blit(label, (WIDTH // 2 - label.get_width() // 2 + offset_x, 376 + offset_y))
         for color, crect in get_auto_move_color_rects(offset_x, offset_y).items():
             selected = color == auto_move_color
             hovered = idle and crect.collidepoint(mx, my)
@@ -5449,7 +5697,7 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
             screen.blit(txt, txt.get_rect(center=crect.center))
         status = auto_move_status_text or "Active"
         status_s = font_tiny.render(status, True, TEXT_ACCENT)
-        screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 398 + offset_y))
+        screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 464 + offset_y))
 
     # Board Detection action card (not a toggle): opens the window picker.
     bd_rect = get_board_detection_button_rect(offset_x, offset_y)
@@ -5679,16 +5927,27 @@ def reset_engine_settings():
 def apply_engine_settings():
     global ANALYSIS_DEPTH, engine_has_changes
     changed=False
+    multipv_changed=False
     for k in ENGINE_ROW_KEYS:
         if engine_draft.get(k) != config.get(k):
             config[k]=engine_draft[k]
             changed=True
+            if k == "multipv":
+                multipv_changed=True
             if k == "depth":
                 ANALYSIS_DEPTH = engine_draft[k]
             if engine_thread is not None and k in ENGINE_PARAM_NAMES:
                 engine_thread.set_pending_parameters({ENGINE_PARAM_NAMES[k]: engine_draft[k]})
     if changed:
         save_config()
+    # MultiPV changes the number/shape of lines for the position already
+    # on screen, so applying it must immediately recalculate that board
+    # rather than waiting for the next move.
+    if multipv_changed and engine_thread is not None:
+        try:
+            engine_thread.recalculate_current()
+        except Exception as exc:
+            print(f"Failed to recalculate after MultiPV change: {exc}")
     engine_has_changes=False
 
 
@@ -6119,6 +6378,15 @@ def handle_menu_click(mx, my):
                 show_auto_color_dialog = True
                 auto_color_dialog_anim = 0.0
             return True
+        _depth_row, depth_minus, _depth_value, depth_plus = (
+            get_auto_move_depth_rects()
+        )
+        if depth_minus.collidepoint(mx, my):
+            set_auto_move_depth(auto_move_depth - 1)
+            return True
+        if depth_plus.collidepoint(mx, my):
+            set_auto_move_depth(auto_move_depth + 1)
+            return True
         if auto_move_enabled:
             for color, rect in get_auto_move_color_rects().items():
                 if rect.collidepoint(mx, my):
@@ -6149,29 +6417,17 @@ def handle_menu_click(mx, my):
                 return True
 
     elif settings_menu_state == "pieces_style":
-        themes = get_available_themes()
-        item_height = THEME_ITEM_HEIGHT
-        gap = THEME_ITEM_GAP
-        top = THEME_LIST_TOP
-        viewport = pygame.Rect(
-            WIDTH // 2 - 200, top, 400, THEME_LIST_BOTTOM - top
+        viewport, style_rects, _total_h, _max_scroll, _scroll = (
+            _pieces_style_layout(get_available_themes())
         )
-        cols = 2
-        for i, (theme_id, _display) in enumerate(themes):
-            row = i // cols
-            col = i % cols
-            x = WIDTH // 2 - 200 + col * (THEME_ITEM_WIDTH + THEME_COL_GAP)
-            y = top + row * (item_height + gap) - int(theme_scroll_offset)
-            theme_rect = pygame.Rect(x, y, THEME_ITEM_WIDTH, item_height)
-            if (
-                viewport.collidepoint(mx, my)
-                and theme_rect.collidepoint(mx, my)
-            ):
-                if theme_id != current_theme:
-                    current_theme = theme_id
-                    images = get_piece_images(current_theme)
-                    save_theme_config(current_theme)
-                return True
+        if viewport.collidepoint(mx, my):
+            for theme_id, _display, theme_rect in style_rects:
+                if theme_rect.collidepoint(mx, my):
+                    if theme_id != current_theme:
+                        current_theme = theme_id
+                        images = get_piece_images(current_theme)
+                        save_theme_config(current_theme)
+                    return True
 
     elif settings_menu_state == "engine_settings":
         for i, key in enumerate(ENGINE_ROW_KEYS):
@@ -6358,7 +6614,23 @@ def draw_gui(
     hist_x = PADDING
     if menu_anim_progress == 0:
         title_s = font_large.render("ChessBotV Rewrite", True, TEXT_COLOR)
-        screen.blit(title_s, (PADDING, (TOP_BAR_HEIGHT - title_s.get_height()) // 2))
+        # One-shot opening slide: start fully off the left edge and move
+        # into the normal title position with cubic-in easing (t³). The
+        # history label keeps using the final title width, so it does not
+        # jump around while the title is arriving.
+        title_ease = cubic_ease_in(title_slide_progress)
+        title_start_x = -title_s.get_width() - 16
+        title_x = int(
+            title_start_x + (PADDING - title_start_x) * title_ease
+        )
+        if title_slide_progress < 1.0:
+            title_s.set_alpha(
+                int(70 + 185 * max(0.0, min(1.0, title_slide_progress)))
+            )
+        screen.blit(
+            title_s,
+            (title_x, (TOP_BAR_HEIGHT - title_s.get_height()) // 2),
+        )
         hist_x = PADDING + title_s.get_width() + 16
     if total_ply:
         _view = len(board.move_stack) if view_ply is None else view_ply
@@ -6394,14 +6666,34 @@ def draw_gui(
         anim_mgr.current_eval,
         mate,
     )
-    # click hint when hovered
+    # Click hint when hovered. Centre it on the narrow eval bar, but clamp
+    # the whole tooltip inside the window: previously the text was centred
+    # on a 32px-wide bar at either edge, so roughly half of it was clipped
+    # off-screen. A small pointer still indicates which bar it belongs to.
     if get_eval_bar_rect().collidepoint(mouse_pos):
-        hint = font_tiny.render("Click to swap side", True, TEXT_MUTED)
-        # show above bar
-        tx = eval_bar_x + EVAL_BAR_WIDTH//2 - hint.get_width()//2
-        ty = eval_bar_y - 18
-        if ty > 2:
-            screen.blit(hint, (tx, ty))
+        hint = font_tiny.render("Click to swap side", True, TEXT_COLOR)
+        tip_w = hint.get_width() + 18
+        tip_h = 24
+        tip_x = eval_bar_x + EVAL_BAR_WIDTH // 2 - tip_w // 2
+        tip_x = max(4, min(tip_x, WIDTH - tip_w - 4))
+        tip_y = max(4, eval_bar_y - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (22, 22, 28), tip_rect, border_radius=7)
+        pygame.draw.rect(screen, (120, 150, 220), tip_rect, 1, border_radius=7)
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(eval_bar_x + EVAL_BAR_WIDTH // 2, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (22, 22, 28),
+            [
+                (pointer_x - 5, tip_rect.bottom - 1),
+                (pointer_x + 5, tip_rect.bottom - 1),
+                (pointer_x, min(eval_bar_y - 1, tip_rect.bottom + 5)),
+            ],
+        )
+        screen.blit(hint, hint.get_rect(center=tip_rect.center))
 
     # 2. Board — supports flip and smooth evaluation-side slide
     board_ox = int(get_board_ox())
@@ -7501,7 +7793,7 @@ def main():
             and _pos_key != auto_fired_key
             and (auto_move_color == "both" or board.turn == (chess.WHITE if auto_move_color == "white" else chess.BLACK))
         ):
-            _threshold = min(20, ANALYSIS_DEPTH) if ANALYSIS_DEPTH else 20
+            _threshold = get_auto_move_depth()
             with engine_thread.lock:
                 _depth_now = engine_thread.info.get("depth", 0)
                 _pv_now = list(engine_thread.info.get("pv", []))
