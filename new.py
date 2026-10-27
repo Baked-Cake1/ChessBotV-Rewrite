@@ -841,6 +841,11 @@ new_game_button_rect = pygame.Rect(
 flip_button_rect = pygame.Rect(
     new_game_button_rect.x - 10 - 50, _button_y, 50, 30
 )
+# Small interactive polish for the settings cog: it eases up in brightness /
+# size and turns slowly while hovered. These are visual-only and never
+# change settings_button_rect (the actual click target).
+settings_gear_rotation = 0.0
+settings_gear_hover_amount = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -2667,51 +2672,223 @@ def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
             )
 
 
-def draw_gear_icon(surface, cx, cy, size, color, thickness=2, rotation=0.0):
-    """Draw a detailed cog/gear icon with teeth, hub and spokes."""
-    # Outer gear body with teeth — 10 teeth for smoother look
-    n_teeth = 10
-    r_outer = size
-    r_inner = size * 0.72
-    pts = []
-    for i in range(n_teeth):
-        base = (2 * math.pi * i) / n_teeth - math.pi / 2 + rotation
-        tooth_w = (2 * math.pi / n_teeth) * 0.48
-        # Alternate outer/inner points for zigzag teeth
-        ang_outer = base + tooth_w / 2
-        ang_inner = base + (2 * math.pi / n_teeth) - tooth_w / 2
-        # Root then tip then root
-        pts.append((cx + r_inner * math.cos(base), cy + r_inner * math.sin(base)))
-        pts.append((cx + r_outer * math.cos(ang_outer - 0.06), cy + r_outer * math.sin(ang_outer - 0.06)))
-        pts.append((cx + r_outer * math.cos(ang_outer + 0.06), cy + r_outer * math.sin(ang_outer + 0.06)))
-    # Close shape by adding final root
-    # Draw filled gear then outline for crisp look
-    # Handle alpha color
-    if len(color) == 4 and color[3] < 255:
-        # Use polygon with alpha
-        pygame.draw.polygon(surface, color, pts, 0)
-        pygame.draw.polygon(surface, color, pts, max(1, thickness))
+_gear_icon_base_cache = {}
+_gear_icon_cache = {}
+
+
+def _gear_polar_point(cx, cy, radius, angle):
+    return (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+
+
+def _render_gear_icon_base(rgb, thickness=2, compact=False):
+    """Render one detailed gear at high resolution.
+
+    The settings cog is only about 22 px wide on screen. Drawing all of its
+    bevels and bolt details directly at that size produces a noisy blob, so
+    the master icon is rendered on a 144 px canvas once and smooth-scaled /
+    rotated from cache by :func:`draw_gear_icon`. ``compact`` keeps the
+    bevels, rim, bolts and hub but omits hairline spokes/slots that would
+    turn into speckle at toolbar size.
+    """
+    cache_key = (tuple(rgb), int(thickness), bool(compact))
+    cached = _gear_icon_base_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    canvas = 144
+    cx = cy = canvas // 2
+    outer_r = 54
+    root_r = 40 if compact else 42
+    icon = pygame.Surface((canvas, canvas), pygame.SRCALPHA)
+
+    base_rgb = tuple(max(0, min(255, int(v))) for v in rgb[:3])
+    highlight = _lerp_color(base_rgb, (255, 255, 255), 0.22)
+    light = _lerp_color(base_rgb, (174, 184, 201), 0.28)
+    mid = _lerp_color(base_rgb, (104, 113, 129), 0.48)
+    dark = _lerp_color(base_rgb, (45, 50, 61), 0.62)
+    deep = _lerp_color(base_rgb, (20, 23, 29), 0.78)
+    recess = _lerp_color(base_rgb, (48, 54, 66), 0.72)
+    recess_light = _lerp_color(base_rgb, (82, 90, 105), 0.58)
+
+    # Eight chunky trapezoidal teeth read better at toolbar size than the
+    # old ten narrow zig-zags. A root midpoint between teeth gives the
+    # valley a gently scalloped, machined profile.
+    teeth = 8
+    pitch = 2.0 * math.pi / teeth
+    body_pts = []
+    tooth_faces = []
+    for i in range(teeth):
+        angle = -math.pi / 2.0 + i * pitch
+        root_left = _gear_polar_point(cx, cy, root_r, angle - pitch * 0.34)
+        tip_left = _gear_polar_point(cx, cy, outer_r, angle - pitch * 0.18)
+        tip_mid = _gear_polar_point(cx, cy, outer_r, angle)
+        tip_right = _gear_polar_point(cx, cy, outer_r, angle + pitch * 0.18)
+        root_mid = _gear_polar_point(cx, cy, root_r, angle)
+        root_right = _gear_polar_point(cx, cy, root_r, angle + pitch * 0.34)
+        valley = _gear_polar_point(cx, cy, root_r - 1, angle + pitch * 0.5)
+        body_pts.extend((root_left, tip_left, tip_right, root_right, valley))
+        tooth_faces.append(
+            (
+                [root_left, tip_left, tip_mid, root_mid],
+                [root_mid, tip_mid, tip_right, root_right],
+                tip_left,
+                tip_mid,
+                tip_right,
+            )
+        )
+
+    # Soft offset silhouette first; the opaque body then leaves only a
+    # narrow lower-right shadow visible.
+    shadow_pts = [(px + 3, py + 4) for px, py in body_pts]
+    pygame.draw.polygon(icon, (7, 9, 12, 118), shadow_pts)
+    pygame.draw.polygon(icon, (*mid, 255), body_pts)
+
+    # Alternate bevel faces on every tooth: lit on one flank, shaded on the
+    # other, with a fine bright edge along the first half of each tip.
+    for left_face, right_face, tip_left, tip_mid, tip_right in tooth_faces:
+        pygame.draw.polygon(icon, (*light, 255), left_face)
+        pygame.draw.polygon(icon, (*dark, 255), right_face)
+        pygame.draw.line(icon, (*highlight, 255), tip_left, tip_mid, 3)
+        pygame.draw.line(icon, (*deep, 255), tip_mid, tip_right, 2)
+
+    outline_w = max(4 if compact else 3, int(thickness) * 2)
+    pygame.draw.polygon(icon, (*deep, 255), body_pts, outline_w)
+
+    # Concentric machined rim and recessed face.
+    pygame.draw.circle(icon, (*dark, 255), (cx, cy), root_r - 3)
+    pygame.draw.circle(icon, (*light, 255), (cx, cy), root_r - 4, 3)
+    pygame.draw.circle(icon, (*recess, 255), (cx, cy), 33)
+    pygame.draw.circle(icon, (*recess_light, 255), (cx, cy), 29)
+    pygame.draw.circle(icon, (*deep, 255), (cx, cy), 33, 2)
+    pygame.draw.circle(icon, (*highlight, 255), (cx, cy), 29, 1)
+    try:
+        pygame.gfxdraw.aacircle(icon, cx, cy, 33, (*deep, 255))
+        pygame.gfxdraw.aacircle(icon, cx, cy, 29, (*highlight, 255))
+    except Exception:
+        pass
+
+    # Six spokes ending in little slotted bolt heads. These details are
+    # deliberately drawn large here; smooth downscaling turns them into a
+    # crisp suggestion of hardware rather than random pixels. The compact
+    # toolbar variant keeps clean bolt heads but drops the hairlines.
+    for k in range(6):
+        angle = -math.pi / 2.0 + k * math.pi / 3.0 + 0.24
+        if not compact:
+            inner = _gear_polar_point(cx, cy, 13, angle)
+            outer = _gear_polar_point(cx, cy, 27, angle)
+            pygame.draw.line(icon, (*dark, 255), inner, outer, 8)
+            pygame.draw.line(icon, (*light, 255), inner, outer, 4)
+
+        bx, by = _gear_polar_point(cx, cy, 23, angle)
+        pygame.draw.circle(icon, (*deep, 255), (int(bx) + 1, int(by) + 1), 5)
+        pygame.draw.circle(icon, (*highlight, 255), (int(bx), int(by)), 5)
+        pygame.draw.circle(icon, (*deep, 255), (int(bx), int(by)), 5, 1)
+        if compact:
+            pygame.draw.circle(icon, (*deep, 255), (int(bx), int(by)), 2)
+        else:
+            slot_angle = angle + 0.65
+            slot_a = (
+                bx - 3.4 * math.cos(slot_angle),
+                by - 3.4 * math.sin(slot_angle),
+            )
+            slot_b = (
+                bx + 3.4 * math.cos(slot_angle),
+                by + 3.4 * math.sin(slot_angle),
+            )
+            pygame.draw.line(icon, (*deep, 255), slot_a, slot_b, 2)
+
+    # Tiny engraved indexing dots between the bolts (large variant only).
+    if not compact:
+        for k in range(6):
+            angle = -math.pi / 2.0 + (k + 0.5) * math.pi / 3.0 + 0.24
+            dx, dy = _gear_polar_point(cx, cy, 25, angle)
+            pygame.draw.circle(icon, (*deep, 255), (int(dx), int(dy)), 2)
+
+    # Layered centre hub: outer collar, bright face, dark socket and pin,
+    # finished with a short screwdriver slot. The compact hub is slightly
+    # larger so the cog still reads instantly in the 50x30 toolbar button.
+    hub_r = 18 if compact else 16
+    hub_face_r = 15 if compact else 13
+    socket_r = 10 if compact else 9
+    pin_r = 5 if compact else 4
+    pygame.draw.circle(icon, (*deep, 255), (cx, cy + 1), hub_r)
+    pygame.draw.circle(icon, (*mid, 255), (cx, cy), hub_r)
+    pygame.draw.circle(icon, (*light, 255), (cx, cy), hub_face_r)
+    pygame.draw.circle(icon, (*recess, 255), (cx, cy), socket_r)
+    pygame.draw.circle(icon, (*highlight, 255), (cx, cy), pin_r)
+    pygame.draw.circle(icon, (*deep, 255), (cx, cy), hub_r, 2)
+    slot_len = 7 if compact else 6
+    slot_angle = -0.58
+    slot_a = (
+        cx - slot_len * math.cos(slot_angle),
+        cy - slot_len * math.sin(slot_angle),
+    )
+    slot_b = (
+        cx + slot_len * math.cos(slot_angle),
+        cy + slot_len * math.sin(slot_angle),
+    )
+    pygame.draw.line(icon, (*deep, 255), slot_a, slot_b, 3)
+    pygame.draw.line(
+        icon,
+        (*highlight, 255),
+        (slot_a[0], slot_a[1] + 2),
+        (slot_b[0], slot_b[1] + 2),
+        1,
+    )
+
+    # One restrained specular arc/dot in the upper-left gives the metal a
+    # light source without adding another bright outline everywhere.
+    pygame.draw.arc(
+        icon,
+        (*highlight, 255),
+        pygame.Rect(cx - 30, cy - 30, 60, 60),
+        2.25,
+        4.05,
+        3,
+    )
+    if not compact:
+        pygame.draw.circle(icon, (*highlight, 255), (cx - 19, cy - 21), 3)
+
+    _gear_icon_base_cache[cache_key] = icon
+    return icon
+
+
+def _get_gear_icon(color, size, thickness=2, rotation=0.0):
+    """Return a cached downscaled/rotated copy of the master gear."""
+    rgb = tuple(max(0, min(255, int(v))) for v in color[:3])
+    alpha = max(0, min(255, int(color[3]))) if len(color) > 3 else 255
+    size_key = max(1, int(round(float(size) * 4.0)))
+    effective_size = size_key / 4.0
+    rotation_key = int(round(math.degrees(float(rotation)))) % 360
+    cache_key = (rgb, alpha, int(thickness), size_key, rotation_key)
+    cached = _gear_icon_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    base = _render_gear_icon_base(
+        rgb, thickness=thickness, compact=effective_size < 16
+    )
+    # The master gear's outside radius is 54 px on its 144 px canvas.
+    scale = effective_size / 54.0
+    if rotation_key:
+        # Pygame rotates counter-clockwise; negate to preserve this
+        # function's historic screen-coordinate (clockwise) convention.
+        icon = pygame.transform.rotozoom(base, -rotation_key, scale)
     else:
-        # Draw gear body filled with muted metallic, outline with color
-        base_fill = (color[0], color[1], color[2]) if len(color) == 3 else (color[0], color[1], color[2])
-        # Subtle inner fill darker
-        pygame.draw.polygon(surface, base_fill, pts, 0)
-        pygame.draw.polygon(surface, base_fill, pts, max(1, thickness))
-        # Highlight ring
-        pygame.draw.circle(surface, base_fill, (cx, cy), int(size * 0.55), max(1, thickness-1) if thickness>1 else 1)
-    # Center hub
-    hub_r = int(size * 0.30)
-    hub_color = (color[0], color[1], color[2]) if len(color) == 3 else (color[0], color[1], color[2])
-    pygame.draw.circle(surface, hub_color, (cx, cy), hub_r, max(1, thickness))
-    pygame.draw.circle(surface, (30, 30, 30), (cx, cy), max(2, hub_r-2), 0)
-    # Spokes — 3 small circles around hub
-    for k in range(3):
-        ang = (2 * math.pi * k) / 3 + rotation
-        sx = cx + int(math.cos(ang) * size * 0.45)
-        sy = cy + int(math.sin(ang) * size * 0.45)
-        pygame.draw.circle(surface, hub_color, (sx, sy), max(1, int(size * 0.12)), 1)
-    # Center dot
-    pygame.draw.circle(surface, hub_color, (cx, cy), max(2, int(size*0.14)), 0)
+        target = max(2, int(round(base.get_width() * scale)))
+        icon = pygame.transform.smoothscale(base, (target, target))
+    if alpha < 255:
+        icon.set_alpha(alpha)
+    _gear_icon_cache[cache_key] = icon
+    return icon
+
+
+def draw_gear_icon(surface, cx, cy, size, color, thickness=2, rotation=0.0):
+    """Draw a polished, supersampled cog with beveled teeth and hub."""
+    if size <= 0:
+        return
+    icon = _get_gear_icon(color, size, thickness=thickness, rotation=rotation)
+    surface.blit(icon, icon.get_rect(center=(int(cx), int(cy))))
 
 
 def draw_new_game_button(screen, mouse_pos):
@@ -2735,23 +2912,211 @@ def draw_settings_button(screen, mouse_pos):
     # Only visible when menu is closed — opening animation is handled entirely
     # by draw_settings_menu (single backdrop), avoiding a double-fade / double
     # overlay that previously caused flicker and a competing expanding border.
+    global settings_gear_rotation, settings_gear_hover_amount
     if menu_anim_progress > 0:
         return
-    hovered = settings_button_rect.collidepoint(mouse_pos)
-    color = BUTTON_HOVER_COLOR if hovered else BUTTON_COLOR
-    pygame.draw.rect(screen, color, settings_button_rect, border_radius=4)
+
+    rect = settings_button_rect
+    hovered = rect.collidepoint(mouse_pos)
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    # Ease the hover treatment and turn the cog slowly while it is under
+    # the cursor. Rotation stops where it is when the pointer leaves —
+    # snapping back to 0° would look like a visual glitch.
+    hover_target = 1.0 if hovered else 0.0
+    settings_gear_hover_amount += (
+        hover_target - settings_gear_hover_amount
+    ) * 0.22
+    if abs(hover_target - settings_gear_hover_amount) < 0.01:
+        settings_gear_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, settings_gear_hover_amount))
+    if hovered:
+        settings_gear_rotation = (
+            settings_gear_rotation + (0.003 if pressed else 0.010)
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    # Cool blue halo that fades in behind the button on hover.
+    if hover_amount > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 16, visual_rect.height + 16), pygame.SRCALPHA
+        )
+        for inset, alpha in ((1, 18), (4, 28), (7, 42)):
+            pygame.draw.rect(
+                glow,
+                (105, 145, 255, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 8, visual_rect.y - 8))
+
+    # Ground shadow — tighter when pressed.
     pygame.draw.rect(
-        screen, MENU_BORDER_COLOR, settings_button_rect, 2, border_radius=4
+        screen,
+        (16, 18, 22),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=9,
     )
-    gear_color = GEAR_COLOR_HOVER if hovered else GEAR_COLOR
+
+    # Vertical metal gradient, built on a small surface so the glass sheen
+    # and shading can be clipped to the rounded button silhouette.
+    if pressed:
+        top_colour = (58, 64, 78)
+        bottom_colour = (40, 45, 57)
+        border_colour = (116, 145, 215)
+    elif hovered:
+        top_colour = (104, 116, 139)
+        bottom_colour = (63, 72, 92)
+        border_colour = (157, 183, 255)
+    else:
+        top_colour = (83, 89, 102)
+        bottom_colour = (51, 55, 65)
+        border_colour = (126, 134, 150)
+
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    # Translucent detail belongs on an overlay, then alpha-blends over the
+    # gradient (direct alpha drawing on ``body`` can replace its alpha).
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    sheen_alpha = int(12 + 18 * hover_amount)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, sheen_alpha),
+        [
+            (-8, visual_rect.height),
+            (visual_rect.width * 0.46, 0),
+            (visual_rect.width * 0.68, 0),
+            (visual_rect.width * 0.14, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(72 + 48 * hover_amount)),
+        (6, 1),
+        (visual_rect.width - 7, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 22),
+        (2, 5),
+        (2, visual_rect.height - 6),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 44 if pressed else 30),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 24),
+        (visual_rect.width - 3, 4, 3, visual_rect.height - 8),
+        border_radius=2,
+    )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=9,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=9)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=7,
+    )
+
+    # A short accent under the cog gives the hover state a finished,
+    # deliberate endpoint without adding text inside the 50 px button.
+    if hover_amount > 0.04:
+        accent_colour = _lerp_color(
+            bottom_colour, (126, 178, 255), hover_amount
+        )
+        accent_w = int(22 * hover_amount)
+        if accent_w >= 2:
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (visual_rect.centerx - accent_w // 2, visual_rect.bottom - 3),
+                (visual_rect.centerx + accent_w // 2, visual_rect.bottom - 3),
+                2,
+            )
+
+    gear_colour = _lerp_color(
+        GEAR_COLOR, GEAR_COLOR_HOVER, hover_amount
+    )
+    gear_size = 11.1 + 0.6 * hover_amount - (0.3 if pressed else 0.0)
     draw_gear_icon(
         screen,
-        settings_button_rect.centerx,
-        settings_button_rect.centery,
-        9,
-        gear_color,
+        visual_rect.centerx,
+        visual_rect.centery,
+        gear_size,
+        gear_colour,
         thickness=2,
+        rotation=settings_gear_rotation,
     )
+
+    # Matching top-bar tooltip language with Flip/eval hints: place it
+    # below the button (never clipped by the top edge) and clamp sideways.
+    if hovered and not pressed:
+        tip = font_tiny.render("Settings", True, TEXT_COLOR)
+        tip_w = tip.get_width() + 16
+        tip_h = 24
+        tip_x = max(
+            4,
+            min(
+                visual_rect.centerx - tip_w // 2,
+                WIDTH - tip_w - 4,
+            ),
+        )
+        tip_y = min(visual_rect.bottom + 7, HEIGHT - tip_h - 4)
+        tip_rect = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
+        pygame.draw.rect(screen, (22, 22, 28), tip_rect, border_radius=7)
+        pygame.draw.rect(
+            screen, (157, 183, 255), tip_rect, 1, border_radius=7
+        )
+        pointer_x = max(
+            tip_rect.x + 8,
+            min(visual_rect.centerx, tip_rect.right - 8),
+        )
+        pygame.draw.polygon(
+            screen,
+            (22, 22, 28),
+            [
+                (pointer_x - 5, tip_rect.y + 1),
+                (pointer_x + 5, tip_rect.y + 1),
+                (pointer_x, max(visual_rect.bottom + 1, tip_rect.y - 5)),
+            ],
+        )
+        screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 
 def navigate_to(page, forward=True):
