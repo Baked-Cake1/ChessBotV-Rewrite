@@ -875,6 +875,10 @@ close_button_icon_phase = 0.0
 engine_settings_button_hover_amount = 0.0
 engine_settings_button_gear_rotation = 0.0
 engine_settings_button_pulse_phase = 0.0
+# Settings main-menu Board button polish. The phase drives only the
+# miniature-board scan/piece bob; Board navigation and themes are unchanged.
+board_button_hover_amount = 0.0
+board_button_pulse_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -3714,6 +3718,475 @@ def scroll_theme_list(delta):
 
 
 # --- Board hub (Pieces Styles / Board Themes) ---
+_board_button_piece_preview_cache = {}
+
+
+def _board_button_current_names():
+    """Return current ``(pieces_style_name, board_theme_name)`` read-only."""
+    piece_name = None
+    try:
+        piece_name = next(
+            (
+                display
+                for theme_id, display in available_themes
+                if theme_id == current_theme
+            ),
+            None,
+        )
+    except Exception:
+        piece_name = None
+    if not piece_name:
+        piece_name = format_theme_name(
+            str(current_theme or "classic").split("/")[-1]
+        )
+
+    board_id = normalise_board_theme(current_board_theme)
+    board_name = BOARD_THEMES.get(board_id, {}).get("display", board_id)
+    return str(piece_name), str(board_name)
+
+
+def _get_board_button_piece_preview(piece_key, size):
+    """Return a cached small current-style piece preview, or ``None``."""
+    size = max(1, int(size))
+    cache_key = (str(current_theme), str(piece_key), size)
+    if cache_key in _board_button_piece_preview_cache:
+        return _board_button_piece_preview_cache[cache_key]
+
+    preview = None
+    try:
+        source = get_preview_images(current_theme).get(piece_key)
+        if source is not None:
+            if source.get_size() == (size, size):
+                preview = source
+            else:
+                preview = pygame.transform.smoothscale(
+                    source, (size, size)
+                )
+    except Exception:
+        preview = None
+    _board_button_piece_preview_cache[cache_key] = preview
+    return preview
+
+
+def _draw_board_button_mini_board(surface, rect, hover_amount=0.0, phase=0.0):
+    """Draw a framed 4x4 board in the active square colours.
+
+    On hover a warm scan highlight walks the sixteen squares in a
+    boustrophedon (snake) path. The helper is size-agnostic so tests can
+    render the same miniature at a larger inspection size.
+    """
+    hover_amount = max(0.0, min(1.0, hover_amount))
+    light_colour = tuple(int(v) for v in LIGHT_SQ[:3])
+    dark_colour = tuple(int(v) for v in DARK_SQ[:3])
+    frame_colour = _lerp_color((111, 82, 48), (176, 132, 78), hover_amount)
+    frame_colour = _lerp_color(frame_colour, dark_colour, 0.22)
+
+    pygame.draw.rect(
+        surface, (24, 17, 10), rect.move(0, 1), border_radius=4
+    )
+    pygame.draw.rect(surface, frame_colour, rect, border_radius=4)
+    pygame.draw.rect(
+        surface,
+        _lerp_color(frame_colour, (255, 255, 255), 0.28),
+        rect,
+        1,
+        border_radius=4,
+    )
+
+    inner_size = min(rect.width, rect.height) - 4
+    inner_size -= inner_size % 4
+    inner_size = max(8, inner_size)
+    inner = pygame.Rect(0, 0, inner_size, inner_size)
+    inner.center = rect.center
+    cell = inner_size // 4
+
+    for row in range(4):
+        for col in range(4):
+            colour = light_colour if (row + col) % 2 == 0 else dark_colour
+            pygame.draw.rect(
+                surface,
+                colour,
+                (inner.x + col * cell, inner.y + row * cell, cell, cell),
+            )
+
+    # Translucent scan/sheen belongs on a separate overlay, then the grid
+    # and frame are restored above it.
+    overlay = pygame.Surface(inner.size, pygame.SRCALPHA)
+    if hover_amount > 0.03:
+        scan_index = int(
+            ((phase / (2.0 * math.pi)) % 1.0) * 16
+        ) % 16
+        scan_row = scan_index // 4
+        scan_offset = scan_index % 4
+        scan_col = scan_offset if scan_row % 2 == 0 else 3 - scan_offset
+        scan_alpha = int(35 + 65 * hover_amount)
+    else:
+        scan_row, scan_col = 1, 1
+        scan_alpha = 24
+    scan_rect = pygame.Rect(
+        scan_col * cell, scan_row * cell, cell, cell
+    )
+    pygame.draw.rect(
+        overlay, (255, 240, 165, scan_alpha), scan_rect
+    )
+    pygame.draw.rect(
+        overlay,
+        (255, 255, 255, int(55 + 70 * hover_amount)),
+        scan_rect,
+        1,
+    )
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(13 + 12 * hover_amount)),
+        [
+            (-4, inner_size),
+            (inner_size * 0.38, 0),
+            (inner_size * 0.62, 0),
+            (inner_size * 0.18, inner_size),
+        ],
+    )
+    surface.blit(overlay, inner.topleft)
+
+    grid_colour = _lerp_color(dark_colour, (35, 25, 16), 0.55)
+    for i in range(1, 4):
+        pygame.draw.line(
+            surface,
+            grid_colour,
+            (inner.x + i * cell, inner.y),
+            (inner.x + i * cell, inner.bottom - 1),
+            1,
+        )
+        pygame.draw.line(
+            surface,
+            grid_colour,
+            (inner.x, inner.y + i * cell),
+            (inner.right - 1, inner.y + i * cell),
+            1,
+        )
+        # Fine coordinate ticks on the lower/left frame.
+        pygame.draw.line(
+            surface,
+            _lerp_color(frame_colour, (255, 255, 255), 0.35),
+            (inner.x + i * cell, rect.bottom - 3),
+            (inner.x + i * cell, rect.bottom - 1),
+            1,
+        )
+        pygame.draw.line(
+            surface,
+            _lerp_color(frame_colour, (255, 255, 255), 0.35),
+            (rect.x + 1, inner.y + i * cell),
+            (rect.x + 3, inner.y + i * cell),
+            1,
+        )
+    pygame.draw.rect(surface, (35, 25, 16), inner, 1)
+
+
+def _draw_board_button_chevron(surface, cx, cy, colour):
+    """Draw the Board row's forward chevron with a soft shadow."""
+    points = [(cx - 4, cy - 7), (cx + 3, cy), (cx - 4, cy + 7)]
+    shadow = [(px, py + 1) for px, py in points]
+    pygame.draw.lines(surface, (25, 19, 12), False, shadow, 3)
+    pygame.draw.lines(surface, colour, False, points, 3)
+    try:
+        pygame.draw.aalines(surface, colour, False, points)
+    except Exception:
+        pass
+
+
+def draw_polished_board_button(screen, rect, hovered):
+    """Draw the Settings-main Board navigation row.
+
+    The caller supplies the original 400x50 row, including entrance slide,
+    and retains click/navigation behaviour. This renderer reads only the
+    active board colours and current piece/style names for its preview.
+    """
+    global board_button_hover_amount, board_button_pulse_phase
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    board_button_hover_amount += (
+        hover_target - board_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - board_button_hover_amount) < 0.01:
+        board_button_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, board_button_hover_amount))
+    if hovered:
+        board_button_pulse_phase = (
+            board_button_pulse_phase + (0.04 if pressed else 0.09)
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+    light_colour = tuple(int(v) for v in LIGHT_SQ[:3])
+    dark_colour = tuple(int(v) for v in DARK_SQ[:3])
+    piece_name, board_name = _board_button_current_names()
+
+    # The halo is mixed from the active board colours, so a Chess.com
+    # green board gives the row a subtly different aura from Classic wood.
+    if hover_amount > 0.01:
+        glow_colour = _lerp_color(dark_colour, light_colour, 0.38)
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 15), (4, 24), (7, 36)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * hover_amount)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=16 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (24, 18, 11),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=10,
+    )
+
+    if pressed:
+        base_top, base_bottom = (70, 61, 48), (46, 40, 31)
+    elif hovered:
+        base_top, base_bottom = (104, 91, 70), (66, 57, 43)
+    else:
+        base_top, base_bottom = (84, 74, 58), (54, 48, 38)
+    top_colour = _lerp_color(base_top, dark_colour, 0.16)
+    bottom_colour = _lerp_color(base_bottom, dark_colour, 0.16)
+    border_colour = _lerp_color((196, 164, 116), dark_colour, 0.22)
+    border_colour = _lerp_color(
+        border_colour, light_colour, 0.24 * hover_amount
+    )
+
+    # Warm bronze/charcoal body with glass and a faint checker watermark.
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(9 + 14 * hover_amount)),
+        [
+            (-20, visual_rect.height),
+            (visual_rect.width * 0.36, 0),
+            (visual_rect.width * 0.55, 0),
+            (visual_rect.width * 0.13, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(62 + 44 * hover_amount)),
+        (9, 1),
+        (visual_rect.width - 10, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 21),
+        (2, 7),
+        (2, visual_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 42 if pressed else 29),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 24),
+        (visual_rect.width - 3, 6, 3, visual_rect.height - 12),
+        border_radius=2,
+    )
+
+    # Faint checker fields in the blank spaces either side of the title.
+    checker_alpha = int(10 + 13 * hover_amount)
+    for x_start in (58, 252):
+        for row in range(4):
+            for col in range(5):
+                if (row + col) % 2 == 0:
+                    pygame.draw.rect(
+                        overlay,
+                        (255, 244, 214, checker_alpha),
+                        (x_start + col * 10, 6 + row * 10, 10, 10),
+                    )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=10,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=10)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=8,
+    )
+
+    # Short checker inlays along the bottom, split to avoid the subtitle.
+    inlay_y = visual_rect.bottom - 5
+    for segment_x in (visual_rect.x + 56, visual_rect.x + 304):
+        for i in range(8):
+            colour = light_colour if i % 2 == 0 else dark_colour
+            colour = _lerp_color(bottom_colour, colour, 0.38)
+            pygame.draw.rect(
+                screen,
+                colour,
+                (segment_x + i * 5, inlay_y, 5, 3),
+            )
+
+    mini_board_rect = pygame.Rect(
+        visual_rect.x + 13, visual_rect.y + 7, 36, 36
+    )
+    _draw_board_button_mini_board(
+        screen,
+        mini_board_rect,
+        hover_amount,
+        board_button_pulse_phase,
+    )
+
+    # Two-line centred label: destination above, current selections below.
+    label = "Board"
+    title_colour = _lerp_color(
+        (244, 238, 226), (255, 255, 255), hover_amount
+    )
+    title = font_large.render(label, True, title_colour)
+    title_rect = title.get_rect(
+        center=(visual_rect.centerx, visual_rect.centery - 9)
+    )
+    title_shadow = font_large.render(label, True, (24, 18, 11))
+    screen.blit(title_shadow, title_rect.move(0, 1))
+    screen.blit(title, title_rect)
+
+    subtitle_text = f"Pieces: {piece_name} · Board: {board_name}"
+    subtitle_text = _elide_text(subtitle_text, font_tiny, 204)
+    subtitle_colour = _lerp_color(
+        (202, 190, 168), light_colour, 0.38 * hover_amount
+    )
+    subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
+    subtitle_rect = subtitle.get_rect(
+        center=(visual_rect.centerx, visual_rect.centery + 15)
+    )
+    subtitle_shadow = font_tiny.render(
+        subtitle_text, True, (24, 18, 11)
+    )
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    # Right-hand destination summary: current piece pair over a board-
+    # theme strip. The pieces bob one pixel on hover; the strip colours
+    # themselves remain the exact active LIGHT_SQ/DARK_SQ pair.
+    detail_x = visual_rect.right - 96
+    for index, (piece_key, square_colour) in enumerate(
+        (("wq", light_colour), ("bn", dark_colour))
+    ):
+        square = pygame.Rect(
+            detail_x + index * 22, visual_rect.centery - 19, 20, 18
+        )
+        pygame.draw.rect(
+            screen, (24, 18, 11), square.move(0, 1), border_radius=3
+        )
+        pygame.draw.rect(screen, square_colour, square, border_radius=3)
+        pygame.draw.rect(
+            screen,
+            _lerp_color(square_colour, (35, 25, 16), 0.45),
+            square,
+            1,
+            border_radius=3,
+        )
+        preview = _get_board_button_piece_preview(piece_key, 17)
+        if preview is not None:
+            bob = int(
+                round(
+                    math.sin(
+                        board_button_pulse_phase + index * math.pi / 2.0
+                    )
+                    * hover_amount
+                )
+            )
+            screen.blit(
+                preview,
+                preview.get_rect(
+                    center=(square.centerx, square.centery + bob)
+                ),
+            )
+
+    theme_strip = pygame.Rect(
+        detail_x, visual_rect.centery + 3, 42, 14
+    )
+    pygame.draw.rect(
+        screen, (24, 18, 11), theme_strip.move(0, 1), border_radius=3
+    )
+    cell_widths = (11, 10, 11, 10)
+    cell_x = theme_strip.x
+    for index, cell_w in enumerate(cell_widths):
+        pygame.draw.rect(
+            screen,
+            light_colour if index % 2 == 0 else dark_colour,
+            (cell_x, theme_strip.y, cell_w, theme_strip.height),
+        )
+        cell_x += cell_w
+    if hover_amount > 0.03:
+        scan_x = int(
+            theme_strip.x
+            + (
+                (board_button_pulse_phase / (2.0 * math.pi)) % 1.0
+            )
+            * theme_strip.width
+        )
+        pygame.draw.line(
+            screen,
+            _lerp_color(light_colour, (255, 255, 255), 0.45),
+            (scan_x, theme_strip.y + 1),
+            (scan_x, theme_strip.bottom - 2),
+            1,
+        )
+    pygame.draw.rect(
+        screen, (35, 25, 16), theme_strip, 1, border_radius=3
+    )
+
+    chevron_colour = _lerp_color(
+        (218, 201, 171), (255, 255, 255), hover_amount
+    )
+    chevron_x = (
+        visual_rect.right
+        - 24
+        + int(round(2 * hover_amount))
+        - (1 if pressed else 0)
+    )
+    _draw_board_button_chevron(
+        screen,
+        chevron_x,
+        visual_rect.centery,
+        chevron_colour,
+    )
+
+
 def get_board_hub_rects(offset_x=0, offset_y=0):
     w, h = 420, 104
     x = WIDTH // 2 - w // 2 + offset_x
@@ -9629,6 +10102,10 @@ def draw_settings_menu(screen):
                 )
                 if item == "Engine Settings":
                     draw_polished_engine_settings_button(
+                        screen, item_rect, is_hovered
+                    )
+                elif item == "Board":
+                    draw_polished_board_button(
                         screen, item_rect, is_hovered
                     )
                 else:

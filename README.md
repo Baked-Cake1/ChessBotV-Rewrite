@@ -42,6 +42,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Top bar:** a polished brass **Flip** button — miniature board between chunky ivory/charcoal exchange arrows whose colours ease-swap with board orientation, plus hover/pressed states and a perspective tooltip — alongside a polished emerald `New` button with circled-plus badge and hover sparkle, and a polished metallic settings button with a supersampled cog featuring beveled teeth, rim, bolts and hub that slowly turns while hovered → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
 - **Settings pages:**
   - **Header Close/X** — polished ruby pill with a ringed central seal and tapered X arms; hover eases in its halo and “Close Settings” tooltip, while the X folds inward as the overlay closes
+  - **Board** — its polished bronze main-menu button shows a framed 4×4 board and right-hand current piece/theme previews in the active `LIGHT_SQ`/`DARK_SQ` colours, names the current Pieces and Board selections in its subtitle, and opens the Pieces Styles / Board Themes hub
   - **Pieces Styles** — visual, scrollable style cards with sample pieces on board-coloured squares, source/current-state labels, hover highlighting, and a full 12-piece preview using the active board colours
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
   - **Engine Settings** — its polished indigo main-menu button carries a detailed gear medallion, five miniature tracks mirroring the staged slider values, an amber unsaved-changes badge and a hover values tooltip; the page itself has sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), and `MultiPV` (1-5), and saving a changed MultiPV value immediately recalculates the current board
@@ -107,6 +108,7 @@ python new.py --help
 | **Gear** (top bar) | Open Settings overlay; hovering brightens the button, turns the detailed cog slowly, and shows a “Settings” tooltip |
 | **X** (Settings header) | Close Settings; hovering shows the polished ruby seal/button state and a right-edge-clamped “Close Settings” tooltip, and the X folds as the overlay closes |
 | **Engine Settings** (Settings main menu) | Open engine sliders; hovering turns the gear, animates the five staged-value tracks and shows the current Threads/Skill/Hash/Depth/MultiPV values (amber when unsaved) |
+| **Board** (Settings main menu) | Open Pieces Styles / Board Themes; its miniature board, piece pair, theme strip, halo and accent follow the active board colours, with a scanning square highlight on hover |
 | **Mouse drag on slider** (Engine Settings) | Adjust Threads/Skill/Hash/Depth live |
 | **Github / Restart** (About) | Open repo in browser / restart via start.bat; hovering GitHub animates its cat medallion and external-link arrow, while hovering Restart turns its circular-arrow medallion, lights the status dots, and clicking it briefly shows “Restarting…” |
 | **Always on Top** (Settings main menu) | Toggle whether the ChessBotV window stays above other windows; the stacked-window icon, row and switch track cross-fade between slate/off and emerald/on |
