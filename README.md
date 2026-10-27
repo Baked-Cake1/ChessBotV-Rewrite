@@ -26,7 +26,8 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Auto game-over** on checkmate, stalemate, insufficient material, 75-move, fivefold repetition, 50-move and threefold repetition
 
 ### Visuals
-- **Lichess-style eval bar** with gradient fill, tick marks (0.25/0.5/0.75), `W/B` labels and glowing marker
+- **Opening title animation:** “ChessBotV Rewrite” slides in once at launch with cubic-in (`t³`) easing
+- **Lichess-style eval bar** with gradient fill, tick marks (0.25/0.5/0.75), `W/B` labels, glowing marker, and a fully on-screen “Click to swap side” tooltip
 - **Engine suggestion arrows render over pieces:** blue, width 7, fades/morphs smoothly; **L-shaped for knight moves** (long-leg first, correct overlay layering)
 - **Check / Checkmate FX:**
   - Under: soft radial red glow
@@ -40,8 +41,10 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Info panel:** opening name (from `openings.json`), game status (`Check!` / `Draw — …`), stats, opening/rec-move row
 - **Top bar:** `New` + detailed gear icon → animated **Settings** overlay with eased open/close (backdrop fade, slide, spring)
 - **Settings pages:**
+  - **Pieces Styles** — visual, scrollable style cards with sample pieces on board-coloured squares, source/current-state labels, hover highlighting, and a full 12-piece preview using the active board colours
   - **Board Theme** — scrollable list with scrollbar + "Scroll for more"
-  - **Engine Settings** — sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), live `setoption` + `save_config()`, Reset to Defaults
+  - **Engine Settings** — sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), and `MultiPV` (1-5); saving a changed MultiPV value immediately recalculates the current board
+  - **Analysis** — internal **Auto-Move** always starts off and its on/off state is never saved. Its separate target-depth control accepts `0-40`; `0` means “use the current Depth Limit”
   - **About** — version `v1.5-beta2` + **Github** button (opens https://github.com/Baked-Cake1/ChessBotV-Rewrite) + **Restart** button (fires `start.bat` via exit code 42 loop)
 
 ---
@@ -102,7 +105,7 @@ python new.py --help
 | **Gear** (top bar) | Open Settings overlay (detailed cog with spokes) |
 | **Mouse drag on slider** (Engine Settings) | Adjust Threads/Skill/Hash/Depth live |
 | **Github / Restart** (About) | Open repo in browser / restart via start.bat |
-| **Mouse wheel** (Board Theme) | Scroll theme list |
+| **Mouse wheel** (Pieces Styles) | Scroll the visual style cards; hover a card to preview all 12 pieces, click to apply |
 | **Esc** | Cancel promotion → Back from sub-page → close Settings; also cancels selection |
 
 - Board ignores clicks during move/rook/board-reset animations or when `is_game_over(claim_draw=True)`.
@@ -120,11 +123,15 @@ hash=2048
 threads=12
 skill=20
 depth=25
+multipv=1
+auto_move_depth=0
 ```
-- Loaded at startup, saved via **Engine Settings** sliders → persists instantly
+- Loaded at startup and saved by the settings UI
 - `Hash` steps: 16,32,64,128,256,512,1024,2048,4096,8192,16384,32768
 - `Depth` slider: 5-40, directly controls `ANALYSIS_DEPTH` for `go depth`
-- Changes are queued as `setoption` + `isready`/`readyok` before next search (never mid-search); NPS resets to 0 at depth limit
+- `auto_move_depth=0` means Auto-Move plays when the search reaches the current Depth Limit; positive values use that depth (capped by the Depth Limit)
+- Auto-Move's enabled state is deliberately not written to the file and is always off on a fresh launch, including when an older file contains `auto_move=1`
+- Changes are queued as `setoption` + `isready`/`readyok` before the next search (never mid-search); a saved MultiPV change forces that next search to be a recalculation of the current position
 
 ---
 
