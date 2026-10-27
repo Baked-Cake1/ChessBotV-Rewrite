@@ -70,6 +70,13 @@ DIVIDER_COLOR = (70, 70, 70)
 BOARD_BORDER_COLOR = (25, 25, 25)
 EVAL_MARKER_COLOR = (255, 190, 30)
 EVAL_MARKER_HIGHLIGHT = (255, 240, 140)
+# Eval-bar shell/gradient palette. The bar stays neutral (black/ivory) so it
+# works with every board theme, while the slim amber boundary marker remains
+# the one strong accent colour.
+EVAL_BAR_FRAME_COLOR = (112, 118, 132)
+EVAL_BAR_FRAME_DARK = (17, 19, 24)
+EVAL_BLACK_GRADIENT = ((58, 63, 74), (12, 14, 19))
+EVAL_WHITE_GRADIENT = ((255, 253, 247), (196, 203, 216))
 EVAL_WIN_WHITE_GLOW = (255, 255, 180, 70)
 EVAL_WIN_BLACK_GLOW = (80, 80, 255, 60)
 GEAR_COLOR = (225, 225, 225)
@@ -2387,95 +2394,277 @@ def draw_gradient_rect(screen, rect, start_color, end_color, vertical=True):
     screen.blit(surface, rect.topleft)
 
 
-def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
-    """Draw a polished, lichess-style evaluation bar."""
-    pygame.draw.rect(screen, (12, 12, 12), (x - 3, y - 3, w + 6, h + 6))
-    pygame.draw.rect(screen, (60, 60, 60), (x - 2, y - 2, w + 4, h + 4))
-
+def _eval_bar_white_fraction(current_eval, mate):
+    """White's share of the eval bar on the existing ±10-pawn scale."""
     if mate is not None:
-        white_h = h if mate > 0 else 0
-    else:
-        clamped = max(min(current_eval, 1000), -1000)
-        fill_percent = (clamped + 1000) / 2000
-        white_h = int(h * fill_percent)
+        return 1.0 if mate > 0 else 0.0
+    try:
+        clamped = max(-1000.0, min(1000.0, float(current_eval)))
+    except Exception:
+        clamped = 0.0
+    return (clamped + 1000.0) / 2000.0
 
+
+def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
+    """Draw a rounded, layered Lichess-style evaluation bar.
+
+    The evaluation mapping and click geometry are unchanged; this is a
+    visual upgrade: a soft shadow/halo, framed glass-like track, anchored
+    black/ivory gradients, a clear centre point, circular side labels and
+    a slim amber pointer at the exact black/white boundary.
+    """
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    if w <= 0 or h <= 0:
+        return
+
+    bar_rect = pygame.Rect(x, y, w, h)
+    radius = max(4, min(10, w // 3))
+    white_h = max(0, min(h, int(round(h * _eval_bar_white_fraction(current_eval, mate)))))
     black_h = h - white_h
 
-    if black_h > 0:
-        for i in range(black_h):
-            t = i / max(1, black_h)
-            v = int(55 - 40 * t)
-            pygame.draw.line(screen, (v, v, v), (x, y + i), (x + w - 1, y + i))
-
-    if white_h > 0:
-        wy = y + black_h
-        for i in range(white_h):
-            t = i / max(1, white_h)
-            v = int(230 + 25 * t)
-            pygame.draw.line(screen, (v, v, v), (x, wy + i), (x + w - 1, wy + i))
-
-    # --- Winning side highlight (subtle glow) ---
     winning = None
     if mate is not None:
         winning = "white" if mate > 0 else "black"
-    else:
-        if current_eval > 180:
-            winning = "white"
-        elif current_eval < -180:
-            winning = "black"
+    elif current_eval > 180:
+        winning = "white"
+    elif current_eval < -180:
+        winning = "black"
+
+    pulse = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.003)
+
+    # A very soft coloured halo behind a clearly winning side. Several
+    # expanded rounded rects approximate a blur without an expensive filter.
     if winning:
-        pulse_a = int(55 + 35 * math.sin(pygame.time.get_ticks() * 0.003))
-        if winning == "white" and white_h > 12:
-            glow = pygame.Surface((w+4, white_h), pygame.SRCALPHA)
-            glow.fill((255, 255, 160, pulse_a//3))
-            screen.blit(glow, (x-2, y+black_h))
-            # inner bright edge
-            pygame.draw.rect(screen, (255, 245, 140, pulse_a), (x, y+black_h, w, 3), border_radius=1)
-        elif winning == "black" and black_h > 12:
-            glow = pygame.Surface((w+4, black_h), pygame.SRCALPHA)
-            glow.fill((90, 90, 255, pulse_a//4))
-            screen.blit(glow, (x-2, y))
-            pygame.draw.rect(screen, (120, 120, 255, pulse_a), (x, y, w, 3), border_radius=1)
+        halo_rgb = (255, 214, 92) if winning == "white" else (105, 130, 255)
+        halo = pygame.Surface((w + 20, h + 20), pygame.SRCALPHA)
+        base_alpha = 15 + int(12 * pulse)
+        for inset, alpha_scale in ((1, 0.45), (4, 0.7), (7, 1.0)):
+            pygame.draw.rect(
+                halo,
+                (*halo_rgb, int(base_alpha * alpha_scale)),
+                (inset, inset, w + 20 - inset * 2, h + 20 - inset * 2),
+                border_radius=radius + 8 - inset,
+            )
+        screen.blit(halo, (x - 10, y - 10))
 
-    for frac, strong in ((0.25, False), (0.5, True), (0.75, False)):
-        ty = y + int(h * frac)
-        tick_len = 6 if strong else 3
-        color = (150, 150, 150) if strong else (85, 85, 85)
-        pygame.draw.line(screen, color, (x, ty), (x + tick_len, ty), 1)
-        pygame.draw.line(screen, color, (x + w - tick_len, ty), (x + w - 1, ty), 1)
-
-    if mate is None:
-        marker_y = y + black_h
-        if marker_y < y + 1:
-            marker_y = y + 1
-        elif marker_y > y + h - 2:
-            marker_y = y + h - 2
-    else:
-        marker_y = (y + h - 3) if mate > 0 else (y + 1)
-
+    # Drop shadow and the dark outer shell.
+    shadow = pygame.Surface((w + 10, h + 12), pygame.SRCALPHA)
+    pygame.draw.rect(
+        shadow,
+        (0, 0, 0, 82),
+        (2, 5, w + 6, h + 4),
+        border_radius=radius + 3,
+    )
+    screen.blit(shadow, (x - 5, y - 3))
     pygame.draw.rect(
         screen,
-        EVAL_MARKER_COLOR,
-        (x - 5, marker_y - 2, w + 10, 5),
-        border_radius=2,
+        EVAL_BAR_FRAME_DARK,
+        bar_rect.inflate(6, 6),
+        border_radius=radius + 3,
     )
+
+    # Build the inner bar on its own surface so all shading can be clipped
+    # to the same rounded silhouette. Gradients are anchored to the whole
+    # bar (not each changing segment), so colours do not swim as eval moves.
+    bar = pygame.Surface((w, h), pygame.SRCALPHA)
+    black_top, black_bottom = EVAL_BLACK_GRADIENT
+    white_top, white_bottom = EVAL_WHITE_GRADIENT
+    denom = max(1, h - 1)
+    for i in range(h):
+        t = i / denom
+        colour = (
+            _lerp_color(black_top, black_bottom, t)
+            if i < black_h
+            else _lerp_color(white_top, white_bottom, t)
+        )
+        pygame.draw.line(bar, (*colour, 255), (0, i), (w - 1, i))
+
+    # All translucent decoration goes on an overlay first. Drawing an
+    # alpha colour directly onto the opaque gradient with pygame.draw can
+    # replace the gradient's alpha instead of blending with it, which made
+    # a winning White segment look dark during visual testing. Blitting
+    # this overlay below performs the intended alpha blend.
+    overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+
+    # A restrained warm/cool wash over the winning segment.
+    if winning == "white" and white_h > 0:
+        pygame.draw.rect(
+            overlay,
+            (255, 214, 92, 18 + int(14 * pulse)),
+            (0, black_h, w, white_h),
+        )
+    elif winning == "black" and black_h > 0:
+        pygame.draw.rect(
+            overlay,
+            (105, 130, 255, 17 + int(13 * pulse)),
+            (0, 0, w, black_h),
+        )
+
+    # Glass shading: a bright spine down the left, a darker right edge and
+    # shallow inner shadows at both ends give the flat fill some depth.
+    pygame.draw.rect(overlay, (255, 255, 255, 30), (2, 2, 4, h - 4), border_radius=2)
+    pygame.draw.rect(overlay, (255, 255, 255, 12), (7, 2, 3, h - 4), border_radius=2)
+    pygame.draw.rect(overlay, (0, 0, 0, 34), (w - 5, 2, 3, h - 4), border_radius=2)
+    pygame.draw.rect(overlay, (0, 0, 0, 34), (0, 0, w, 3))
+    pygame.draw.rect(overlay, (0, 0, 0, 28), (0, h - 3, w, 3))
+    pygame.draw.line(overlay, (255, 255, 255, 34), (3, 1), (w - 4, 1))
+
+    # Fine quarter ticks, coloured against whichever segment they sit on.
+    for frac, strong in ((0.25, False), (0.5, True), (0.75, False)):
+        ty = int(round((h - 1) * frac))
+        tick_len = 8 if strong else 5
+        tick_colour = (
+            (255, 255, 255, 112) if ty < black_h else (22, 25, 31, 96)
+        )
+        tick_width = 2 if strong else 1
+        pygame.draw.line(overlay, tick_colour, (1, ty), (tick_len, ty), tick_width)
+        pygame.draw.line(
+            overlay,
+            tick_colour,
+            (w - tick_len - 1, ty),
+            (w - 2, ty),
+            tick_width,
+        )
+
+    # The exact centre gets a faint amber rule and diamond, separate from
+    # the moving boundary marker below.
+    centre_y = h // 2
+    pygame.draw.line(
+        overlay,
+        (*EVAL_MARKER_COLOR, 92),
+        (3, centre_y),
+        (w - 4, centre_y),
+        1,
+    )
+    cx = w // 2
+    diamond = [
+        (cx, centre_y - 4),
+        (cx + 4, centre_y),
+        (cx, centre_y + 4),
+        (cx - 4, centre_y),
+    ]
+    pygame.draw.polygon(overlay, (*EVAL_MARKER_COLOR, 178), diamond)
+    pygame.draw.polygon(overlay, (62, 43, 0, 190), diamond, 1)
+
+    bar.blit(overlay, (0, 0))
+
+    # Clip every layer above to the bar's rounded silhouette.
+    mask = pygame.Surface((w, h), pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=radius)
+    bar.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(bar, bar_rect.topleft)
+
+    # Metallic inner frame and a hairline around the dark shell.
+    pygame.draw.rect(
+        screen,
+        (151, 159, 173),
+        bar_rect.inflate(4, 4),
+        1,
+        border_radius=radius + 2,
+    )
+    pygame.draw.rect(
+        screen,
+        EVAL_BAR_FRAME_COLOR,
+        bar_rect,
+        2,
+        border_radius=radius,
+    )
+
+    # Slim amber boundary pointer with little side tips. It sits above the
+    # frame so the precise black/white meeting point remains unmistakable.
+    marker_y = max(y + 3, min(y + black_h, y + h - 4))
+    marker_glow = pygame.Surface((w + 24, 19), pygame.SRCALPHA)
+    glow_alpha = 24 + int(18 * pulse)
+    pygame.draw.rect(
+        marker_glow,
+        (*EVAL_MARKER_COLOR, glow_alpha // 2),
+        (1, 3, w + 22, 13),
+        border_radius=7,
+    )
+    pygame.draw.rect(
+        marker_glow,
+        (*EVAL_MARKER_COLOR, glow_alpha),
+        (5, 5, w + 14, 9),
+        border_radius=5,
+    )
+    screen.blit(marker_glow, (x - 12, marker_y - 9))
+
+    left_tip = [(x - 10, marker_y), (x - 4, marker_y - 4), (x - 4, marker_y + 4)]
+    right_tip = [
+        (x + w + 9, marker_y),
+        (x + w + 3, marker_y - 4),
+        (x + w + 3, marker_y + 4),
+    ]
+    pygame.draw.polygon(screen, EVAL_MARKER_COLOR, left_tip)
+    pygame.draw.polygon(screen, EVAL_MARKER_COLOR, right_tip)
+
+    marker_rect = pygame.Rect(x - 6, marker_y - 3, w + 12, 7)
+    pygame.draw.rect(screen, EVAL_MARKER_COLOR, marker_rect, border_radius=4)
     pygame.draw.rect(
         screen,
         EVAL_MARKER_HIGHLIGHT,
-        (x - 5, marker_y - 1, w + 10, 2),
+        (marker_rect.x + 2, marker_y - 2, marker_rect.width - 4, 2),
         border_radius=1,
     )
+    pygame.draw.rect(screen, (74, 50, 0), marker_rect, 1, border_radius=4)
+    marker_cx = x + w // 2
+    pygame.draw.polygon(
+        screen,
+        (74, 50, 0),
+        [
+            (marker_cx, marker_y - 2),
+            (marker_cx + 3, marker_y),
+            (marker_cx, marker_y + 2),
+            (marker_cx - 3, marker_y),
+        ],
+    )
 
-    if black_h >= 22:
-        b_label = font_tiny.render("B", True, (215, 215, 215))
-        screen.blit(b_label, (x + (w - b_label.get_width()) // 2, y + 4))
-    if white_h >= 22:
-        w_label = font_tiny.render("W", True, (30, 30, 30))
-        screen.blit(
-            w_label, (x + (w - w_label.get_width()) // 2, y + h - 20)
+    # Circular side chips replace the old floating letters. They only appear
+    # when their segment is tall enough not to crowd the boundary marker.
+    def draw_side_label(cy, text, foreground, background, border):
+        centre = (x + w // 2, cy)
+        pygame.draw.circle(screen, (14, 15, 19), (centre[0], centre[1] + 1), 11)
+        pygame.draw.circle(screen, background, centre, 11)
+        pygame.draw.circle(screen, border, centre, 11, 1)
+        label = font_tiny.render(text, True, foreground)
+        screen.blit(label, label.get_rect(center=centre))
+
+    if black_h >= 30:
+        draw_side_label(
+            y + 17,
+            "B",
+            (22, 24, 30),
+            (238, 241, 247),
+            (151, 159, 173),
         )
-
-    pygame.draw.rect(screen, (85, 85, 85), (x, y, w, h), 1)
+    if white_h >= 30:
+        draw_side_label(
+            y + h - 17,
+            "W",
+            (242, 244, 248),
+            (25, 27, 34),
+            (151, 159, 173),
+        )
+    if mate is not None and h >= 90:
+        # A central M makes a forced-mate bar feel distinct from a merely
+        # large numerical advantage.
+        if mate > 0:
+            draw_side_label(
+                y + h // 2,
+                "M",
+                EVAL_MARKER_HIGHLIGHT,
+                (25, 27, 34),
+                EVAL_MARKER_COLOR,
+            )
+        else:
+            draw_side_label(
+                y + h // 2,
+                "M",
+                (25, 27, 34),
+                (238, 241, 247),
+                EVAL_MARKER_COLOR,
+            )
 
 
 def draw_gear_icon(surface, cx, cy, size, color, thickness=2, rotation=0.0):

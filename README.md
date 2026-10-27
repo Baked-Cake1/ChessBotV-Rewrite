@@ -27,7 +27,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 
 ### Visuals
 - **Opening title animation:** “ChessBotV Rewrite” slides in once at launch with cubic-in (`t³`) easing
-- **Lichess-style eval bar** with gradient fill, tick marks (0.25/0.5/0.75), `W/B` labels, glowing marker, and a fully on-screen “Click to swap side” tooltip
+- **Lichess-style eval bar** with a rounded framed glass track, anchored slate/ivory gradients, subtle winning-side halo, quarter ticks and centre diamond, circular `W`/`B` chips (plus a central `M` for forced mate), a slim amber boundary pointer, and a fully on-screen “Click to swap side” tooltip
 - **Engine suggestion arrows render over pieces:** blue, width 7, fades/morphs smoothly; **L-shaped for knight moves** (long-leg first, correct overlay layering)
 - **Check / Checkmate FX:**
   - Under: soft radial red glow
