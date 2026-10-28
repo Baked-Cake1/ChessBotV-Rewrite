@@ -907,6 +907,11 @@ engine_settings_button_pulse_phase = 0.0
 # owned by the existing engine-slider state and helpers.
 threads_slider_hover_amount = 0.0
 threads_slider_pulse_phase = 0.0
+# Engine Settings Skill Level slider polish. These values animate only its
+# crown/star visuals; the 0..20 draft, display lerp and drag mapping remain
+# owned by the existing engine-slider state and helpers.
+skill_slider_hover_amount = 0.0
+skill_slider_pulse_phase = 0.0
 # Settings main-menu Board button polish. The phase drives only the
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
@@ -10341,6 +10346,1013 @@ def _draw_polished_threads_slider(
     return thumb_x, thumb_y
 
 
+def _skill_slider_tier(value, low, high):
+    """Return ``(tier_index, tier_name)`` for a Skill Level value."""
+    try:
+        low = int(low)
+        high = int(high)
+        numeric_value = float(value)
+    except Exception:
+        return 0, "Gentle"
+    if high <= low:
+        return 4, "Full strength"
+    fraction = (numeric_value - low) / float(high - low)
+    fraction = max(0.0, min(1.0, fraction))
+    if fraction >= 1.0:
+        return 4, "Full strength"
+    if fraction >= 0.75:
+        return 3, "Master"
+    if fraction >= 0.50:
+        return 2, "Expert"
+    if fraction >= 0.25:
+        return 1, "Club"
+    return 0, "Gentle"
+
+
+def _skill_slider_values():
+    """Read staged/saved/display Skill Level values for its renderer.
+
+    As with Threads, this is deliberately read-only: the thumb follows the
+    smoothed display float, the value chip/subtitle/bubble show the staged
+    draft, and the saved marker reads ``config``. ``set_engine_slider_value``
+    remains the only code that changes the draft from a drag.
+    """
+    try:
+        low_raw, high_raw = ENGINE_ROW_LIMITS.get("skill", (0, 20))
+        low = int(low_raw)
+        high = int(high_raw)
+    except Exception:
+        low, high = 0, 20
+    high = max(low, high)
+
+    def draft_value(raw, default):
+        try:
+            value = int(round(float(raw)))
+        except (TypeError, ValueError):
+            value = int(default)
+        return max(low, min(high, value))
+
+    saved_default = ENGINE_DEFAULTS.get("skill", high)
+    saved = draft_value(config.get("skill", saved_default), saved_default)
+    draft = draft_value(engine_draft.get("skill", saved), saved)
+    try:
+        display = float(engine_slider_display.get("skill", float(draft)))
+    except (TypeError, ValueError):
+        display = float(draft)
+    display = max(float(low), min(float(high), display))
+
+    span = float(high - low)
+    if span <= 0:
+        display_fraction = draft_fraction = saved_fraction = 1.0
+    else:
+        display_fraction = (display - low) / span
+        draft_fraction = (draft - low) / span
+        saved_fraction = (saved - low) / span
+
+    draft_tier_index, draft_tier = _skill_slider_tier(draft, low, high)
+    display_tier_index, display_tier = _skill_slider_tier(
+        display, low, high
+    )
+    return {
+        "low": low,
+        "high": high,
+        "draft": draft,
+        "saved": saved,
+        "display": display,
+        "dirty": draft != saved,
+        "display_fraction": max(0.0, min(1.0, display_fraction)),
+        "draft_fraction": max(0.0, min(1.0, draft_fraction)),
+        "saved_fraction": max(0.0, min(1.0, saved_fraction)),
+        "draft_tier_index": draft_tier_index,
+        "draft_tier": draft_tier,
+        "display_tier_index": display_tier_index,
+        "display_tier": display_tier,
+    }
+
+
+def _skill_slider_accent(fraction):
+    """Violet-to-gold accent colour for a 0..1 Skill Level fraction."""
+    fraction = max(0.0, min(1.0, float(fraction)))
+    stops = (
+        (0.00, (126, 112, 205)),
+        (0.28, (169, 104, 232)),
+        (0.55, (219, 102, 194)),
+        (0.78, (250, 145, 88)),
+        (1.00, (255, 210, 92)),
+    )
+    if fraction <= stops[0][0]:
+        return stops[0][1]
+    for (start_t, start_colour), (end_t, end_colour) in zip(
+        stops, stops[1:]
+    ):
+        if fraction <= end_t:
+            local = (fraction - start_t) / max(1e-9, end_t - start_t)
+            return _lerp_color(start_colour, end_colour, local)
+    return stops[-1][1]
+
+
+def _skill_slider_tick_values(low, high, max_intervals=24):
+    """Inclusive Skill Level tick values, normally every integer 0..20."""
+    try:
+        low = int(low)
+        high = int(high)
+        max_intervals = max(1, int(max_intervals))
+    except Exception:
+        return (0, 20)
+    if high <= low:
+        return (low,)
+
+    span = high - low
+    if span <= max_intervals:
+        return tuple(range(low, high + 1))
+    raw_step = int(math.ceil(span / float(max_intervals)))
+    step = raw_step
+    for candidate in (
+        1, 2, 4, 5, 8, 10, 16, 20, 25, 32, 50, 64, 100, 128, 200,
+        250, 500, 1000,
+    ):
+        if candidate >= raw_step:
+            step = candidate
+            break
+    values = list(range(low, high + 1, step))
+    if values[-1] != high:
+        values.append(high)
+    return tuple(values)
+
+
+def _draw_skill_sparkle(surface, cx, cy, radius, colour, rotation=0.0):
+    """Draw a small four-point Skill Level sparkle."""
+    cx, cy = int(cx), int(cy)
+    radius = max(2, int(radius))
+    points = []
+    for point_index in range(8):
+        point_radius = (
+            float(radius)
+            if point_index % 2 == 0
+            else max(1.0, radius * 0.32)
+        )
+        angle = rotation + point_index * (math.pi / 4.0)
+        points.append(
+            (
+                cx + int(round(point_radius * math.cos(angle))),
+                cy + int(round(point_radius * math.sin(angle))),
+            )
+        )
+    pygame.draw.polygon(surface, colour, points)
+    if radius >= 3:
+        pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 1)
+
+
+def _draw_skill_crown_icon(
+    surface,
+    cx,
+    cy,
+    size,
+    hover_amount=0.0,
+    phase=0.0,
+    fraction=0.0,
+    tier_index=0,
+):
+    """Draw a crown medallion whose rim and tier pips follow Skill Level."""
+    cx, cy = int(cx), int(cy)
+    size = max(20, int(size))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    fraction = max(0.0, min(1.0, float(fraction)))
+    tier_index = max(0, min(4, int(tier_index)))
+    accent = _skill_slider_accent(fraction)
+    rim_colour = _lerp_color(
+        _lerp_color(accent, (105, 92, 145), 0.28),
+        (255, 255, 255),
+        0.22 * hover_amount,
+    )
+    face_colour = _lerp_color((46, 36, 70), (62, 47, 88), hover_amount)
+    inner_colour = _lerp_color((31, 24, 52), (42, 32, 66), hover_amount)
+    medallion_radius = max(9, size // 2)
+
+    pygame.draw.circle(
+        surface, (14, 11, 28), (cx, cy + 2), medallion_radius
+    )
+    pygame.draw.circle(surface, rim_colour, (cx, cy), medallion_radius)
+    pygame.draw.circle(
+        surface, face_colour, (cx, cy), max(6, medallion_radius - 2)
+    )
+    pygame.draw.circle(
+        surface, inner_colour, (cx, cy), max(5, medallion_radius - 4)
+    )
+
+    # Enamel rim pips, kept inside the medallion silhouette.
+    pip_radius = max(5.0, medallion_radius - 3.0)
+    for pip_index in range(12):
+        angle = pip_index * (math.tau / 12.0) + math.pi / 12.0
+        pip = (
+            int(round(cx + pip_radius * math.cos(angle))),
+            int(round(cy + pip_radius * math.sin(angle))),
+        )
+        pygame.draw.circle(
+            surface,
+            _lerp_color((92, 76, 128), rim_colour, 0.52),
+            pip,
+            1,
+        )
+
+    crown_width = max(14, int(round(size * 0.62)))
+    crown_left = cx - crown_width // 2
+    crown_right = crown_left + crown_width
+    crown_base_y = cy + max(3, int(round(size * 0.10)))
+    crown_peak_y = cy - max(7, int(round(size * 0.24)))
+    crown_side_y = cy - max(4, int(round(size * 0.13)))
+    crown_valley_y = cy - max(1, int(round(size * 0.03)))
+    crown_colour = _lerp_color(accent, (255, 214, 105), 0.58)
+    crown_colour = _lerp_color(
+        crown_colour, (255, 255, 255), 0.14 * hover_amount
+    )
+    crown_points = [
+        (crown_left, crown_base_y),
+        (crown_left, crown_side_y),
+        (cx - crown_width // 4, crown_valley_y),
+        (cx, crown_peak_y),
+        (cx + crown_width // 4, crown_valley_y),
+        (crown_right, crown_side_y),
+        (crown_right, crown_base_y),
+    ]
+    pygame.draw.polygon(
+        surface,
+        (24, 17, 40),
+        [(point_x, point_y + 1) for point_x, point_y in crown_points],
+    )
+    pygame.draw.polygon(surface, crown_colour, crown_points)
+    pygame.draw.polygon(
+        surface,
+        _lerp_color(crown_colour, (255, 255, 255), 0.42),
+        crown_points,
+        1,
+    )
+    for tip_x, tip_y in (
+        (crown_left, crown_side_y - 1),
+        (cx, crown_peak_y - 1),
+        (crown_right, crown_side_y - 1),
+    ):
+        pygame.draw.circle(surface, (24, 17, 40), (tip_x, tip_y + 1), 2)
+        pygame.draw.circle(surface, accent, (tip_x, tip_y), 2)
+        pygame.draw.circle(surface, (255, 255, 255), (tip_x, tip_y), 1)
+
+    band_rect = pygame.Rect(crown_left, crown_base_y - 1, crown_width, 4)
+    pygame.draw.rect(
+        surface,
+        _lerp_color(crown_colour, (92, 58, 24), 0.28),
+        band_rect,
+        border_radius=2,
+    )
+    for jewel_offset in (-crown_width // 4, 0, crown_width // 4):
+        pygame.draw.circle(
+            surface,
+            (255, 246, 205),
+            (cx + jewel_offset, band_rect.centery),
+            1,
+        )
+
+    tier_y = min(cy + medallion_radius - 4, crown_base_y + 7)
+    for tier_pip in range(5):
+        pip_centre = (cx + (tier_pip - 2) * 4, tier_y)
+        pygame.draw.circle(
+            surface, (17, 13, 33), (pip_centre[0], pip_centre[1] + 1), 1
+        )
+        pygame.draw.circle(
+            surface,
+            accent if tier_pip <= tier_index else (76, 63, 103),
+            pip_centre,
+            1,
+        )
+
+    if hover_amount > 0.03:
+        orbit_radius = size * 0.53
+        orbit_centre = (
+            int(round(cx + orbit_radius * math.cos(phase - 0.75))),
+            int(round(cy + orbit_radius * math.sin(phase - 0.75))),
+        )
+        _draw_skill_sparkle(
+            surface,
+            orbit_centre[0],
+            orbit_centre[1],
+            3,
+            _lerp_color(accent, (255, 255, 255), 0.35),
+            rotation=phase * 0.45,
+        )
+
+
+def _draw_skill_slider_thumb(
+    surface,
+    cx,
+    cy,
+    radius,
+    hover_amount=0.0,
+    dragging=False,
+    phase=0.0,
+    fraction=0.0,
+):
+    """Draw the Skill Level thumb as a crown-gold star medallion."""
+    cx, cy = int(cx), int(cy)
+    radius = max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    active_amount = 1.0 if dragging else hover_amount
+    accent = _skill_slider_accent(fraction)
+    rim_colour = _lerp_color(
+        _lerp_color(accent, (225, 205, 240), 0.30),
+        (255, 255, 255),
+        0.28 * active_amount,
+    )
+    face_colour = _lerp_color((67, 51, 96), (88, 66, 120), active_amount)
+    inner_colour = _lerp_color((43, 33, 69), (59, 44, 88), active_amount)
+
+    pygame.draw.circle(surface, (15, 11, 29), (cx, cy + 2), radius)
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), max(2, radius - 2))
+    pygame.draw.circle(surface, inner_colour, (cx, cy), max(1, radius - 3))
+
+    jewel_distance = max(2.0, radius * 0.55)
+    for jewel_index in range(4):
+        angle = phase * 0.30 + jewel_index * (math.tau / 4.0) + math.pi / 4.0
+        jewel = (
+            int(round(cx + jewel_distance * math.cos(angle))),
+            int(round(cy + jewel_distance * math.sin(angle))),
+        )
+        pygame.draw.circle(
+            surface,
+            _lerp_color(accent, (255, 255, 255), 0.22),
+            jewel,
+            1,
+        )
+
+    grip_extent = max(2, radius - 5)
+    pygame.draw.line(
+        surface,
+        (25, 19, 45),
+        (cx, cy - grip_extent),
+        (cx, cy + grip_extent),
+        1,
+    )
+
+    star_outer = max(4.0, radius * 0.48)
+    star_inner = max(2.0, star_outer * 0.48)
+    star_rotation = -math.pi / 2.0 + phase * 0.16
+    star_points = []
+    for point_index in range(10):
+        point_radius = star_outer if point_index % 2 == 0 else star_inner
+        angle = star_rotation + point_index * (math.pi / 5.0)
+        star_points.append(
+            (
+                cx + int(round(point_radius * math.cos(angle))),
+                cy + int(round(point_radius * math.sin(angle))),
+            )
+        )
+    pygame.draw.polygon(
+        surface,
+        (24, 17, 40),
+        [(point_x, point_y + 1) for point_x, point_y in star_points],
+    )
+    pygame.draw.polygon(
+        surface,
+        _lerp_color(accent, (255, 220, 118), 0.58),
+        star_points,
+    )
+    pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 1)
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (32, 24, 54, 255)
+        )
+    except Exception:
+        pass
+
+
+def _draw_polished_skill_slider(
+    screen, row_rect, track_rect, value_rect, mx, my
+):
+    """Draw the Engine Settings Skill Level row in its original rects.
+
+    Crown/tier artwork, the rung ladder, markers, chip and bubble are
+    presentation only. ``track_rect`` remains the exact 180x6 linear
+    mapping used by the shared click/drag code, the thumb uses the
+    smoothed display value, and text values show the staged draft.
+    """
+    global skill_slider_hover_amount, skill_slider_pulse_phase
+
+    values = _skill_slider_values()
+    low = values["low"]
+    high = values["high"]
+    draft = values["draft"]
+    saved = values["saved"]
+    display = values["display"]
+    is_dirty = values["dirty"]
+    display_fraction = values["display_fraction"]
+    draft_fraction = values["draft_fraction"]
+    accent_display = _skill_slider_accent(display_fraction)
+    accent_draft = _skill_slider_accent(draft_fraction)
+    draft_tier = values["draft_tier"]
+    draft_tier_index = values["draft_tier_index"]
+    display_tier_index = values["display_tier_index"]
+
+    thumb_x = track_rect.x + int(display_fraction * track_rect.width)
+    thumb_y = track_rect.centery
+    is_dragging = engine_slider_dragging == "skill"
+    thumb_hover = bool(
+        is_dragging
+        or (abs(mx - thumb_x) < 14 and abs(my - thumb_y) < 14)
+        or track_rect.collidepoint(mx, my)
+    )
+
+    hover_target = 1.0 if thumb_hover else 0.0
+    skill_slider_hover_amount += (
+        hover_target - skill_slider_hover_amount
+    ) * 0.24
+    if abs(hover_target - skill_slider_hover_amount) < 0.01:
+        skill_slider_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, skill_slider_hover_amount))
+    if is_dragging:
+        phase_step = 0.16
+    elif thumb_hover:
+        phase_step = 0.11
+    elif is_dirty:
+        phase_step = 0.025
+    else:
+        phase_step = 0.0
+    if phase_step:
+        skill_slider_pulse_phase = (
+            skill_slider_pulse_phase + phase_step
+        ) % (2.0 * math.pi)
+    phase = skill_slider_pulse_phase
+    active_amount = 1.0 if is_dragging else hover_amount
+
+    glow_colour = (255, 196, 92) if is_dirty else accent_display
+    glow_strength = max(hover_amount, 0.20 if is_dirty else 0.0)
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (row_rect.width + 16, row_rect.height + 16), pygame.SRCALPHA
+        )
+        for inset, alpha in ((1, 13), (4, 21), (7, 31)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (row_rect.x - 8, row_rect.y - 8))
+
+    pygame.draw.rect(
+        screen, (20, 15, 35), row_rect.move(0, 2), border_radius=6
+    )
+    if is_dragging:
+        top_colour, bottom_colour = (88, 68, 112), (55, 42, 78)
+        border_colour = _lerp_color(accent_display, (255, 255, 255), 0.34)
+    elif thumb_hover:
+        top_colour, bottom_colour = (96, 74, 122), (60, 46, 86)
+        border_colour = _lerp_color(accent_display, (255, 255, 255), 0.30)
+    else:
+        top_colour, bottom_colour = (76, 61, 100), (49, 40, 70)
+        border_colour = _lerp_color(accent_display, (154, 142, 178), 0.58)
+    if is_dirty:
+        border_colour = _lerp_color(
+            border_colour, (255, 200, 104), 0.38
+        )
+
+    body = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    denom = max(1, row_rect.height - 1)
+    for body_row in range(row_rect.height):
+        colour = _lerp_color(
+            top_colour, bottom_colour, body_row / denom
+        )
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, body_row),
+            (row_rect.width - 1, body_row),
+        )
+
+    overlay = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(8 + 13 * hover_amount)),
+        [
+            (-18, row_rect.height),
+            (row_rect.width * 0.38, 0),
+            (row_rect.width * 0.56, 0),
+            (row_rect.width * 0.16, row_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(58 + 40 * hover_amount)),
+        (8, 1),
+        (row_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 20),
+        (2, 7),
+        (2, row_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 30),
+        (0, row_rect.height - 4, row_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 23),
+        (row_rect.width - 3, 6, 3, row_rect.height - 12),
+        border_radius=2,
+    )
+
+    # A faint ascending mastery staircase behind the real controls.
+    step_alpha = int(17 + 24 * hover_amount)
+    step_colour = (*_lerp_color(accent_display, (255, 255, 255), 0.30), step_alpha)
+    step_points = [
+        (112, 55), (156, 55), (156, 49), (205, 49), (205, 43),
+        (254, 43), (254, 37), (303, 37), (303, 31), (352, 31),
+    ]
+    pygame.draw.lines(overlay, step_colour, False, step_points, 1)
+    for node in (step_points[0], step_points[4], step_points[-1]):
+        pygame.draw.circle(overlay, step_colour, node, 2)
+    for boundary_fraction in (0.25, 0.50, 0.75):
+        boundary_x = int(150 + boundary_fraction * 180)
+        pygame.draw.line(
+            overlay,
+            (255, 255, 255, int(8 + 10 * hover_amount)),
+            (boundary_x, 8),
+            (boundary_x, row_rect.height - 9),
+            1,
+        )
+    for sparkle_centre, sparkle_radius in (((112, 10), 2), ((430, 10), 2)):
+        sparkle_alpha = int(35 + 55 * hover_amount)
+        sparkle_colour = (255, 235, 180, sparkle_alpha)
+        pygame.draw.line(
+            overlay,
+            sparkle_colour,
+            (sparkle_centre[0] - sparkle_radius, sparkle_centre[1]),
+            (sparkle_centre[0] + sparkle_radius, sparkle_centre[1]),
+            1,
+        )
+        pygame.draw.line(
+            overlay,
+            sparkle_colour,
+            (sparkle_centre[0], sparkle_centre[1] - sparkle_radius),
+            (sparkle_centre[0], sparkle_centre[1] + sparkle_radius),
+            1,
+        )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask, (255, 255, 255, 255), mask.get_rect(), border_radius=6
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, row_rect.topleft)
+    pygame.draw.rect(screen, border_colour, row_rect, 2, border_radius=6)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        row_rect.inflate(-3, -3),
+        1,
+        border_radius=5,
+    )
+
+    _draw_skill_crown_icon(
+        screen,
+        row_rect.x + 27,
+        row_rect.centery,
+        31,
+        hover_amount=active_amount,
+        phase=phase,
+        fraction=display_fraction,
+        tier_index=display_tier_index,
+    )
+    label_colour = _lerp_color(
+        (238, 232, 250), (255, 255, 255), hover_amount
+    )
+    label = font_small.render("Skill Level", True, label_colour)
+    label_rect = label.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery - 10)
+    )
+    label_shadow = font_small.render("Skill Level", True, (22, 16, 39))
+    screen.blit(label_shadow, label_rect.move(0, 1))
+    screen.blit(label, label_rect)
+
+    subtitle_text = (
+        draft_tier if draft_tier_index == 4 else f"{draft_tier} strength"
+    )
+    subtitle_colour = _lerp_color(
+        (183, 164, 214),
+        _lerp_color(accent_draft, (255, 255, 255), 0.36),
+        hover_amount,
+    )
+    subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
+    subtitle_rect = subtitle.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery + 13)
+    )
+    subtitle_shadow = font_tiny.render(subtitle_text, True, (22, 16, 39))
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    # The socket/groove surround, but never replace, the original track.
+    socket_rect = track_rect.inflate(10, 10)
+    groove_rect = track_rect.inflate(4, 4)
+    pygame.draw.rect(
+        screen,
+        (16, 12, 31),
+        socket_rect.move(0, 1),
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (31, 24, 52), socket_rect, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color((105, 86, 143), accent_display, 0.42 + 0.28 * hover_amount),
+        socket_rect,
+        1,
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (48, 38, 72), groove_rect, border_radius=5)
+    pygame.draw.rect(
+        screen, (22, 17, 41), groove_rect, 1, border_radius=5
+    )
+
+    fill_end_x = max(groove_rect.x + 4, thumb_x)
+    fill_width = max(
+        0, min(groove_rect.width, fill_end_x - groove_rect.x)
+    )
+    if fill_width > 0:
+        fill_surface = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_denom = max(1, groove_rect.width - 1)
+        for fill_x in range(groove_rect.width):
+            colour = _skill_slider_accent(fill_x / fill_denom)
+            colour = _lerp_color(
+                colour, (255, 255, 255), 0.10 * hover_amount
+            )
+            pygame.draw.line(
+                fill_surface,
+                (*colour, 255),
+                (fill_x, 0),
+                (fill_x, groove_rect.height - 1),
+            )
+        fill_overlay = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        pygame.draw.line(
+            fill_overlay,
+            (255, 255, 255, int(80 + 45 * hover_amount)),
+            (2, 1),
+            (groove_rect.width - 3, 1),
+            1,
+        )
+        pygame.draw.rect(
+            fill_overlay,
+            (0, 0, 0, 42),
+            (0, groove_rect.height - 3, groove_rect.width, 3),
+        )
+        fill_surface.blit(fill_overlay, (0, 0))
+        fill_mask = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_mask.fill((0, 0, 0, 0))
+        pygame.draw.rect(
+            fill_mask,
+            (255, 255, 255, 255),
+            fill_mask.get_rect(),
+            border_radius=5,
+        )
+        fill_surface.blit(
+            fill_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT
+        )
+        screen.blit(
+            fill_surface,
+            groove_rect.topleft,
+            area=pygame.Rect(0, 0, fill_width, groove_rect.height),
+        )
+
+    def fraction_to_x(fraction):
+        return track_rect.x + int(fraction * track_rect.width)
+
+    saved_x = fraction_to_x(values["saved_fraction"])
+    draft_x = fraction_to_x(draft_fraction)
+
+    # One rung per Skill Level, with taller tier-boundary rungs every five.
+    for tick_value in _skill_slider_tick_values(low, high):
+        tick_fraction = (
+            1.0 if high <= low else (tick_value - low) / (high - low)
+        )
+        tick_x = fraction_to_x(tick_fraction)
+        tick_active = tick_value <= display + 1e-9
+        major_tick = (tick_value - low) % 5 == 0
+        tick_top = groove_rect.y + (1 if major_tick else 2)
+        tick_bottom = groove_rect.bottom - (2 if major_tick else 3)
+        tick_accent = _skill_slider_accent(tick_fraction)
+        pygame.draw.line(
+            screen,
+            (
+                _lerp_color(tick_accent, (35, 24, 58), 0.48)
+                if tick_active
+                else (96, 82, 124)
+            ),
+            (tick_x, tick_top),
+            (tick_x, tick_bottom),
+            1,
+        )
+        pip_centre = (tick_x, track_rect.centery + 17)
+        pip_radius = 3 if major_tick else 2
+        pygame.draw.circle(
+            screen, (16, 12, 31), (pip_centre[0], pip_centre[1] + 1), pip_radius
+        )
+        pygame.draw.circle(
+            screen,
+            (
+                _lerp_color(tick_accent, (255, 255, 255), 0.18 * hover_amount)
+                if tick_active
+                else (82, 69, 109)
+            ),
+            pip_centre,
+            pip_radius,
+        )
+
+    if hover_amount > 0.03 and fill_width > 8:
+        for lane in range(3):
+            pulse_t = (phase / (2.0 * math.pi) + lane / 3.0) % 1.0
+            pulse_x = int(
+                groove_rect.x + 3 + pulse_t * max(1, fill_width - 6)
+            )
+            pulse_fraction = max(
+                0.0,
+                min(
+                    1.0,
+                    (pulse_x - groove_rect.x)
+                    / float(max(1, groove_rect.width - 1)),
+                ),
+            )
+            _draw_skill_sparkle(
+                screen,
+                pulse_x,
+                track_rect.centery + (lane - 1) * 3,
+                2,
+                _lerp_color(
+                    _skill_slider_accent(pulse_fraction),
+                    (255, 255, 255),
+                    0.55,
+                ),
+                rotation=phase + lane * 0.7,
+            )
+
+    saved_marker_y = socket_rect.y - 4
+    pygame.draw.polygon(
+        screen,
+        (22, 17, 41),
+        [
+            (saved_x, saved_marker_y - 3),
+            (saved_x + 3, saved_marker_y),
+            (saved_x, saved_marker_y + 3),
+            (saved_x - 3, saved_marker_y),
+        ],
+    )
+    pygame.draw.polygon(
+        screen,
+        (240, 236, 248),
+        [
+            (saved_x, saved_marker_y - 2),
+            (saved_x + 2, saved_marker_y),
+            (saved_x, saved_marker_y + 2),
+            (saved_x - 2, saved_marker_y),
+        ],
+    )
+    if is_dirty or abs(draft_x - thumb_x) > 2:
+        needle_colour = (
+            (255, 200, 104)
+            if is_dirty
+            else _lerp_color(accent_draft, (255, 255, 255), 0.34)
+        )
+        pygame.draw.line(
+            screen,
+            needle_colour,
+            (draft_x, socket_rect.y - 1),
+            (draft_x, socket_rect.bottom),
+            1,
+        )
+        pygame.draw.polygon(
+            screen,
+            needle_colour,
+            [
+                (draft_x - 3, socket_rect.bottom + 4),
+                (draft_x + 3, socket_rect.bottom + 4),
+                (draft_x, socket_rect.bottom),
+            ],
+        )
+
+    if hover_amount > 0.01:
+        thumb_glow = pygame.Surface((42, 42), pygame.SRCALPHA)
+        for glow_radius, glow_alpha in ((18, 18), (15, 28), (12, 40)):
+            pygame.draw.circle(
+                thumb_glow,
+                (*accent_display, int(glow_alpha * hover_amount)),
+                (21, 21),
+                glow_radius,
+            )
+        screen.blit(
+            thumb_glow, thumb_glow.get_rect(center=(thumb_x, thumb_y))
+        )
+    thumb_radius = 11 + (1 if is_dragging else int(round(hover_amount)))
+    _draw_skill_slider_thumb(
+        screen,
+        thumb_x,
+        thumb_y,
+        thumb_radius,
+        hover_amount=hover_amount,
+        dragging=is_dragging,
+        phase=phase,
+        fraction=display_fraction,
+    )
+
+    chip_rect = pygame.Rect(
+        value_rect.x + 3, row_rect.y + 13, value_rect.width - 6, 38
+    )
+    pygame.draw.rect(
+        screen, (17, 13, 33), chip_rect.move(0, 1), border_radius=8
+    )
+    chip_bg = (61, 48, 88) if thumb_hover else (48, 38, 72)
+    chip_border = (
+        (255, 200, 104)
+        if is_dirty
+        else _lerp_color(accent_display, (255, 255, 255), 0.24)
+        if thumb_hover
+        else _lerp_color(accent_display, (130, 112, 165), 0.45)
+    )
+    pygame.draw.rect(screen, chip_bg, chip_rect, border_radius=8)
+    pygame.draw.rect(screen, chip_border, chip_rect, 1, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(chip_border, (255, 255, 255), 0.28),
+        chip_rect.inflate(-3, -3),
+        1,
+        border_radius=6,
+    )
+    value_colour = (
+        TEXT_ACCENT
+        if is_dirty
+        else (255, 255, 255)
+        if thumb_hover or is_dragging
+        else TEXT_COLOR
+    )
+    value_text = str(draft)
+    value_font = font_small
+    value_surface = value_font.render(value_text, True, value_colour)
+    if value_surface.get_width() > chip_rect.width - 10:
+        value_font = font_tiny
+        value_surface = value_font.render(value_text, True, value_colour)
+    screen.blit(
+        value_surface,
+        value_surface.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery - 7)
+        ),
+    )
+    denominator = font_tiny.render(
+        f"of {high}",
+        True,
+        _lerp_color((178, 160, 210), (255, 240, 205), hover_amount),
+    )
+    screen.blit(
+        denominator,
+        denominator.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery + 11)
+        ),
+    )
+    if is_dirty:
+        badge = (value_rect.right - 6, value_rect.centery - 14)
+        pygame.draw.circle(screen, (43, 29, 9), (badge[0], badge[1] + 1), 4)
+        pygame.draw.circle(screen, (255, 200, 80), badge, 4)
+        pygame.draw.circle(screen, (255, 236, 178), badge, 4, 1)
+        pygame.draw.circle(
+            screen, (255, 255, 255), (badge[0] - 1, badge[1] - 1), 1
+        )
+
+    # Five ascending mastery bars use the row's spare right-hand space.
+    bar_x0 = chip_rect.right + 11
+    bar_x1 = row_rect.right - 15
+    if bar_x1 > bar_x0 + 24:
+        bar_baseline = row_rect.bottom - 17
+        bar_width = 5
+        bar_gap = 4
+        total_bar_width = 5 * bar_width + 4 * bar_gap
+        bar_start_x = min(
+            bar_x0, max(bar_x0, bar_x1 - total_bar_width + 1)
+        )
+        bar_heights = (8, 13, 18, 23, 28)
+        active_bars = display_tier_index + 1
+        pygame.draw.line(
+            screen,
+            (20, 15, 36),
+            (bar_start_x - 2, bar_baseline + 2),
+            (bar_start_x + total_bar_width + 1, bar_baseline + 2),
+            2,
+        )
+        for bar_index, bar_height in enumerate(bar_heights):
+            bar_rect = pygame.Rect(
+                bar_start_x + bar_index * (bar_width + bar_gap),
+                bar_baseline - bar_height,
+                bar_width,
+                bar_height,
+            )
+            bar_active = bar_index < active_bars
+            bar_accent = _skill_slider_accent(
+                1.0 if bar_index == 4 else bar_index / 4.0
+            )
+            pygame.draw.rect(
+                screen,
+                (18, 13, 33),
+                bar_rect.move(0, 1),
+                border_radius=2,
+            )
+            pygame.draw.rect(
+                screen,
+                (
+                    _lerp_color(bar_accent, (255, 255, 255), 0.14 * hover_amount)
+                    if bar_active
+                    else (62, 50, 84)
+                ),
+                bar_rect,
+                border_radius=2,
+            )
+            pygame.draw.rect(
+                screen,
+                (24, 18, 44),
+                bar_rect,
+                1,
+                border_radius=2,
+            )
+        pygame.draw.line(
+            screen,
+            _lerp_color(accent_display, (255, 255, 255), 0.20),
+            (bar_start_x - 2, bar_baseline + 1),
+            (bar_start_x + total_bar_width + 1, bar_baseline + 1),
+            1,
+        )
+        if hover_amount > 0.03:
+            climb_t = (phase / (2.0 * math.pi)) % 1.0
+            climb_x = int(
+                bar_start_x + climb_t * max(1, total_bar_width - 1)
+            )
+            climb_y = int(bar_baseline - 8 - climb_t * 20)
+            _draw_skill_sparkle(
+                screen,
+                climb_x,
+                climb_y,
+                3,
+                (255, 246, 205),
+                rotation=phase * 0.7,
+            )
+
+    if thumb_hover or is_dragging:
+        if is_dirty:
+            bubble_text = (
+                f"Unsaved · {draft}/{high} {draft_tier} · saved {saved}"
+            )
+        else:
+            bubble_text = f"Skill {draft}/{high} · {draft_tier}"
+        bubble_text = _elide_text(bubble_text, font_tiny, 185)
+        bubble = font_tiny.render(bubble_text, True, TEXT_COLOR)
+        tip_w = bubble.get_width() + 14
+        tip_h = 20
+        min_tip_x = row_rect.x + 138
+        max_tip_x = max(min_tip_x, chip_rect.x - tip_w - 6)
+        tip_x = max(
+            min_tip_x,
+            min(thumb_x - tip_w // 2, max_tip_x),
+        )
+        tip_rect = pygame.Rect(tip_x, row_rect.y + 3, tip_w, tip_h)
+        pygame.draw.rect(
+            screen, (24, 18, 44), tip_rect, border_radius=6
+        )
+        pygame.draw.rect(
+            screen, chip_border, tip_rect, 1, border_radius=6
+        )
+        pointer_x = max(
+            tip_rect.x + 7,
+            min(thumb_x, tip_rect.right - 7),
+        )
+        pygame.draw.polygon(
+            screen,
+            (24, 18, 44),
+            [
+                (pointer_x - 4, tip_rect.bottom - 1),
+                (pointer_x + 4, tip_rect.bottom - 1),
+                (
+                    pointer_x,
+                    min(socket_rect.y - 1, tip_rect.bottom + 5),
+                ),
+            ],
+        )
+        screen.blit(bubble, bubble.get_rect(center=tip_rect.center))
+
+    return thumb_x, thumb_y
+
+
 def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
 
@@ -10353,6 +11365,12 @@ def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
 
         if key == "threads":
             _draw_polished_threads_slider(
+                screen, row_rect, track_rect, value_rect, mx, my
+            )
+            continue
+
+        if key == "skill":
+            _draw_polished_skill_slider(
                 screen, row_rect, track_rect, value_rect, mx, my
             )
             continue
