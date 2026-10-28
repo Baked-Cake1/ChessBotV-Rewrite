@@ -282,7 +282,7 @@ MAX_THREADS = max(1, os.cpu_count() or 1)
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "use_package": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "use_package": 0}
 _STRING_CONFIG_KEYS = ("theme", "board_theme", "auto_move_color")
 
 
@@ -318,6 +318,10 @@ def _clamp_config_limits(cfg):
         cfg["auto_move_depth"] = max(0, min(int(cfg.get("auto_move_depth", 0)), 40))
     except Exception:
         cfg["auto_move_depth"] = 0
+    try:
+        cfg["autoplay_depth"] = max(1, min(int(cfg.get("autoplay_depth", 20)), 40))
+    except Exception:
+        cfg["autoplay_depth"] = 20
     return cfg
 
 
@@ -376,6 +380,7 @@ def save_config():
             f.write(f"always_on_top={1 if config.get('always_on_top', 1) else 0}\n")
             f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
+            f.write(f"autoplay_depth={int(config.get('autoplay_depth', 20))}\n")
             f.write(f"use_package={1 if config.get('use_package', 0) else 0}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
@@ -419,10 +424,17 @@ board_detection_picker_purpose = "detect"  # "detect" | "autoplay"
 # the chosen window/side, the located board rectangle, the last accepted
 # board-only screenshot/grid, and any move awaiting verification after a
 # real mouse drag.
-AUTOPLAY_DEPTH = 20
+AUTOPLAY_DEFAULT_DEPTH = 20
+# Backwards-compatible default name; live code uses get_autoplay_depth(),
+# which applies the saved Auto-play depth capped by the Depth Limit.
+AUTOPLAY_DEPTH = AUTOPLAY_DEFAULT_DEPTH
+AUTOPLAY_DEPTH_MIN = 1
+AUTOPLAY_DEPTH_MAX = 40
+autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
 AUTOPLAY_POLL_SECONDS = 0.4
 AUTOPLAY_DRAG_SECONDS = 0.38
-AUTOPLAY_STOP_VK = 0x77  # F8: global stop while the chess window has focus
+AUTOPLAY_STOP_VK = 0x77  # F8: universal Auto-play toggle (Windows VK_F8)
+AUTOPLAY_TOGGLE_VK = AUTOPLAY_STOP_VK
 show_autoplay_side_dialog = False
 autoplay_side_dialog_anim = 0.0
 show_autoplay_gameover_dialog = False
@@ -454,10 +466,28 @@ _autoplay = {
     "pending_before_image": None,
     "pending_before_grid": None,
     "pending_started_at": 0.0,
+    "pending_causes_checkmate": False,
     "drag_attempts": 0,
+    "drag_id": 0,
+    "drag_running": False,
+    "drag_result_ready": False,
+    "drag_success": False,
+    "drag_kind": "",
+    "drag_move": None,
+    "drag_move_san": "",
+    "drag_error": "",
     "game_result": None,
+    "awaiting_f8_restart": False,
+    "session_ready": False,
     "stop_key_down": False,
+    "last_f8_toggle_at": 0.0,
 }
+
+# The real-cursor drag runs on this worker so focusing/dragging in the
+# target window no longer blocks ChessBotV's pygame event/render loop
+# (especially visible while ChessBotV itself is Always on Top).
+_autoplay_drag_lock = threading.Lock()
+_autoplay_drag_thread = None
 
 
 def apply_always_on_top(enabled, persist=False):
@@ -545,6 +575,42 @@ def set_use_package(enabled, persist=True):
     backend = "chess-fen-detector package" if use_package_enabled else "built-in CNN"
     print(f"Board vision backend for the next detection/scan: {backend}.")
     return use_package_enabled
+
+
+def get_autoplay_depth():
+    """Return the engine depth Auto-play waits for before dragging a move.
+
+    The saved Auto-play depth is 1..40. It is capped by the current Depth
+    Limit for the same reason Auto-Move's positive depth is: the shared
+    analysis search never reports a depth beyond that limit.
+    """
+    try:
+        limit = int(globals().get("ANALYSIS_DEPTH", config.get("depth", 25)))
+    except Exception:
+        limit = 25
+    limit = max(1, limit)
+    try:
+        chosen = int(autoplay_depth)
+    except Exception:
+        chosen = AUTOPLAY_DEFAULT_DEPTH
+    chosen = max(AUTOPLAY_DEPTH_MIN, min(int(chosen), AUTOPLAY_DEPTH_MAX))
+    return min(chosen, limit)
+
+
+def set_autoplay_depth(depth, persist=True):
+    """Set and save Auto-play's target engine depth (1..40)."""
+    global autoplay_depth
+    try:
+        autoplay_depth = max(
+            AUTOPLAY_DEPTH_MIN,
+            min(int(depth), AUTOPLAY_DEPTH_MAX),
+        )
+    except Exception:
+        autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
+    config["autoplay_depth"] = autoplay_depth
+    if persist:
+        save_config()
+    return autoplay_depth
 
 
 def normalise_board_theme(value):
@@ -737,6 +803,13 @@ try:
 except Exception:
     auto_move_depth = 0
 auto_move_arm_reset = True
+try:
+    autoplay_depth = max(
+        AUTOPLAY_DEPTH_MIN,
+        min(int(config.get("autoplay_depth", AUTOPLAY_DEFAULT_DEPTH)), AUTOPLAY_DEPTH_MAX),
+    )
+except Exception:
+    autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
 use_package_enabled = bool(config.get("use_package", 0))
 
 # Pieces Style menu layout & scrolling — two columns of visual style cards
@@ -4662,7 +4735,7 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
 
 # --- Board Detection ---
 # The Analysis page can capture another Windows application window, find a
-# Chess.com-coloured chessboard in that screenshot, and display the result
+# supported chessboard palette in that screenshot, and display the result
 # with a blue 8x8 overlay. Detection is deliberately scoped to finding the
 # board itself (White orientation: a8 top-left, h1 bottom-right); it does
 # not sync or play moves from the external board yet.
@@ -4742,7 +4815,31 @@ PIECE_CODES = {
     "p": "bp",
     ".": "blank",
 }
-SQUARE_BG_BGR = ((208, 236, 235), (82, 149, 115))  # #ebecd0 / #739552
+BOARD_SQUARE_PALETTES = (
+    {
+        "id": "chesscom",
+        "name": "Chess.com",
+        "light_hex": "#ebecd0",
+        "dark_hex": "#739552",
+        "light_bgr": (208, 236, 235),
+        "dark_bgr": (82, 149, 115),
+    },
+    {
+        "id": "basic_lichess",
+        "name": "Basic / Lichess",
+        "light_hex": "#f0d9b5",
+        "dark_hex": "#b58863",
+        # OpenCV/window captures are BGR, so these are the RGB hex
+        # colours above with their red/blue channels swapped.
+        "light_bgr": (181, 217, 240),
+        "dark_bgr": (99, 136, 181),
+    },
+)
+# Backwards-compatible name for the original Chess.com palette.
+SQUARE_BG_BGR = (
+    BOARD_SQUARE_PALETTES[0]["light_bgr"],
+    BOARD_SQUARE_PALETTES[0]["dark_bgr"],
+)
 SQUARE_BG_TOLERANCE = 24
 _cnn_classifier_cache = None
 _cnn_classifier_lock = threading.Lock()
@@ -5527,20 +5624,81 @@ def _expected_anchor_symbols():
     )
 
 
-def _board_colour_masks(image):
-    """Return (light, dark, combined) Chess.com square-colour masks."""
+def _board_colour_masks(image, palette=None):
+    """Return ``(light, dark, combined)`` square-colour masks.
+
+    With no ``palette`` this is the union of every supported palette
+    (Chess.com and Basic/Lichess), which is what board location uses: a
+    real board normally contributes pixels from only one pair, while the
+    existing coverage/parity scoring still rejects unrelated coloured
+    blobs. A palette may be one of ``BOARD_SQUARE_PALETTES``, its ``id``,
+    or a ``(light_bgr, dark_bgr)`` pair.
+    """
     import numpy as np
 
     if image is None or getattr(image, "ndim", 0) != 3:
         raise ValueError("Board detection needs a colour screenshot")
-    colours = SQUARE_BG_BGR
+
+    if palette is None:
+        palettes = BOARD_SQUARE_PALETTES
+    elif isinstance(palette, dict):
+        palettes = (palette,)
+    elif isinstance(palette, str):
+        palettes = tuple(
+            item for item in BOARD_SQUARE_PALETTES if item["id"] == palette
+        )
+        if not palettes:
+            raise ValueError(f"Unknown board square palette: {palette!r}")
+    else:
+        # A direct (light, dark) pair, retained for small helpers/tests.
+        palettes = (
+            {"light_bgr": tuple(palette[0]), "dark_bgr": tuple(palette[1])},
+        )
+
     tolerance = SQUARE_BG_TOLERANCE
     bgr = image[:, :, :3].astype(np.int16)
-    light_colour = np.asarray(colours[0], dtype=np.int16)
-    dark_colour = np.asarray(colours[1], dtype=np.int16)
-    light = np.max(np.abs(bgr - light_colour), axis=2) <= tolerance
-    dark = np.max(np.abs(bgr - dark_colour), axis=2) <= tolerance
+    light = np.zeros(bgr.shape[:2], dtype=bool)
+    dark = np.zeros(bgr.shape[:2], dtype=bool)
+    for item in palettes:
+        light_colour = np.asarray(item["light_bgr"], dtype=np.int16)
+        dark_colour = np.asarray(item["dark_bgr"], dtype=np.int16)
+        light |= np.max(np.abs(bgr - light_colour), axis=2) <= tolerance
+        dark |= np.max(np.abs(bgr - dark_colour), axis=2) <= tolerance
     return light, dark, light | dark
+
+
+def _board_palette_for_rect(image, board_rect):
+    """Identify which supported palette best explains a located board."""
+    if image is None or getattr(image, "ndim", 0) != 3:
+        return dict(BOARD_SQUARE_PALETTES[0])
+    x, y, width, _height = [int(value) for value in board_rect]
+    side = int(width)
+    crop = image[y:y + side, x:x + side]
+    if crop.shape[0] != side or crop.shape[1] != side or side <= 0:
+        return dict(BOARD_SQUARE_PALETTES[0])
+
+    best_palette = BOARD_SQUARE_PALETTES[0]
+    best_metrics = None
+    for palette in BOARD_SQUARE_PALETTES:
+        light_mask, dark_mask, bg_mask = _board_colour_masks(
+            crop, palette=palette
+        )
+        integrals = {
+            "light": _mask_integral(light_mask),
+            "dark": _mask_integral(dark_mask),
+            "bg": _mask_integral(bg_mask),
+        }
+        metrics = _board_geometry_score((0, 0, side, side), integrals)
+        if best_metrics is None or metrics["score"] > best_metrics["score"]:
+            best_palette = palette
+            best_metrics = metrics
+
+    result = dict(best_palette)
+    if best_metrics is not None:
+        result["coverage"] = float(best_metrics["coverage"])
+        result["parity"] = float(best_metrics["parity"])
+        result["score"] = float(best_metrics["score"])
+    return result
 
 
 def _mask_integral(mask):
@@ -5952,7 +6110,7 @@ def _sync_board_anchor_labels(result):
 
 
 def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
-    """Find a White-oriented Chess.com board square in a BGR screenshot.
+    """Find a White-oriented supported-colour board in a BGR screenshot.
 
     The grid-colour geometry does the locating in both modes. With Use
     Package off, the local CNN classifies the two corner anchors and then
@@ -6013,6 +6171,10 @@ def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
         return None
     best["expected_anchors"] = expected
     best["image_size"] = (image_w, image_h)
+    palette = _board_palette_for_rect(image, best["board_rect"])
+    best["board_palette"] = palette
+    best["board_palette_id"] = palette.get("id", "chesscom")
+    best["board_palette_name"] = palette.get("name", "Chess.com")
     best["vision_backend"] = "package" if use_package else "cnn"
     best["vision_use_package"] = bool(use_package)
     if use_package:
@@ -6154,6 +6316,26 @@ def _autoplay_candidate_matches(candidate_grid, after_grid, before_grid):
             if after_grid[row][col] != before_grid[row][col]:
                 support += 1
     return support > 0
+
+
+def _autoplay_transition_matches(candidate_grid, after_grid, before_grid):
+    """True when every square changed by a move is observed correctly.
+
+    This narrower check is used only for a known checkmating Auto-play
+    move. A site's game-over overlay can cover or recolour unrelated
+    squares immediately after mate, but the squares that actually
+    changed (origin, destination, captured/castling/en-passant squares)
+    must still positively match the move before it is accepted.
+    """
+    changed = 0
+    for row in range(8):
+        for col in range(8):
+            if after_grid[row][col] == before_grid[row][col]:
+                continue
+            changed += 1
+            if candidate_grid[row][col] != after_grid[row][col]:
+                return False
+    return changed > 0
 
 
 def _autoplay_matching_legal_moves(board, candidate_grid):
@@ -6704,12 +6886,27 @@ def _autoplay_user32():
     return libs[0] if libs else None
 
 
-def _autoplay_focus_window(hwnd):
+def _autoplay_drag_is_current(drag_id):
+    """Whether a background drag job still belongs to the live session."""
+    if drag_id is None:
+        return True
+    with _autoplay_drag_lock:
+        return (
+            int(_autoplay.get("drag_id", 0) or 0) == int(drag_id)
+            and bool(_autoplay.get("drag_running"))
+            and bool(_autoplay.get("enabled"))
+            and bool(_autoplay.get("running"))
+        )
+
+
+def _autoplay_focus_window(hwnd, drag_id=None):
     """Bring the target chess window forward before a real mouse drag."""
     user32 = _autoplay_user32()
     if user32 is None or not hwnd:
         return False
     try:
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         window = ctypes.c_void_p(int(hwnd)) if not isinstance(hwnd, ctypes.c_void_p) else hwnd
         if not user32.IsWindow(window):
             return False
@@ -6717,29 +6914,40 @@ def _autoplay_focus_window(hwnd):
             user32.ShowWindow(window, 9)  # SW_RESTORE
         user32.BringWindowToTop(window)
         focused = bool(user32.SetForegroundWindow(window))
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         time.sleep(0.05)
-        return focused
+        return focused and _autoplay_drag_is_current(drag_id)
     except Exception:
         return False
 
 
-def _autoplay_click_screen_point(point):
+def _autoplay_click_screen_point(point, drag_id=None):
     user32 = _autoplay_user32()
     if user32 is None:
         return False
     try:
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         if not user32.SetCursorPos(int(point[0]), int(point[1])):
             return False
         time.sleep(0.03)
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
         time.sleep(0.03)
         user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
-        return True
+        return _autoplay_drag_is_current(drag_id)
     except Exception:
         return False
 
 
-def _autoplay_drag_screen_points(start, end, duration=AUTOPLAY_DRAG_SECONDS):
+def _autoplay_drag_screen_points(
+    start,
+    end,
+    duration=AUTOPLAY_DRAG_SECONDS,
+    drag_id=None,
+):
     """Drag the real cursor from one desktop point to another in <=0.4s."""
     user32 = _autoplay_user32()
     if user32 is None:
@@ -6747,14 +6955,20 @@ def _autoplay_drag_screen_points(start, end, duration=AUTOPLAY_DRAG_SECONDS):
     duration = max(0.05, min(0.4, float(duration)))
     mouse_down = False
     try:
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         if not user32.SetCursorPos(int(start[0]), int(start[1])):
             return False
         time.sleep(0.03)
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
         mouse_down = True
         started = time.monotonic()
         steps = 24
         for step in range(1, steps + 1):
+            if not _autoplay_drag_is_current(drag_id):
+                return False
             fraction = step / steps
             x = int(round(start[0] + (end[0] - start[0]) * fraction))
             y = int(round(start[1] + (end[1] - start[1]) * fraction))
@@ -6767,7 +6981,7 @@ def _autoplay_drag_screen_points(start, end, duration=AUTOPLAY_DRAG_SECONDS):
         time.sleep(0.02)
         user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
         mouse_down = False
-        return True
+        return _autoplay_drag_is_current(drag_id)
     except Exception:
         return False
     finally:
@@ -6778,22 +6992,34 @@ def _autoplay_drag_screen_points(start, end, duration=AUTOPLAY_DRAG_SECONDS):
                 pass
 
 
-def _autoplay_drag_move(move, screen_board_rect, side, hwnd=None):
+def _autoplay_drag_move(
+    move,
+    screen_board_rect,
+    side,
+    hwnd=None,
+    drag_id=None,
+):
     """Focus the target and drag one chess move on its real board."""
     if screen_board_rect is None or move is None:
         return False
-    _autoplay_focus_window(hwnd)
+    if not _autoplay_drag_is_current(drag_id):
+        return False
+    _autoplay_focus_window(hwnd, drag_id=drag_id)
+    if not _autoplay_drag_is_current(drag_id):
+        return False
     start, end = _autoplay_move_screen_points(screen_board_rect, move, side)
-    if not _autoplay_drag_screen_points(start, end):
+    if not _autoplay_drag_screen_points(start, end, drag_id=drag_id):
         return False
 
     if move.promotion:
-        # Chess.com presents promotion choices down the destination file
-        # from the promotion square. Queen is on the destination itself;
+        # Supported sites present promotion choices down the destination
+        # file from the promotion square. Queen is on the destination itself;
         # this also harmlessly confirms auto-queen boards in most themes.
         # For an underpromotion, classify those choice cells and click
         # the one that actually shows the desired piece when possible.
         time.sleep(0.12)
+        if not _autoplay_drag_is_current(drag_id):
+            return False
         order = (chess.QUEEN, chess.KNIGHT, chess.ROOK, chess.BISHOP)
         try:
             choice_index = order.index(move.promotion)
@@ -6808,7 +7034,7 @@ def _autoplay_drag_move(move, screen_board_rect, side, hwnd=None):
                 crop = _autoplay_capture_board_crop()
             except Exception:
                 crop = None
-            if crop is not None and _autoplay.get("enabled", True):
+            if crop is not None and _autoplay_drag_is_current(drag_id):
                 choice_cells = [
                     (max(0, min(7, dest_row + direction * index)), dest_col)
                     for index in range(4)
@@ -6829,8 +7055,11 @@ def _autoplay_drag_move(move, screen_board_rect, side, hwnd=None):
         left, top, right, bottom = _board_cell_bounds(
             screen_board_rect, choice_row, dest_col
         )
-        _autoplay_click_screen_point(((left + right) // 2, (top + bottom) // 2))
-    return True
+        _autoplay_click_screen_point(
+            ((left + right) // 2, (top + bottom) // 2),
+            drag_id=drag_id,
+        )
+    return _autoplay_drag_is_current(drag_id)
 
 
 def _autoplay_stop_hotkey_down():
@@ -6839,9 +7068,138 @@ def _autoplay_stop_hotkey_down():
     if user32 is None:
         return False
     try:
-        return bool(user32.GetAsyncKeyState(AUTOPLAY_STOP_VK) & 0x8000)
+        return bool(user32.GetAsyncKeyState(AUTOPLAY_TOGGLE_VK) & 0x8000)
     except Exception:
         return False
+
+
+def _autoplay_drag_worker(drag_id, kind, move, move_san, rect, side, hwnd):
+    """Run focus + physical drag away from the pygame/UI thread."""
+    success = False
+    error = ""
+    try:
+        success = bool(
+            _autoplay_drag_move(
+                move,
+                rect,
+                side,
+                hwnd=hwnd,
+                drag_id=drag_id,
+            )
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+
+    with _autoplay_drag_lock:
+        if int(_autoplay.get("drag_id", 0) or 0) != int(drag_id):
+            return
+        _autoplay.update({
+            "drag_running": False,
+            "drag_result_ready": True,
+            "drag_success": bool(success),
+            "drag_kind": str(kind or ""),
+            "drag_move": move,
+            "drag_move_san": str(move_san or ""),
+            "drag_error": error,
+        })
+
+
+def _autoplay_start_drag_async(kind, move, move_san):
+    """Start a non-blocking external drag for the current Auto-play board."""
+    global _autoplay_drag_thread
+    window = _autoplay.get("window") or {}
+    hwnd = window.get("hwnd") if isinstance(window, dict) else None
+    rect = _autoplay.get("screen_board_rect")
+    side = _autoplay_side_name(_autoplay.get("side", "white"))
+    if move is None or rect is None:
+        return False
+
+    with _autoplay_drag_lock:
+        previous_thread = _autoplay_drag_thread
+        if (
+            _autoplay.get("drag_running")
+            and previous_thread is not None
+            and previous_thread.is_alive()
+        ):
+            return False
+        drag_id = int(_autoplay.get("drag_id", 0) or 0) + 1
+        _autoplay.update({
+            "drag_id": drag_id,
+            "drag_running": True,
+            "drag_result_ready": False,
+            "drag_success": False,
+            "drag_kind": str(kind or ""),
+            "drag_move": move,
+            "drag_move_san": str(move_san or ""),
+            "drag_error": "",
+        })
+        thread = threading.Thread(
+            target=_autoplay_drag_worker,
+            args=(
+                drag_id,
+                str(kind or ""),
+                move,
+                str(move_san or ""),
+                tuple(rect),
+                side,
+                hwnd,
+            ),
+            name="ChessBotV-AutoplayDrag",
+            daemon=True,
+        )
+        _autoplay_drag_thread = thread
+
+    try:
+        thread.start()
+    except Exception:
+        with _autoplay_drag_lock:
+            if int(_autoplay.get("drag_id", 0) or 0) == drag_id:
+                _autoplay.update({
+                    "drag_running": False,
+                    "drag_result_ready": False,
+                })
+        return False
+    return True
+
+
+def _autoplay_take_drag_result():
+    """Pop a finished background-drag result on the GUI thread, if any."""
+    with _autoplay_drag_lock:
+        if not _autoplay.get("drag_result_ready"):
+            return None
+        result = {
+            "drag_id": int(_autoplay.get("drag_id", 0) or 0),
+            "success": bool(_autoplay.get("drag_success")),
+            "kind": str(_autoplay.get("drag_kind", "") or ""),
+            "move": _autoplay.get("drag_move"),
+            "move_san": str(_autoplay.get("drag_move_san", "") or ""),
+            "error": str(_autoplay.get("drag_error", "") or ""),
+        }
+        _autoplay.update({
+            "drag_running": False,
+            "drag_result_ready": False,
+            "drag_success": False,
+            "drag_kind": "",
+            "drag_move": None,
+            "drag_move_san": "",
+            "drag_error": "",
+        })
+        return result
+
+
+def _autoplay_invalidate_drag():
+    """Cancel/forget any background drag before stopping or rescanning."""
+    with _autoplay_drag_lock:
+        _autoplay.update({
+            "drag_id": int(_autoplay.get("drag_id", 0) or 0) + 1,
+            "drag_running": False,
+            "drag_result_ready": False,
+            "drag_success": False,
+            "drag_kind": "",
+            "drag_move": None,
+            "drag_move_san": "",
+            "drag_error": "",
+        })
 
 
 def _make_thumbnail_surface(image, max_w=276, max_h=92):
@@ -6911,6 +7269,11 @@ def _board_detection_summary(result):
         f"{_anchor_summary(anchors.get('top_left'))}; "
         f"{_anchor_summary(anchors.get('bottom_right'))}."
     )
+    palette_name = str(result.get("board_palette_name", "") or "").strip()
+    if not palette_name and isinstance(result.get("board_palette"), dict):
+        palette_name = str(result["board_palette"].get("name", "") or "").strip()
+    if palette_name:
+        summary += f" Palette: {palette_name}."
 
     piece_grid = result.get("piece_grid")
     if piece_grid:
@@ -6959,8 +7322,9 @@ def _board_detection_worker(window_info, use_package=None):
         )
         if detection is None:
             board_detection_error = (
-                "No Chess.com-coloured 8x8 board found in that window. "
-                "Make sure the full board is visible and try again."
+                "No supported 8x8 board found in that window (Chess.com "
+                "or Basic/Lichess colours). Make sure the full board is "
+                "visible and try again."
             )
             board_detection_last_summary = board_detection_error
             return
@@ -7099,6 +7463,7 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
     """Stop any scan/game loop and close Auto-play's modal dialogs."""
     global show_autoplay_side_dialog, show_autoplay_gameover_dialog
     global show_board_detection_dialog, board_detection_picker_purpose
+    _autoplay_invalidate_drag()
     _autoplay["scan_id"] = int(_autoplay.get("scan_id", 0)) + 1
     _autoplay.update({
         "enabled": False,
@@ -7110,7 +7475,9 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
         "pending_move": None,
         "pending_before_image": None,
         "pending_before_grid": None,
+        "pending_causes_checkmate": False,
         "game_result": None,
+        "awaiting_f8_restart": False,
     })
     _autoplay_set_status(reason, error=reason if error else "")
     show_autoplay_side_dialog = False
@@ -7133,15 +7500,12 @@ def request_autoplay_start():
             error="Auto-play needs Windows window capture and mouse control.",
         )
         return False
-    if int(ANALYSIS_DEPTH or 0) < AUTOPLAY_DEPTH:
-        message = f"Set Depth Limit to at least {AUTOPLAY_DEPTH} before Auto-play."
-        _autoplay_set_status(message, error=message)
-        return False
     if board_detection_running:
         message = "Wait for Board Detection to finish before starting Auto-play."
         _autoplay_set_status(message, error=message)
         return False
 
+    _autoplay_invalidate_drag()
     _autoplay.update({
         "enabled": True,
         "running": False,
@@ -7149,6 +7513,9 @@ def request_autoplay_start():
         "pending_window": None,
         "window": None,
         "game_result": None,
+        "awaiting_f8_restart": False,
+        "session_ready": False,
+        "pending_causes_checkmate": False,
     })
     _autoplay_set_status("Choose the window you are playing on.")
     if not open_board_detection_dialog("autoplay"):
@@ -7189,8 +7556,9 @@ def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
         )
         if detection is None:
             raise RuntimeError(
-                "No Chess.com-coloured 8x8 board found in that window. "
-                "Make sure the full board is visible and try again."
+                "No supported 8x8 board found in that window (Chess.com "
+                "or Basic/Lichess colours). Make sure the full board is "
+                "visible and try again."
             )
         board_rect = detection["board_rect"]
         detection["window"] = dict(window_info)
@@ -7230,6 +7598,7 @@ def start_autoplay_scan(side=None):
     if not window_info:
         return stop_autoplay("Choose a window before scanning.", error=True)
     side = _autoplay_side_name(side or _autoplay.get("side", "white"))
+    _autoplay_invalidate_drag()
     scan_id = int(_autoplay.get("scan_id", 0)) + 1
     use_package_snapshot = bool(use_package_enabled)
     _autoplay.update({
@@ -7251,8 +7620,11 @@ def start_autoplay_scan(side=None):
         "pending_move": None,
         "pending_before_image": None,
         "pending_before_grid": None,
+        "pending_causes_checkmate": False,
         "drag_attempts": 0,
         "game_result": None,
+        "awaiting_f8_restart": False,
+        "session_ready": False,
     })
     _autoplay_set_status(
         f"Scanning the full board as {side.capitalize()} with "
@@ -7280,6 +7652,60 @@ def restart_autoplay_scan():
         return request_autoplay_start()
     _autoplay["enabled"] = True
     return start_autoplay_scan(_autoplay.get("side", "white"))
+
+
+def toggle_autoplay():
+    """Universal Auto-play on/off action used by F8 everywhere.
+
+    Active setup/scanning/running sessions stop. A finished game (or a
+    previous imported session) rescans the retained window/side. With no
+    reusable session, F8 starts the normal window -> side -> scan flow.
+    """
+    if (
+        _autoplay.get("enabled")
+        or _autoplay.get("running")
+        or _autoplay.get("scan_running")
+        or _autoplay.get("drag_running")
+        or show_autoplay_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "autoplay"
+        )
+    ):
+        return stop_autoplay()
+
+    # Never let an F8 "on" press steal a standalone Board Detection
+    # picker, interrupt its worker, or stack Auto-play setup over an
+    # unrelated modal question.
+    if show_board_detection_dialog or board_detection_running:
+        return False
+    if (
+        not show_autoplay_gameover_dialog
+        and (
+            globals().get("show_newgame_confirm", False)
+            or globals().get("show_auto_color_dialog", False)
+            or globals().get("show_game_over", False)
+            or globals().get("promotion_pending", None) is not None
+        )
+    ):
+        return False
+
+    if _autoplay.get("awaiting_f8_restart") or (
+        _autoplay.get("state") == "game_over" and _autoplay.get("window")
+    ):
+        return restart_autoplay_scan()
+    if _autoplay.get("session_ready") and _autoplay.get("window"):
+        return restart_autoplay_scan()
+    return request_autoplay_start()
+
+
+def _autoplay_handle_f8_press():
+    """Debounced F8 edge shared by global polling and pygame events."""
+    now = time.monotonic()
+    if now - float(_autoplay.get("last_f8_toggle_at", 0.0) or 0.0) < 0.35:
+        return False
+    _autoplay["last_f8_toggle_at"] = now
+    return toggle_autoplay()
 
 
 def _autoplay_board_crop_from_screenshot(image, board_rect):
@@ -7376,7 +7802,7 @@ def draw_autoplay_side_dialog(screen):
         screen.blit(text, text.get_rect(center=(rect.centerx + 10, rect.centery)))
 
     _draw_board_detection_button(screen, cancel, "Cancel")
-    hint = font_tiny.render("The board is scanned once; later polls check changed squares only.", True, TEXT_MUTED)
+    hint = font_tiny.render(f"Auto-play depth {get_autoplay_depth()} · the board is scanned once.", True, TEXT_MUTED)
     if hint.get_width() <= panel.width + 80:
         screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.bottom + 16)))
     return choices, cancel
@@ -7427,9 +7853,9 @@ def draw_autoplay_gameover_dialog(screen):
     if detail:
         detail_s = font_small.render(detail, True, TEXT_MUTED)
         screen.blit(detail_s, detail_s.get_rect(center=(panel.centerx, panel.y + 68)))
-    question = font_small.render("Are you starting again?", True, TEXT_COLOR)
+    question = font_small.render("Auto-play is stopped. Start again?", True, TEXT_COLOR)
     screen.blit(question, question.get_rect(center=(panel.centerx, panel.y + 104)))
-    hint = font_tiny.render("Start the new game in the target window, then scan it.", True, TEXT_MUTED)
+    hint = font_tiny.render("Start the new game, then press F8 or Scan New Game.", True, TEXT_MUTED)
     screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.y + 128)))
 
     _draw_board_detection_button(screen, scan_rect, "Scan New Game", primary=True)
@@ -8393,6 +8819,112 @@ def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(bd_rect.x, bd_rect.bottom + 42, bd_rect.width, 94)
 
 
+def get_autoplay_depth_rects(offset_x=0, offset_y=0):
+    """Compact Auto-play depth stepper inside its existing 94px card."""
+    row = get_autoplay_toggle_rect(offset_x, offset_y)
+    outer = pygame.Rect(row.right - 188, row.bottom - 27, 172, 23)
+    minus = pygame.Rect(outer.x + 52, outer.y + 2, 26, 19)
+    value = pygame.Rect(minus.right + 4, outer.y + 2, 48, 19)
+    plus = pygame.Rect(value.right + 4, outer.y + 2, 26, 19)
+    return {
+        "row": row,
+        "outer": outer,
+        "minus": minus,
+        "value": value,
+        "plus": plus,
+    }
+
+
+def _adjust_autoplay_depth(delta):
+    """Move the saved Auto-play depth by a signed stepper amount."""
+    try:
+        current = int(autoplay_depth)
+    except Exception:
+        current = AUTOPLAY_DEFAULT_DEPTH
+    current = max(AUTOPLAY_DEPTH_MIN, min(current, AUTOPLAY_DEPTH_MAX))
+    new_depth = max(
+        AUTOPLAY_DEPTH_MIN,
+        min(current + int(delta), AUTOPLAY_DEPTH_MAX),
+    )
+    if new_depth == current:
+        return False
+    set_autoplay_depth(new_depth)
+    return True
+
+
+def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
+    """Draw the saved/effective Auto-play depth control on the card."""
+    rects = get_autoplay_depth_rects(offset_x, offset_y)
+    outer = rects["outer"]
+    pygame.draw.rect(screen, (34, 34, 44), outer, border_radius=7)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, outer, 1, border_radius=7)
+
+    label = font_tiny.render("Depth", True, TEXT_MUTED)
+    screen.blit(
+        label,
+        label.get_rect(center=(outer.x + 27, outer.centery + 1)),
+    )
+
+    try:
+        stored = int(autoplay_depth)
+    except Exception:
+        stored = AUTOPLAY_DEFAULT_DEPTH
+    stored = max(AUTOPLAY_DEPTH_MIN, min(stored, AUTOPLAY_DEPTH_MAX))
+    effective = get_autoplay_depth()
+
+    mouse_x, mouse_y = mouse_pos or (-9999, -9999)
+    for key, symbol, enabled in (
+        ("minus", "−", stored > AUTOPLAY_DEPTH_MIN),
+        ("plus", "+", stored < AUTOPLAY_DEPTH_MAX),
+    ):
+        rect = rects[key]
+        hovered = enabled and rect.collidepoint(mouse_x, mouse_y)
+        pygame.draw.rect(
+            screen,
+            BUTTON_HOVER_COLOR if hovered else (48, 48, 60),
+            rect,
+            border_radius=6,
+        )
+        pygame.draw.rect(
+            screen,
+            (150, 170, 255) if hovered else MENU_BORDER_COLOR,
+            rect,
+            1,
+            border_radius=6,
+        )
+        symbol_surface = font_small.render(
+            symbol,
+            True,
+            TEXT_COLOR if enabled else TEXT_MUTED,
+        )
+        screen.blit(
+            symbol_surface,
+            symbol_surface.get_rect(center=rect.center),
+        )
+
+    value_rect = rects["value"]
+    pygame.draw.rect(screen, (25, 25, 34), value_rect, border_radius=6)
+    pygame.draw.rect(
+        screen,
+        MENU_BORDER_COLOR,
+        value_rect,
+        1,
+        border_radius=6,
+    )
+    capped = effective != stored
+    value_text = f"{stored}>{effective}" if capped else str(stored)
+    value_surface = font_tiny.render(
+        value_text,
+        True,
+        (255, 197, 110) if capped else TEXT_ACCENT,
+    )
+    screen.blit(
+        value_surface,
+        value_surface.get_rect(center=value_rect.center),
+    )
+    return rects
+
+
 def get_use_package_toggle_rect(offset_x=0, offset_y=0):
     """Recognition-backend toggle below Auto-play and its status line."""
     autoplay_rect = get_autoplay_toggle_rect(offset_x, offset_y)
@@ -8478,7 +9010,11 @@ def _analysis_settings_button_summary():
         ).capitalize()
     except Exception:
         autoplay_side = "White"
-    autoplay_detail = f"({autoplay_side}, depth {int(AUTOPLAY_DEPTH)})"
+    try:
+        autoplay_depth_now = int(get_autoplay_depth())
+    except Exception:
+        autoplay_depth_now = AUTOPLAY_DEFAULT_DEPTH
+    autoplay_detail = f"({autoplay_side}, depth {autoplay_depth_now})"
     if autoplay_error_text and not (autoplay_scan or autoplay_running):
         autoplay_state = "error"
         autoplay_label = "Auto-play needs attention"
@@ -8494,15 +9030,15 @@ def _analysis_settings_button_summary():
         autoplay_state = "setup"
         autoplay_label = "Auto-play setup"
         autoplay_subtitle = "Auto-play setup in progress"
-    elif autoplay_phase_text == "game_over" and autoplay_enabled:
+    elif autoplay_phase_text == "game_over":
         autoplay_state = "ready"
-        autoplay_label = f"Auto-play finished {autoplay_detail}"
-        autoplay_subtitle = "Auto-play finished"
+        autoplay_label = f"Auto-play stopped — F8 restarts {autoplay_detail}"
+        autoplay_subtitle = "Auto-play stopped · F8 restarts"
     elif autoplay_enabled or autoplay_running:
         autoplay_state = "on"
         autoplay_label = f"Auto-play on {autoplay_detail}"
         autoplay_subtitle = (
-            f"Auto-play · {autoplay_side} · depth {int(AUTOPLAY_DEPTH)}"
+            f"Auto-play · {autoplay_side} · depth {autoplay_depth_now}"
         )
     else:
         autoplay_state = "off"
@@ -9285,10 +9821,16 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
         screen,
         autoplay_rect,
         "Auto-play",
-        f"Scan a live window, sync FEN, drag the best move at depth {AUTOPLAY_DEPTH}",
+        "Scan, sync FEN, drag best move",
         autoplay_shown_on,
         autoplay_anim,
         idle and autoplay_rect.collidepoint(mx, my),
+    )
+    _draw_autoplay_depth_stepper(
+        screen,
+        (mx, my) if idle else (-9999, -9999),
+        offset_x,
+        offset_y,
     )
     if _autoplay.get("error"):
         autoplay_status = _autoplay["error"]
@@ -9297,10 +9839,13 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
         autoplay_status = _autoplay["status"]
         autoplay_colour = TEXT_ACCENT if autoplay_shown_on else TEXT_MUTED
     else:
-        autoplay_status = "Choose a window and side. F8 stops Auto-play at any time."
+        autoplay_status = "Choose a window and side. F8 toggles Auto-play at any time."
         autoplay_colour = TEXT_MUTED
-    if autoplay_shown_on and "F8" not in autoplay_status:
-        autoplay_status = f"{autoplay_status}  ·  F8 stops"
+    if "F8" not in autoplay_status:
+        if _autoplay.get("awaiting_f8_restart"):
+            autoplay_status = f"{autoplay_status}  ·  F8 restarts"
+        elif autoplay_shown_on:
+            autoplay_status = f"{autoplay_status}  ·  F8 stops"
     autoplay_status_s = font_tiny.render(
         _elide_text(autoplay_status, font_tiny, 620), True, autoplay_colour
     )
@@ -13826,8 +14371,19 @@ def handle_menu_click(mx, my):
             if not board_detection_running:
                 open_board_detection_dialog()
             return True
+        autoplay_depth_rects = get_autoplay_depth_rects()
+        if autoplay_depth_rects["minus"].collidepoint(mx, my):
+            _adjust_autoplay_depth(-1)
+            return True
+        if autoplay_depth_rects["plus"].collidepoint(mx, my):
+            _adjust_autoplay_depth(1)
+            return True
+        if autoplay_depth_rects["outer"].collidepoint(mx, my):
+            # The label/value part of the stepper is a control surface,
+            # not part of the Auto-play on/off card click.
+            return True
         if get_autoplay_toggle_rect().collidepoint(mx, my):
-            request_autoplay_start()
+            toggle_autoplay()
             return True
         if get_use_package_toggle_rect().collidepoint(mx, my):
             set_use_package(not use_package_enabled)
@@ -14741,15 +15297,21 @@ def main():
         result = get_game_result(board)
         if result is None:
             return False
+        _autoplay_invalidate_drag()
         _autoplay.update({
+            "enabled": False,
             "running": False,
             "state": "game_over",
             "pending_move": None,
             "pending_before_image": None,
             "pending_before_grid": None,
+            "pending_causes_checkmate": False,
             "game_result": result,
+            "awaiting_f8_restart": True,
         })
-        _autoplay_set_status(f"{result[0]} — Auto-play finished.")
+        _autoplay_set_status(
+            f"{result[0]} — Auto-play stopped. Press F8 to restart."
+        )
         show_autoplay_gameover_dialog = True
         autoplay_gameover_dialog_anim = 0.0
         # Suppress ChessBot's built-in game-over dialog for this same
@@ -14839,7 +15401,10 @@ def main():
             "pending_move": None,
             "pending_before_image": None,
             "pending_before_grid": None,
+            "pending_causes_checkmate": False,
             "drag_attempts": 0,
+            "awaiting_f8_restart": False,
+            "session_ready": True,
         })
         auto_seen_ply = len(board.move_stack)
         auto_fired_key = None
@@ -14852,7 +15417,7 @@ def main():
         if board.turn == autoplay_player_color():
             _autoplay["state"] = "our_turn"
             _autoplay_set_status(
-                f"Auto-play synced as {side.capitalize()}. Waiting for depth {AUTOPLAY_DEPTH}..."
+                f"Auto-play synced as {side.capitalize()}. Waiting for depth {get_autoplay_depth()}..."
             )
         else:
             _autoplay["state"] = "wait_opponent"
@@ -14877,18 +15442,58 @@ def main():
         )
         return crop, candidate, changed
 
+    def autoplay_process_drag_result():
+        """Consume one non-blocking drag result on the GUI thread."""
+        result = _autoplay_take_drag_result()
+        if result is None:
+            return False
+        if not _autoplay.get("enabled") or not _autoplay.get("running"):
+            return True
+
+        pending = _autoplay.get("pending_move")
+        if pending is None or result.get("move") != pending:
+            stop_autoplay(
+                "Auto-play stopped: its background drag finished out of sync.",
+                error=True,
+            )
+            return True
+
+        if not result.get("success"):
+            if result.get("kind") == "retry":
+                message = "Auto-play could not retry the drag in the target window."
+            else:
+                message = "Auto-play could not drag the piece in the target window."
+            if result.get("error"):
+                message = f"{message} ({result['error']})"
+            stop_autoplay(message, error=True)
+            return True
+
+        now = time.monotonic()
+        move_san = result.get("move_san") or board.san(pending)
+        _autoplay.update({
+            "state": "verify_our_move",
+            "pending_started_at": now,
+            "next_poll_at": now + AUTOPLAY_POLL_SECONDS,
+        })
+        if result.get("kind") == "retry":
+            _autoplay_set_status(
+                f"Auto-play dragged {move_san} again; checking the board..."
+            )
+        else:
+            _autoplay_set_status(
+                f"Auto-play played {move_san}; checking the board in "
+                f"{AUTOPLAY_POLL_SECONDS:.1f}s..."
+            )
+        return True
+
     def update_autoplay():
-        # F8 is a global Windows stop key, useful while the chess window
-        # (not ChessBotV) has keyboard focus during a live game.
-        stop_down = _autoplay_stop_hotkey_down()
+        # F8 is the universal Windows Auto-play toggle, useful while the
+        # chess window (not ChessBotV) has keyboard focus during a game.
+        toggle_down = _autoplay_stop_hotkey_down()
         was_down = bool(_autoplay.get("stop_key_down"))
-        _autoplay["stop_key_down"] = stop_down
-        if stop_down and not was_down and (
-            _autoplay.get("enabled")
-            or show_autoplay_side_dialog
-            or show_autoplay_gameover_dialog
-        ):
-            stop_autoplay("Auto-play stopped with F8.")
+        _autoplay["stop_key_down"] = toggle_down
+        if toggle_down and not was_down:
+            _autoplay_handle_f8_press()
             return
 
         if _autoplay.get("scan_ready"):
@@ -14910,6 +15515,13 @@ def main():
             return
         if autoplay_finish_if_game_over():
             return
+        if autoplay_process_drag_result():
+            return
+        if _autoplay.get("drag_running"):
+            # The physical focus/drag is happening in the target window
+            # on a worker thread. Return immediately so this GUI keeps
+            # rendering and handling input/F8 instead of freezing.
+            return
 
         now = time.monotonic()
         state = _autoplay.get("state")
@@ -14930,15 +15542,16 @@ def main():
                     engine_thread.board.fen()
                     if getattr(engine_thread, "board", None) is not None else None
                 )
+            target_depth = get_autoplay_depth()
             if (
-                depth_now < AUTOPLAY_DEPTH
+                depth_now < target_depth
                 or not pv_now
                 or pv_now[0] not in board.legal_moves
                 or engine_fen != board.fen()
                 or info_fen != board.fen()
             ):
                 _autoplay_set_status(
-                    f"Auto-play ({side}) waiting for depth {AUTOPLAY_DEPTH} (now {depth_now})..."
+                    f"Auto-play ({side}) waiting for depth {target_depth} (now {depth_now})..."
                 )
                 return
 
@@ -14974,31 +15587,26 @@ def main():
             pending_before_image = _autoplay.get("last_image")
             pending_before_grid = _autoplay_board_grid_from_board(board)
             move_san = board.san(move)
-            _autoplay_set_status(f"Auto-play dragging {move_san} in the target window...")
-            window_info = _autoplay.get("window") or {}
-            dragged = _autoplay_drag_move(
-                move,
-                _autoplay.get("screen_board_rect"),
-                side,
-                hwnd=window_info.get("hwnd"),
-            )
-            if not _autoplay.get("enabled"):
-                return
-            if not dragged:
-                stop_autoplay("Auto-play could not drag the piece in the target window.", error=True)
-                return
+            mate_clone = board.copy(stack=False)
+            mate_clone.push(move)
             _autoplay.update({
-                "state": "verify_our_move",
+                "state": "dragging",
                 "pending_move": move,
                 "pending_before_image": pending_before_image,
                 "pending_before_grid": pending_before_grid,
                 "pending_started_at": time.monotonic(),
+                "pending_causes_checkmate": bool(mate_clone.is_checkmate()),
                 "drag_attempts": 1,
                 "next_poll_at": time.monotonic() + AUTOPLAY_POLL_SECONDS,
             })
             _autoplay_set_status(
-                f"Auto-play played {move_san}; checking the board in {AUTOPLAY_POLL_SECONDS:.1f}s..."
+                f"Auto-play dragging {move_san} in the target window..."
             )
+            if not _autoplay_start_drag_async("our_move", move, move_san):
+                stop_autoplay(
+                    "Auto-play could not drag the piece in the target window.",
+                    error=True,
+                )
             return
 
         if state == "wait_opponent":
@@ -15036,7 +15644,7 @@ def main():
                 return
             _autoplay["state"] = "our_turn"
             _autoplay_set_status(
-                f"Auto-play detected opponent move {move_san}. Waiting for depth {AUTOPLAY_DEPTH}..."
+                f"Auto-play detected opponent move {move_san}. Waiting for depth {get_autoplay_depth()}..."
             )
             return
 
@@ -15060,19 +15668,19 @@ def main():
             elapsed = now - float(_autoplay.get("pending_started_at", now))
             if not changed:
                 if elapsed >= 1.2 and int(_autoplay.get("drag_attempts", 0)) < 2:
-                    window_info = _autoplay.get("window") or {}
                     _autoplay_set_status("Auto-play move was not seen; dragging once more...")
-                    if _autoplay_drag_move(
+                    _autoplay["drag_attempts"] = int(
+                        _autoplay.get("drag_attempts", 0)
+                    ) + 1
+                    if not _autoplay_start_drag_async(
+                        "retry",
                         pending,
-                        _autoplay.get("screen_board_rect"),
-                        side,
-                        hwnd=window_info.get("hwnd"),
+                        board.san(pending),
                     ):
-                        _autoplay["drag_attempts"] = int(_autoplay.get("drag_attempts", 0)) + 1
-                        _autoplay["pending_started_at"] = time.monotonic()
-                        _autoplay["next_poll_at"] = time.monotonic() + AUTOPLAY_POLL_SECONDS
-                    else:
-                        stop_autoplay("Auto-play could not retry the drag in the target window.", error=True)
+                        stop_autoplay(
+                            "Auto-play could not retry the drag in the target window.",
+                            error=True,
+                        )
                 elif elapsed >= 2.8:
                     stop_autoplay(
                         "Auto-play stopped: the dragged move did not appear on the live board.",
@@ -15085,7 +15693,17 @@ def main():
             clone = board.copy(stack=False)
             clone.push(pending)
             after_our_grid = _autoplay_board_grid_from_board(clone)
-            if _autoplay_candidate_matches(candidate, after_our_grid, before_grid):
+            verified = _autoplay_candidate_matches(
+                candidate, after_our_grid, before_grid
+            )
+            if not verified and _autoplay.get("pending_causes_checkmate"):
+                # A game-over overlay may obscure unrelated squares right
+                # after mate; every square changed by the mating move
+                # itself must still match before accepting it.
+                verified = _autoplay_transition_matches(
+                    candidate, after_our_grid, before_grid
+                )
+            if verified:
                 move_san = board.san(pending)
                 if not autoplay_push_move(pending):
                     stop_autoplay("Auto-play lost sync while applying its verified move.", error=True)
@@ -15096,6 +15714,7 @@ def main():
                     "pending_move": None,
                     "pending_before_image": None,
                     "pending_before_grid": None,
+                    "pending_causes_checkmate": False,
                     "drag_attempts": 0,
                 })
                 if autoplay_finish_if_game_over():
@@ -15126,13 +15745,14 @@ def main():
                     "pending_move": None,
                     "pending_before_image": None,
                     "pending_before_grid": None,
+                    "pending_causes_checkmate": False,
                     "drag_attempts": 0,
                 })
                 if autoplay_finish_if_game_over():
                     return
                 _autoplay["state"] = "our_turn"
                 _autoplay_set_status(
-                    f"Auto-play verified {our_san} and detected {opponent_san}. Waiting for depth {AUTOPLAY_DEPTH}..."
+                    f"Auto-play verified {our_san} and detected {opponent_san}. Waiting for depth {get_autoplay_depth()}..."
                 )
                 return
 
@@ -15472,12 +16092,8 @@ def main():
                 if show_board_detection_dialog:
                     handle_board_detection_key(event.key)
                     continue
-                if event.key == pygame.K_F8 and (
-                    _autoplay.get("enabled")
-                    or show_autoplay_side_dialog
-                    or show_autoplay_gameover_dialog
-                ):
-                    stop_autoplay("Auto-play stopped with F8.")
+                if event.key == pygame.K_F8:
+                    _autoplay_handle_f8_press()
                     continue
                 if show_autoplay_side_dialog:
                     if event.key == pygame.K_ESCAPE:

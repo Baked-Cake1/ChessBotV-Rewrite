@@ -35,6 +35,12 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 - **Animations:** cubic ease move + rook slide for castling, capture pop-and-fade (scale 1.0→1.8), board-reset multi-piece slide
 - **Always-on-top** window via `ctypes` (Windows)
 
+### Board vision & Auto-play
+- **Board Detection / Auto-play palettes:** board location accepts Chess.com (`#ebecd0` / `#739552`) and Basic/Lichess (`#f0d9b5` / `#b58863`) square colours; the detection summary names the palette that matched, while the selected CNN/package recogniser still classifies the located board
+- **Auto-play finish + F8:** when a verified Auto-play move ends the game (including checkmate), Auto-play turns itself fully off and waits. **F8** is the universal Auto-play toggle — it stops an active setup/scan/game, rescans the retained window/side after a finished game, or starts the normal setup flow when no reusable session exists
+- **Non-blocking external drag:** focusing the target window and dragging/promotion-clicking runs on a cancellable background thread, so ChessBotV keeps rendering and responding (including to F8) while Always on Top is enabled; screenshot verification and the one-drag retry still happen on the GUI thread
+- **Auto-play depth:** the stepper inside the Auto-play card saves `autoplay_depth` (`1-40`, default `20`). Auto-play drags when the shared search reaches that depth, capped by the current Depth Limit (shown as `chosen>effective` when capped)
+
 ### Themes & UI
 - **Board themes:** any folder under `pieces/<theme>/` (e.g. `classic`). Auto-discovered, `classic` pinned first
 - **Chess.com styles:** any subfolder in `pieces/chesscom/<style>/` (e.g. `8_bit`, `chesskid` → "8-Bit", "ChessKid")
@@ -119,6 +125,8 @@ python new.py --help
 | **Board** (Settings main menu) | Open Pieces Styles / Board Themes; its miniature board, piece pair, theme strip, halo and accent follow the active board colours, with a scanning square highlight on hover |
 | **Analysis Settings** (Settings main menu) | Open Auto-Move, Board Detection and Auto-play; its eval scope sweeps on hover or while a feature is live, while the subtitle, three colour-coded status rails and below-row tooltip summarise each feature (amber for setup, red when attention is needed) |
 | **Use Package** (Analysis Settings) | Toggle the board-vision recogniser for the next Board Detection/Auto-play scan: off uses `chessbotv_cnn.pth`; on uses the installed `chess-fen-detector` package on ChessBotV's located board crop. A running Auto-play session keeps the recogniser from its initial scan |
+| **Auto-play Depth − / +** (Analysis Settings) | Set and save the engine depth Auto-play waits for before dragging (`1-40`, default `20`); the effective depth is capped by Depth Limit |
+| **F8** | Universal Auto-play toggle: stop an active session, rescan after a finished game, or start Auto-play setup |
 | **Mouse drag on slider** (Engine Settings) | Adjust the staged engine values; Threads lights its CPU core ticks/pips and lanes, while Skill Level lights its crown, 21-rung tier ladder and five mastery bars from violet toward gold; both distinguish the smoothed thumb from the amber staged target and ivory saved marker, and show an in-row value bubble while hovering/dragging |
 | **Github / Restart** (About) | Open repo in browser / restart via start.bat; hovering GitHub animates its cat medallion and external-link arrow, while hovering Restart turns its circular-arrow medallion, lights the status dots, and clicking it briefly shows “Restarting…” |
 | **Always on Top** (Settings main menu) | Toggle whether the ChessBotV window stays above other windows; the stacked-window icon, row and switch track cross-fade between slate/off and emerald/on |
@@ -142,12 +150,14 @@ skill=20
 depth=25
 multipv=1
 auto_move_depth=0
+autoplay_depth=20
 use_package=0
 ```
 - Loaded at startup and saved by the settings UI
 - `Hash` steps: 16,32,64,128,256,512,1024,2048,4096,8192,16384,32768
 - `Depth` slider: 5-40, directly controls `ANALYSIS_DEPTH` for `go depth`
 - `auto_move_depth=0` means Auto-Move plays when the search reaches the current Depth Limit; positive values use that depth (capped by the Depth Limit)
+- `autoplay_depth=20` is Auto-play's separate saved target depth (`1-40`), also capped by the current Depth Limit; Auto-play's on/off state itself remains session-only
 - `use_package=0` selects the local CNN; `use_package=1` selects `chess-fen-detector` for the next Board Detection/Auto-play scan. Existing scans/sessions keep the backend they started with
 - Auto-Move's enabled state is deliberately not written to the file and is always off on a fresh launch, including when an older file contains `auto_move=1`
 - Changes are queued as `setoption` + `isready`/`readyok` before the next search (never mid-search); a saved MultiPV change forces that next search to be a recalculation of the current position
