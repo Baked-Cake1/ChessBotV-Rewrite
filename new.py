@@ -1,4 +1,5 @@
 import ctypes
+import importlib
 import json
 import math
 import os
@@ -417,7 +418,7 @@ board_detection_result_ready = False
 board_detection_last_summary = ""
 _board_detection_thread = None
 _win32_capture_libs_cache = None
-board_detection_picker_purpose = "detect"  # "detect" | "autoplay"
+board_detection_picker_purpose = "detect"  # "detect" | "autoplay" | "advisor"
 
 # --- Auto-play (Analysis page) ---
 # One mutable session dict keeps the external-window sync state together:
@@ -488,6 +489,54 @@ _autoplay = {
 # (especially visible while ChessBotV itself is Always on Top).
 _autoplay_drag_lock = threading.Lock()
 _autoplay_drag_thread = None
+
+# --- Advisor Mode (Analysis page) ---
+# Advisor is the read-only sibling of Auto-play: it scans/syncs the same
+# kind of live window, but instead of dragging pieces it sends Stockfish's
+# current best move/eval/depth to a cliv-gui ``ProcessOverlay`` drawn over
+# the target window. It is deliberately session-only; stopping clears the
+# selected window so the next start always asks again.
+ADVISOR_POLL_SECONDS = 0.25
+ADVISOR_RELEASE_SETTLE_SECONDS = 0.18
+ADVISOR_OVERLAY_EXTRA_BOTTOM = 44
+ADVISOR_OVERLAY_ALPHA = 0.94
+show_advisor_side_dialog = False
+advisor_side_dialog_anim = 0.0
+_advisor = {
+    "enabled": False,
+    "running": False,
+    "state": "idle",
+    "status": "",
+    "error": "",
+    "window": None,
+    "pending_window": None,
+    "side": "white",
+    "vision_backend": "cnn",
+    "vision_use_package": False,
+    "scan_id": 0,
+    "scan_running": False,
+    "scan_ready": False,
+    "scan_result": None,
+    "board_rect": None,
+    "window_rect": None,
+    "window_size": None,
+    "screen_board_rect": None,
+    "last_image": None,
+    "last_grid": None,
+    "expected_fen": None,
+    "next_poll_at": 0.0,
+    "mouse_down": False,
+    "mouse_released_at": 0.0,
+    "sync_pending": False,
+    "capture_failures": 0,
+    "best_move_uci": "",
+    "best_move_san": "",
+    "eval_text": "",
+    "depth": 0,
+    "overlay_generation": 0,
+    "game_result": None,
+}
+_cliv_process_overlay_class = None
 
 
 def apply_always_on_top(enabled, persist=False):
@@ -611,6 +660,19 @@ def set_autoplay_depth(depth, persist=True):
     if persist:
         save_config()
     return autoplay_depth
+
+
+def _advisor_eval_text(score, mate):
+    """Format Stockfish's White-perspective score for the Advisor overlay."""
+    if mate is not None:
+        try:
+            return f"M{int(mate)}"
+        except Exception:
+            return "M?"
+    try:
+        return f"{float(score or 0) / 100.0:+.2f}"
+    except Exception:
+        return "+0.00"
 
 
 def normalise_board_theme(value):
@@ -865,6 +927,7 @@ always_on_top_hover_amount = 0.0
 always_on_top_icon_phase = 0.0
 auto_move_anim = 1.0 if auto_move_enabled else 0.0
 autoplay_anim = 0.0
+advisor_anim = 0.0
 use_package_anim = 1.0 if use_package_enabled else 0.0
 # Smoothed depth progress-bar fill (0..1 of the target depth)
 depth_bar_fraction = 0.0
@@ -1084,8 +1147,8 @@ def update_slider_display():
 def update_global_anims():
     global legal_pulse_t, eval_highlight_pulse, confirm_anim, game_over_anim
     global always_on_top_anim, auto_move_anim, auto_color_dialog_anim
-    global board_detection_dialog_anim, autoplay_anim, use_package_anim
-    global autoplay_side_dialog_anim, autoplay_gameover_dialog_anim
+    global board_detection_dialog_anim, autoplay_anim, advisor_anim, use_package_anim
+    global autoplay_side_dialog_anim, autoplay_gameover_dialog_anim, advisor_side_dialog_anim
     global title_slide_progress
     if title_slide_progress < 1.0:
         title_slide_progress = min(1.0, title_slide_progress + TITLE_SLIDE_SPEED)
@@ -1115,6 +1178,10 @@ def update_global_anims():
         autoplay_gameover_dialog_anim = min(1.0, autoplay_gameover_dialog_anim + 0.12)
     else:
         autoplay_gameover_dialog_anim = max(0.0, autoplay_gameover_dialog_anim - 0.12)
+    if show_advisor_side_dialog:
+        advisor_side_dialog_anim = min(1.0, advisor_side_dialog_anim + 0.12)
+    else:
+        advisor_side_dialog_anim = max(0.0, advisor_side_dialog_anim - 0.12)
     autoplay_shown_on = bool(
         _autoplay.get("enabled")
         or show_autoplay_side_dialog
@@ -1123,10 +1190,19 @@ def update_global_anims():
             and board_detection_picker_purpose == "autoplay"
         )
     )
+    advisor_shown_on = bool(
+        _advisor.get("enabled")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    )
     for name, on in (
         ("always_on_top_anim", always_on_top_enabled),
         ("auto_move_anim", auto_move_enabled or show_auto_color_dialog),
         ("autoplay_anim", autoplay_shown_on),
+        ("advisor_anim", advisor_shown_on),
         ("use_package_anim", use_package_enabled),
     ):
         cur = globals()[name]
@@ -6357,6 +6433,77 @@ def _autoplay_find_legal_move(board, candidate_grid):
     return matches[0] if len(matches) == 1 else None
 
 
+def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
+    """Unique 0/1/2-ply legal sequence shown by an Advisor screenshot.
+
+    Advisor polls only after the player releases the mouse. In a fast
+    game that screenshot can already contain both the player's move and
+    an instant/premoved reply, so fall back to a unique two-ply sequence
+    when no single move explains the observed changed squares.
+    """
+    if board is None or candidate_grid is None:
+        return None
+    before_grid = _autoplay_board_grid_from_board(board)
+    if candidate_grid == before_grid:
+        return []
+
+    matches = _autoplay_matching_legal_moves(board, candidate_grid)
+    if len(matches) == 1:
+        return matches
+    if len(matches) > 1 or int(max_plies or 0) < 2:
+        return None
+
+    sequences = []
+    for first_move in board.legal_moves:
+        clone = board.copy(stack=False)
+        clone.push(first_move)
+        for second_move in _autoplay_matching_legal_moves(clone, candidate_grid):
+            sequences.append([first_move, second_move])
+            if len(sequences) > 1:
+                return None
+    if len(sequences) == 1:
+        return sequences[0]
+
+    # A site's checkmate/game-over banner can recolour or cover squares
+    # unrelated to the mating move. If no ordinary full-board sequence
+    # matches, accept a checkmating sequence only when every square it
+    # changes is positively observed and that sequence is unique. This
+    # preserves Advisor's required full stop on checkmate without using
+    # the looser test for ordinary moves.
+    terminal_sequences = []
+    for move in board.legal_moves:
+        clone = board.copy(stack=False)
+        clone.push(move)
+        if not clone.is_checkmate():
+            continue
+        after_grid = _autoplay_board_grid_from_board(clone)
+        if _autoplay_transition_matches(candidate_grid, after_grid, before_grid):
+            terminal_sequences.append([move])
+            if len(terminal_sequences) > 1:
+                return None
+    if len(terminal_sequences) == 1:
+        return terminal_sequences[0]
+
+    for first_move in board.legal_moves:
+        first_clone = board.copy(stack=False)
+        first_clone.push(first_move)
+        if first_clone.is_game_over():
+            continue
+        for second_move in first_clone.legal_moves:
+            second_clone = first_clone.copy(stack=False)
+            second_clone.push(second_move)
+            if not second_clone.is_checkmate():
+                continue
+            after_grid = _autoplay_board_grid_from_board(second_clone)
+            if _autoplay_transition_matches(
+                candidate_grid, after_grid, before_grid
+            ):
+                terminal_sequences.append([first_move, second_move])
+                if len(terminal_sequences) > 1:
+                    return None
+    return terminal_sequences[0] if len(terminal_sequences) == 1 else None
+
+
 def _autoplay_changed_visual_squares(previous, current,
                                      mean_threshold=6.0,
                                      changed_fraction=0.035):
@@ -6652,6 +6799,23 @@ class _WinRect(ctypes.Structure):
     ]
 
 
+class _WinPoint(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_long),
+        ("y", ctypes.c_long),
+    ]
+
+
+def _hwnd_value(hwnd):
+    """Normalise a ctypes/int HWND to an int for comparisons."""
+    if not hwnd:
+        return 0
+    try:
+        return int(hwnd.value if isinstance(hwnd, ctypes.c_void_p) else hwnd)
+    except Exception:
+        return 0
+
+
 class _BitmapInfoHeader(ctypes.Structure):
     _fields_ = [
         ("biSize", ctypes.c_uint32),
@@ -6702,6 +6866,18 @@ def _get_win32_capture_libs():
     user32.GetWindowTextW.restype = ctypes.c_int
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_WinRect)]
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(_WinPoint)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.WindowFromPoint.argtypes = [_WinPoint]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
     get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
     get_long.argtypes = [wintypes.HWND, ctypes.c_int]
     get_long.restype = ctypes.c_ssize_t
@@ -6753,6 +6929,140 @@ def _get_win32_capture_libs():
     return _win32_capture_libs_cache
 
 
+def _window_process_name(hwnd):
+    """Executable basename (for example ``chrome.exe``) owning a window."""
+    libs = _get_win32_capture_libs()
+    if libs is None or not hwnd:
+        return ""
+    user32 = libs[0]
+    kernel32 = None
+    process_handle = None
+    try:
+        from ctypes import wintypes
+
+        pid = wintypes.DWORD(0)
+        window = ctypes.c_void_p(_hwnd_value(hwnd))
+        if not user32.GetWindowThreadProcessId(window, ctypes.byref(pid)):
+            return ""
+        if not pid.value:
+            return ""
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        process_handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
+        )
+        if not process_handle:
+            return ""
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(
+            process_handle, 0, buffer, ctypes.byref(size)
+        ):
+            return ""
+        return os.path.basename(buffer.value or "")
+    except Exception:
+        return ""
+    finally:
+        if process_handle and kernel32 is not None:
+            try:
+                kernel32.CloseHandle(process_handle)
+            except Exception:
+                pass
+
+
+ADVISOR_MOUSE_BUTTON_VKS = (0x01, 0x02, 0x04)  # left / right / middle
+
+
+def _advisor_any_mouse_button_down():
+    """True while any physical mouse button is currently held (Windows)."""
+    user32 = _autoplay_user32()
+    if user32 is None:
+        return False
+    try:
+        return any(
+            bool(user32.GetAsyncKeyState(vk) & 0x8000)
+            for vk in ADVISOR_MOUSE_BUTTON_VKS
+        )
+    except Exception:
+        return False
+
+
+def _advisor_cursor_in_target_window():
+    """True when the cursor is over the Advisor target/board.
+
+    ``WindowFromPoint`` can return cliv-gui's transparent overlay rather
+    than the chess window itself, so after the exact-HWND check this also
+    accepts the already-located target rectangle. It deliberately does
+    not treat a hold over ChessBotV's own window as a target hold.
+    """
+    user32 = _autoplay_user32()
+    if user32 is None:
+        return False
+    window_info = _advisor.get("window") or _advisor.get("pending_window") or {}
+    target_hwnd = _hwnd_value(window_info.get("hwnd")) if isinstance(window_info, dict) else 0
+    if not target_hwnd:
+        return False
+
+    try:
+        point = _WinPoint()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return False
+        x, y = int(point.x), int(point.y)
+
+        point_hwnd = user32.WindowFromPoint(point)
+        root_hwnd = _hwnd_value(
+            user32.GetAncestor(point_hwnd, 2) if point_hwnd else point_hwnd
+        )  # GA_ROOT
+        if root_hwnd == target_hwnd:
+            return True
+        own_hwnd = _hwnd_value(_get_window_hwnd(_user32()))
+        if own_hwnd and root_hwnd == own_hwnd:
+            return False
+
+        board_rect = _advisor.get("screen_board_rect")
+        if board_rect:
+            bx, by, bw, _bh = [int(value) for value in board_rect]
+            if bx <= x < bx + bw and by <= y < by + bw:
+                return True
+
+        rect = _WinRect()
+        if user32.GetWindowRect(
+            ctypes.c_void_p(target_hwnd), ctypes.byref(rect)
+        ):
+            return bool(
+                rect.left <= x < rect.right and rect.top <= y < rect.bottom
+            )
+    except Exception:
+        return False
+    return False
+
+
+def _advisor_target_mouse_down():
+    """Latched target mouse-hold used to suppress Advisor screenshots."""
+    if not _advisor_any_mouse_button_down():
+        return False
+    if _advisor.get("mouse_down"):
+        # The press began in the target; keep pausing until the physical
+        # release even if the drag moves outside the board/window.
+        return True
+    return _advisor_cursor_in_target_window()
+
+
 def _enumerate_capture_windows():
     """Visible top-level windows suitable for the Board Detection picker."""
     libs = _get_win32_capture_libs()
@@ -6796,6 +7106,7 @@ def _enumerate_capture_windows():
                 "hwnd": hwnd_value,
                 "title": title,
                 "rect": (rect.left, rect.top, rect.right, rect.bottom),
+                "process_name": _window_process_name(hwnd_value),
                 "thumbnail": None,
             })
         except Exception:
@@ -7202,6 +7513,383 @@ def _autoplay_invalidate_drag():
         })
 
 
+# --- Advisor Mode overlay (cliv-gui / ProcessOverlay) ---
+def _load_cliv_process_overlay():
+    """Load cliv-gui's ``ProcessOverlay`` lazily.
+
+    The PyPI distribution is named ``cliv-gui``. Version 1.0.4 installs
+    the import package as ``clivgui`` even though its documentation's
+    examples say ``cliv_gui``, so accept either import name.
+    """
+    global _cliv_process_overlay_class
+    if _cliv_process_overlay_class is not None:
+        return _cliv_process_overlay_class
+
+    errors = []
+    for module_name in ("clivgui", "cliv_gui"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+            continue
+        overlay_class = getattr(module, "ProcessOverlay", None)
+        if overlay_class is None:
+            errors.append(f"{module_name}: ProcessOverlay not found")
+            continue
+        _cliv_process_overlay_class = overlay_class
+        return overlay_class
+
+    raise RuntimeError(
+        "Advisor Mode needs the optional cliv-gui package. "
+        "Run `pip install cliv-gui`."
+        + (f" Import errors: {'; '.join(errors)}" if errors else "")
+    )
+
+
+def _advisor_overlay_square_rect(board_rect, square, side, inset=2):
+    """Target-window rectangle for one chess square in overlay coords."""
+    row, col = _autoplay_square_visual(square, side)
+    left, top, right, bottom = _board_cell_bounds(board_rect, row, col)
+    inset = max(0, int(inset))
+    return (
+        int(left + inset),
+        int(top + inset),
+        max(1, int(right - left - inset * 2)),
+        max(1, int(bottom - top - inset * 2)),
+    )
+
+
+def _advisor_make_overlay_snapshot(board_rect, side, move, text):
+    """Thread-safe drawing snapshot consumed by the Tk overlay thread."""
+    if not board_rect:
+        return None
+    board_rect = tuple(int(value) for value in board_rect)
+    from_rect = None
+    to_rect = None
+    if move is not None:
+        from_rect = _advisor_overlay_square_rect(
+            board_rect, move.from_square, side
+        )
+        to_rect = _advisor_overlay_square_rect(
+            board_rect, move.to_square, side
+        )
+    return {
+        "board_rect": board_rect,
+        "from_rect": from_rect,
+        "to_rect": to_rect,
+        "text": str(text or ""),
+    }
+
+
+def _advisor_draw_overlay_snapshot(overlay, snapshot):
+    """Draw origin/destination boxes and the under-board readout.
+
+    This must only be called from the overlay service's Tk thread; every
+    canvas call goes through cliv-gui's ``ProcessOverlay`` API.
+    """
+    overlay.clear_drawings()
+    if not snapshot:
+        return
+    board_rect = snapshot.get("board_rect")
+    if not board_rect:
+        return
+    board_x, board_y, board_w, board_h = [int(value) for value in board_rect]
+
+    from_rect = snapshot.get("from_rect")
+    if from_rect:
+        overlay.draw_rectangle(
+            int(from_rect[0]), int(from_rect[1]),
+            int(from_rect[2]), int(from_rect[3]),
+            color="#ff2020", thickness=5,
+        )
+    to_rect = snapshot.get("to_rect")
+    if to_rect:
+        overlay.draw_rectangle(
+            int(to_rect[0]), int(to_rect[1]),
+            int(to_rect[2]), int(to_rect[3]),
+            color="#1e90ff", thickness=5,
+        )
+
+    text = str(snapshot.get("text", "") or "")
+    if not text:
+        return
+    font_size = 13 if board_w >= 420 else 11
+    box_w = min(
+        board_w,
+        max(190, int(len(text) * font_size * 0.62) + 24),
+    )
+    box_h = 28
+    box_x = board_x + (board_w - box_w) // 2
+    box_y = board_y + board_h + 7
+    overlay.draw_rectangle(
+        box_x, box_y, box_w, box_h,
+        color="#dbeafe", thickness=1, fill="#101820",
+    )
+    overlay.draw_text(
+        box_x + box_w // 2,
+        box_y + box_h // 2,
+        text,
+        color="white",
+        font=("Arial", font_size, "bold"),
+    )
+
+
+class _AdvisorOverlayService:
+    """Own every cliv-gui/Tk call on one persistent background thread.
+
+    A fresh Tk interpreter is created per Advisor session, but always in
+    this same service thread. That keeps Tk calls confined to one thread
+    and makes the required stop -> choose-a-window-again restart reliable
+    instead of creating Tk roots from many short-lived Python threads.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread = None
+        self._generation = 0
+        self._pending = None
+        self._active_generation = 0
+        self._ready_generation = 0
+        self._stop_generation = 0
+        self._error = ""
+        self._error_generation = 0
+        self._snapshot = None
+        self._snapshot_version = 0
+
+    def start_session(self, hwnd, process_name):
+        """Queue an overlay for one exact HWND; returns its generation."""
+        hwnd = _hwnd_value(hwnd)
+        if not hwnd:
+            return 0
+        with self._lock:
+            previous = self._active_generation
+            if self._pending:
+                previous = int(self._pending.get("generation", previous) or previous)
+            if previous:
+                self._stop_generation = int(previous)
+            self._generation += 1
+            generation = self._generation
+            self._pending = {
+                "generation": generation,
+                "hwnd": int(hwnd),
+                "process_name": str(process_name or "unknown.exe"),
+            }
+            self._snapshot = None
+            self._snapshot_version += 1
+            self._error = ""
+            self._error_generation = 0
+            start_thread = self._thread is None or not self._thread.is_alive()
+            if start_thread:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="ChessBotV-AdvisorOverlay",
+                    daemon=True,
+                )
+        if start_thread:
+            self._thread.start()
+        self._wake.set()
+        return generation
+
+    def set_snapshot(self, snapshot, generation=None):
+        """Publish the latest rectangles/text if they actually changed."""
+        with self._lock:
+            if generation is not None and int(generation) != int(self._generation):
+                return False
+            new_snapshot = dict(snapshot) if snapshot else None
+            if new_snapshot == self._snapshot:
+                return False
+            self._snapshot = new_snapshot
+            self._snapshot_version += 1
+            return True
+
+    def stop_session(self, generation=None):
+        with self._lock:
+            if generation is None:
+                if self._pending:
+                    generation = self._pending.get("generation")
+                else:
+                    generation = self._active_generation or self._generation
+            generation = int(generation or 0)
+            if generation:
+                self._stop_generation = generation
+            if self._pending and int(self._pending.get("generation", 0)) == generation:
+                self._pending = None
+            self._snapshot = None
+            self._snapshot_version += 1
+        self._wake.set()
+
+    def is_ready(self, generation):
+        with self._lock:
+            generation = int(generation or 0)
+            return bool(
+                generation
+                and self._ready_generation == generation
+                and self._active_generation == generation
+            )
+
+    def error_for(self, generation):
+        with self._lock:
+            if int(generation or 0) == int(self._error_generation):
+                return str(self._error or "")
+            return ""
+
+    def active_generation(self):
+        with self._lock:
+            return int(self._active_generation or 0)
+
+    def _set_error(self, generation, message):
+        with self._lock:
+            self._error_generation = int(generation or 0)
+            self._error = str(message or "")
+
+    def _run(self):
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                pending = self._pending
+                self._pending = None
+                if pending:
+                    generation = int(pending.get("generation", 0) or 0)
+                    self._active_generation = generation
+                else:
+                    generation = 0
+            if not pending or not generation:
+                continue
+
+            overlay = None
+            try:
+                overlay_class = _load_cliv_process_overlay()
+                target_hwnd = int(pending.get("hwnd", 0) or 0)
+                overlay = overlay_class(
+                    str(pending.get("process_name") or "unknown.exe"),
+                    bg_color="#000000",
+                    alpha=ADVISOR_OVERLAY_ALPHA,
+                )
+
+                # ProcessOverlay's stock finder takes the first visible
+                # window belonging to an executable. Advisor requires the
+                # exact picker-selected HWND (important for browsers with
+                # several windows), so narrow that lookup to this window.
+                try:
+                    overlay.find_process_window = (
+                        lambda target=target_hwnd: target
+                    )
+                except Exception:
+                    pass
+
+                # Extend only the overlay's bottom edge so the readout can
+                # sit directly under a board that reaches the target
+                # window's own bottom edge. Board coordinates do not move.
+                try:
+                    original_get_window_rect = overlay.get_window_rect
+
+                    def get_window_rect(hwnd, original=original_get_window_rect):
+                        rect = original(hwnd)
+                        if not rect:
+                            return rect
+                        x, y, width, height = rect
+                        return (
+                            x,
+                            y,
+                            width,
+                            height + ADVISOR_OVERLAY_EXTRA_BOTTOM,
+                        )
+
+                    overlay.get_window_rect = get_window_rect
+                except Exception:
+                    pass
+
+                with self._lock:
+                    stop_requested = self._stop_generation == generation
+                if stop_requested:
+                    try:
+                        overlay.stop()
+                    except Exception:
+                        pass
+                    continue
+                if not overlay.start():
+                    raise RuntimeError(
+                        "cliv-gui could not find/start the selected window overlay"
+                    )
+                try:
+                    overlay.hwnd = target_hwnd
+                except Exception:
+                    pass
+                with self._lock:
+                    self._ready_generation = generation
+                    if self._error_generation == generation:
+                        self._error = ""
+                        self._error_generation = 0
+
+                drawn_version = -1
+
+                def tick():
+                    nonlocal drawn_version
+                    try:
+                        with self._lock:
+                            stopping = self._stop_generation == generation
+                            snapshot = (
+                                dict(self._snapshot) if self._snapshot else None
+                            )
+                            version = int(self._snapshot_version)
+                        if stopping:
+                            try:
+                                overlay.clear_drawings()
+                            except Exception:
+                                pass
+                            try:
+                                overlay.stop()
+                            except Exception:
+                                pass
+                            return
+                        if version != drawn_version:
+                            _advisor_draw_overlay_snapshot(overlay, snapshot)
+                            drawn_version = version
+                    except Exception as exc:
+                        self._set_error(
+                            generation,
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                        try:
+                            overlay.stop()
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        overlay.root.after(40, tick)
+                    except Exception:
+                        return
+
+                overlay.root.after(25, tick)
+                overlay.root.mainloop()
+
+                with self._lock:
+                    stop_requested = self._stop_generation == generation
+                if not stop_requested:
+                    self._set_error(generation, "Advisor overlay closed.")
+            except Exception as exc:
+                self._set_error(
+                    generation,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                if overlay is not None:
+                    try:
+                        overlay.stop()
+                    except Exception:
+                        pass
+            finally:
+                with self._lock:
+                    if self._active_generation == generation:
+                        self._active_generation = 0
+                    if self._ready_generation == generation:
+                        self._ready_generation = 0
+
+
+_advisor_overlay_service = _AdvisorOverlayService()
+
+
 def _make_thumbnail_surface(image, max_w=276, max_h=92):
     """Convert a BGR screenshot to a small pygame preview surface."""
     try:
@@ -7504,6 +8192,19 @@ def request_autoplay_start():
         message = "Wait for Board Detection to finish before starting Auto-play."
         _autoplay_set_status(message, error=message)
         return False
+    if (
+        _advisor.get("enabled")
+        or _advisor.get("running")
+        or _advisor.get("scan_running")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    ):
+        message = "Stop Advisor Mode before starting Auto-play."
+        _autoplay_set_status(message, error=message)
+        return False
 
     _autoplay_invalidate_drag()
     _autoplay.update({
@@ -7674,6 +8375,22 @@ def toggle_autoplay():
     ):
         return stop_autoplay()
 
+    # A retained Auto-play session must not bypass Advisor's mutual
+    # exclusion by taking the F8 rescan path below.
+    if (
+        _advisor.get("enabled")
+        or _advisor.get("running")
+        or _advisor.get("scan_running")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    ):
+        message = "Stop Advisor Mode before starting Auto-play."
+        _autoplay_set_status(message, error=message)
+        return False
+
     # Never let an F8 "on" press steal a standalone Board Detection
     # picker, interrupt its worker, or stack Auto-play setup over an
     # unrelated modal question.
@@ -7685,6 +8402,7 @@ def toggle_autoplay():
             globals().get("show_newgame_confirm", False)
             or globals().get("show_auto_color_dialog", False)
             or globals().get("show_game_over", False)
+            or globals().get("show_advisor_side_dialog", False)
             or globals().get("promotion_pending", None) is not None
         )
     ):
@@ -7706,6 +8424,306 @@ def _autoplay_handle_f8_press():
         return False
     _autoplay["last_f8_toggle_at"] = now
     return toggle_autoplay()
+
+
+# --- Advisor Mode session control ---
+def _advisor_set_status(status, error=""):
+    _advisor["status"] = str(status or "")
+    _advisor["error"] = str(error or "")
+
+
+def stop_advisor(reason="Advisor Mode stopped", error=False):
+    """Stop Advisor, destroy its overlay, and forget the target window."""
+    global show_advisor_side_dialog
+    global show_board_detection_dialog, board_detection_picker_purpose
+    overlay_generation = int(_advisor.get("overlay_generation", 0) or 0)
+    try:
+        _advisor_overlay_service.stop_session(overlay_generation or None)
+    except Exception:
+        pass
+    _advisor["scan_id"] = int(_advisor.get("scan_id", 0)) + 1
+    _advisor.update({
+        "enabled": False,
+        "running": False,
+        "state": "idle",
+        "scan_running": False,
+        "scan_ready": False,
+        "scan_result": None,
+        "window": None,
+        "pending_window": None,
+        "board_rect": None,
+        "window_rect": None,
+        "window_size": None,
+        "screen_board_rect": None,
+        "last_image": None,
+        "last_grid": None,
+        "expected_fen": None,
+        "mouse_down": False,
+        "sync_pending": False,
+        "capture_failures": 0,
+        "best_move_uci": "",
+        "best_move_san": "",
+        "eval_text": "",
+        "depth": 0,
+        "overlay_generation": 0,
+        "game_result": None,
+    })
+    _advisor_set_status(reason, error=reason if error else "")
+    show_advisor_side_dialog = False
+    if board_detection_picker_purpose == "advisor":
+        show_board_detection_dialog = False
+        board_detection_picker_purpose = "detect"
+    if reason:
+        print(f"Advisor Mode: {reason}")
+    return False
+
+
+def request_advisor_start():
+    """Begin Advisor's window -> side -> first-scan setup flow."""
+    if (
+        _advisor.get("enabled")
+        or _advisor.get("running")
+        or _advisor.get("scan_running")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    ):
+        return stop_advisor()
+    if os.name != "nt":
+        message = "Advisor Mode needs Windows window capture and cliv-gui overlay support."
+        _advisor_set_status(message, error=message)
+        return False
+    if (
+        _autoplay.get("enabled")
+        or _autoplay.get("running")
+        or _autoplay.get("scan_running")
+        or _autoplay.get("drag_running")
+        or show_autoplay_side_dialog
+        or show_autoplay_gameover_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "autoplay"
+        )
+    ):
+        message = "Stop Auto-play before starting Advisor Mode."
+        _advisor_set_status(message, error=message)
+        return False
+    if board_detection_running:
+        message = "Wait for Board Detection to finish before starting Advisor Mode."
+        _advisor_set_status(message, error=message)
+        return False
+    try:
+        _load_cliv_process_overlay()
+    except Exception as exc:
+        message = str(exc)
+        display_message = (
+            "Install: pip install cliv-gui"
+            if "pip install cliv-gui" in message else message
+        )
+        _advisor_set_status(display_message, error=display_message)
+        print(f"Advisor Mode: {message}")
+        return False
+
+    _advisor.update({
+        "enabled": True,
+        "running": False,
+        "state": "choosing_window",
+        "pending_window": None,
+        "window": None,
+        "board_rect": None,
+        "window_rect": None,
+        "window_size": None,
+        "screen_board_rect": None,
+        "last_image": None,
+        "last_grid": None,
+        "expected_fen": None,
+        "game_result": None,
+        "sync_pending": False,
+    })
+    _advisor_set_status("Choose the window to broadcast on.")
+    if not open_board_detection_dialog("advisor"):
+        return stop_advisor(
+            "Could not open the Advisor Mode window picker.", error=True
+        )
+    return True
+
+
+def toggle_advisor():
+    """Toggle used by Analysis Settings' Advisor Mode row."""
+    if (
+        _advisor.get("enabled")
+        or _advisor.get("running")
+        or _advisor.get("scan_running")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    ):
+        return stop_advisor()
+    return request_advisor_start()
+
+
+def _advisor_window_selected(window_info):
+    """Store the picker choice, start its overlay, and ask the side."""
+    global show_advisor_side_dialog, advisor_side_dialog_anim
+    global show_board_detection_dialog, board_detection_picker_purpose
+    if not window_info:
+        return stop_advisor("No Advisor Mode window was selected.", error=True)
+
+    window_info = dict(window_info)
+    if not window_info.get("process_name"):
+        window_info["process_name"] = _window_process_name(
+            window_info.get("hwnd")
+        )
+    _advisor["pending_window"] = dict(window_info)
+    _advisor["window"] = dict(window_info)
+    _advisor["state"] = "choosing_side"
+
+    generation = _advisor_overlay_service.start_session(
+        window_info.get("hwnd"),
+        window_info.get("process_name") or "unknown.exe",
+    )
+    if not generation:
+        return stop_advisor(
+            "Advisor Mode could not start the cliv-gui overlay.", error=True
+        )
+    _advisor["overlay_generation"] = int(generation)
+    _advisor_set_status("Choose the side you are playing.")
+    show_board_detection_dialog = False
+    board_detection_picker_purpose = "detect"
+    show_advisor_side_dialog = True
+    advisor_side_dialog_anim = 0.0
+    return True
+
+
+def _advisor_scan_worker(window_info, side, scan_id, use_package=None):
+    """Capture the selected target and run Advisor's one full-board scan."""
+    use_package = _use_package_selected(use_package)
+    try:
+        _ensure_vision_backend_ready(use_package)
+        # The initial scan obeys the same rule as live polling: never
+        # use a screenshot of a piece while it is being held in the
+        # target. The post-capture check also discards the boundary
+        # race where a press starts during the capture itself.
+        image = None
+        window_rect = None
+        while True:
+            while (
+                int(_advisor.get("scan_id", 0)) == int(scan_id)
+                and _advisor.get("enabled")
+                and _advisor_target_mouse_down()
+            ):
+                _advisor["mouse_down"] = True
+                _advisor_set_status(
+                    "Advisor waiting for the mouse to be released before scanning..."
+                )
+                time.sleep(0.05)
+            if int(_advisor.get("scan_id", 0)) != int(scan_id) or not _advisor.get("enabled"):
+                return
+            if _advisor.get("mouse_down"):
+                _advisor["mouse_down"] = False
+                _advisor["mouse_released_at"] = time.monotonic()
+                time.sleep(ADVISOR_RELEASE_SETTLE_SECONDS)
+                _advisor_set_status(
+                    f"Scanning the full board as {_autoplay_side_name(side).capitalize()} "
+                    f"with {_vision_backend_label(use_package)}..."
+                )
+            image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
+            if image is None or not _advisor_target_mouse_down():
+                break
+            _advisor["mouse_down"] = True
+        if image is None:
+            raise RuntimeError("Could not screenshot the selected window")
+        expected_anchors = (("R", "r") if _autoplay_side_name(side) == "black" else None)
+        detection = detect_chessboard_in_image(
+            image,
+            expected_anchors=expected_anchors,
+            use_package=use_package,
+        )
+        if detection is None:
+            raise RuntimeError(
+                "No supported 8x8 board found in that window (Chess.com "
+                "or Basic/Lichess colours). Make sure the full board is "
+                "visible and try again."
+            )
+        board_rect = detection["board_rect"]
+        detection["window"] = dict(window_info)
+        detection["window_title"] = window_info.get("title", "Selected window")
+        detection["side"] = _autoplay_side_name(side)
+        detection["screenshot"] = image
+        if window_rect:
+            detection["window_rect"] = window_rect
+            detection["window_size"] = (
+                int(window_rect[2] - window_rect[0]),
+                int(window_rect[3] - window_rect[1]),
+            )
+            detection["screen_board_rect"] = (
+                window_rect[0] + board_rect[0],
+                window_rect[1] + board_rect[1],
+                board_rect[2],
+                board_rect[3],
+            )
+        if int(_advisor.get("scan_id", 0)) != int(scan_id) or not _advisor.get("enabled"):
+            return
+        _advisor["scan_result"] = detection
+        _advisor["scan_ready"] = True
+        _advisor["state"] = "importing"
+        _advisor_set_status("Board scanned. Importing the position as FEN...")
+    except Exception as exc:
+        if int(_advisor.get("scan_id", 0)) == int(scan_id) and _advisor.get("enabled"):
+            stop_advisor(f"Advisor scan failed: {exc}", error=True)
+    finally:
+        if int(_advisor.get("scan_id", 0)) == int(scan_id):
+            _advisor["scan_running"] = False
+
+
+def start_advisor_scan(side=None):
+    """Start Advisor's initial full-board scan for the chosen side."""
+    window_info = _advisor.get("pending_window") or _advisor.get("window")
+    if not window_info:
+        return stop_advisor("Choose a window before scanning.", error=True)
+    side = _autoplay_side_name(side or _advisor.get("side", "white"))
+    scan_id = int(_advisor.get("scan_id", 0)) + 1
+    use_package_snapshot = bool(use_package_enabled)
+    _advisor.update({
+        "enabled": True,
+        "running": False,
+        "state": "scanning",
+        "window": dict(window_info),
+        "pending_window": dict(window_info),
+        "side": side,
+        "vision_backend": "package" if use_package_snapshot else "cnn",
+        "vision_use_package": use_package_snapshot,
+        "scan_id": scan_id,
+        "scan_running": True,
+        "scan_ready": False,
+        "scan_result": None,
+        "last_image": None,
+        "last_grid": None,
+        "expected_fen": None,
+        "game_result": None,
+        "sync_pending": False,
+        "capture_failures": 0,
+    })
+    _advisor_set_status(
+        f"Scanning the full board as {side.capitalize()} with "
+        f"{_vision_backend_label(use_package_snapshot)}..."
+    )
+    try:
+        begin_settings_menu_close()
+    except Exception:
+        pass
+    thread = threading.Thread(
+        target=_advisor_scan_worker,
+        args=(dict(window_info), side, scan_id, use_package_snapshot),
+        name="advisor-scan",
+        daemon=True,
+    )
+    thread.start()
+    return True
 
 
 def _autoplay_board_crop_from_screenshot(image, board_rect):
@@ -7739,6 +8757,37 @@ def _autoplay_capture_board_crop():
     _autoplay["window_rect"] = window_rect
     _autoplay["window_size"] = window_size
     _autoplay["screen_board_rect"] = (
+        window_rect[0] + board_rect[0],
+        window_rect[1] + board_rect[1],
+        board_rect[2],
+        board_rect[3],
+    )
+    return _autoplay_board_crop_from_screenshot(image, board_rect)
+
+
+def _advisor_capture_board_crop():
+    """Capture Advisor's target and keep only its located board crop."""
+    window_info = _advisor.get("window") or {}
+    board_rect = _advisor.get("board_rect")
+    if not window_info or board_rect is None:
+        return None
+    image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
+    if image is None or window_rect is None:
+        return None
+    window_size = (
+        int(window_rect[2] - window_rect[0]),
+        int(window_rect[3] - window_rect[1]),
+    )
+    expected_size = _advisor.get("window_size")
+    if expected_size is not None and tuple(expected_size) != window_size:
+        stop_advisor(
+            "The target window was resized; turn Advisor Mode on again to scan its board.",
+            error=True,
+        )
+        return None
+    _advisor["window_rect"] = window_rect
+    _advisor["window_size"] = window_size
+    _advisor["screen_board_rect"] = (
         window_rect[0] + board_rect[0],
         window_rect[1] + board_rect[1],
         board_rect[2],
@@ -7821,6 +8870,83 @@ def handle_autoplay_side_click(mx, my):
     return True
 
 
+def get_advisor_side_dialog_rects():
+    e = cubic_ease_in_out(max(0.0, min(1.0, advisor_side_dialog_anim)))
+    w, h = 440, 224
+    x = WIDTH // 2 - w // 2
+    y = HEIGHT // 2 - h // 2 - int((1 - e) * 18)
+    panel = pygame.Rect(x, y, w, h)
+    bw, bh, gap = 168, 48, 16
+    total = 2 * bw + gap
+    x0 = panel.centerx - total // 2
+    choices = {
+        side: pygame.Rect(x0 + index * (bw + gap), y + 104, bw, bh)
+        for index, side in enumerate(("white", "black"))
+    }
+    cancel = pygame.Rect(panel.centerx - 70, y + h - 52, 140, 36)
+    return panel, choices, cancel
+
+
+def draw_advisor_side_dialog(screen):
+    e = cubic_ease_in_out(max(0.0, min(1.0, advisor_side_dialog_anim)))
+    panel, choices, cancel = get_advisor_side_dialog_rects()
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, int(170 * e)))
+    screen.blit(overlay, (0, 0))
+    pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
+    pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
+    pygame.draw.rect(screen, (130, 220, 150), panel, 2, border_radius=14)
+
+    title = font_large.render("Advisor Mode", True, TEXT_COLOR)
+    screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 30)))
+    question = font_small.render("Which side are you playing?", True, TEXT_MUTED)
+    screen.blit(question, question.get_rect(center=(panel.centerx, panel.y + 60)))
+    window_info = _advisor.get("pending_window") or _advisor.get("window") or {}
+    window_title = window_info.get("title", "Selected window")
+    window_s = font_tiny.render(
+        _elide_text(window_title, font_tiny, panel.width - 36),
+        True, TEXT_ACCENT,
+    )
+    screen.blit(window_s, window_s.get_rect(center=(panel.centerx, panel.y + 82)))
+
+    mx, my = pygame.mouse.get_pos()
+    for side, rect in choices.items():
+        hovered = rect.collidepoint(mx, my)
+        bg = (74, 158, 96) if hovered else (66, 66, 80)
+        pygame.draw.rect(screen, bg, rect, border_radius=10)
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, rect, 2, border_radius=10)
+        pygame.draw.circle(
+            screen,
+            (240, 240, 240) if side == "white" else (25, 25, 25),
+            (rect.x + 24, rect.centery),
+            9,
+        )
+        text = font_small.render(side.capitalize(), True, TEXT_COLOR)
+        screen.blit(text, text.get_rect(center=(rect.centerx + 10, rect.centery)))
+
+    _draw_board_detection_button(screen, cancel, "Cancel")
+    hint = font_tiny.render(
+        "cliv-gui overlay · polls pause while the mouse is held.",
+        True, TEXT_MUTED,
+    )
+    if hint.get_width() <= panel.width + 80:
+        screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.bottom + 16)))
+    return choices, cancel
+
+
+def handle_advisor_side_click(mx, my):
+    global show_advisor_side_dialog
+    panel, choices, cancel = get_advisor_side_dialog_rects()
+    for side, rect in choices.items():
+        if rect.collidepoint(mx, my):
+            show_advisor_side_dialog = False
+            start_advisor_scan(side)
+            return True
+    if cancel.collidepoint(mx, my) or not panel.collidepoint(mx, my):
+        return stop_advisor("Advisor Mode cancelled before scanning.")
+    return True
+
+
 def get_autoplay_gameover_dialog_rects():
     e = cubic_ease_in_out(max(0.0, min(1.0, autoplay_gameover_dialog_anim)))
     w, h = 480, 228
@@ -7897,9 +9023,13 @@ def open_board_detection_dialog(purpose="detect"):
     global board_detection_error
     if board_detection_running:
         return False
-    purpose = "autoplay" if purpose == "autoplay" else "detect"
-    if purpose == "detect" and _autoplay.get("enabled"):
-        board_detection_error = "Stop Auto-play before running Board Detection."
+    purpose = purpose if purpose in ("autoplay", "advisor") else "detect"
+    if purpose == "detect" and (
+        _autoplay.get("enabled") or _advisor.get("enabled")
+    ):
+        board_detection_error = (
+            "Stop Auto-play or Advisor Mode before running Board Detection."
+        )
         board_detection_status = board_detection_error
         return False
     board_detection_picker_purpose = purpose
@@ -7971,11 +9101,21 @@ def draw_board_detection_dialog(screen):
     pygame.draw.rect(screen, (80, 160, 255), panel, 2, border_radius=14)
 
     autoplay_picker = board_detection_picker_purpose == "autoplay"
-    title = font_large.render("Auto-play" if autoplay_picker else "Board Detection", True, TEXT_COLOR)
+    advisor_picker = board_detection_picker_purpose == "advisor"
+    live_picker = autoplay_picker or advisor_picker
+    title_text = (
+        "Advisor Mode" if advisor_picker
+        else "Auto-play" if autoplay_picker
+        else "Board Detection"
+    )
+    title = font_large.render(title_text, True, TEXT_COLOR)
     screen.blit(title, (panel.x + 32, panel.y + 20))
     subtitle_text = (
-        "Choose the window you are playing on"
-        if autoplay_picker else "Choose the window containing the chessboard"
+        "Choose the window to broadcast on"
+        if advisor_picker
+        else "Choose the window you are playing on"
+        if autoplay_picker
+        else "Choose the window containing the chessboard"
     )
     subtitle = font_small.render(subtitle_text, True, TEXT_MUTED)
     screen.blit(subtitle, (panel.x + 32, panel.y + 50))
@@ -8037,7 +9177,7 @@ def draw_board_detection_dialog(screen):
     else:
         detail = (
             "Select a preview, then Use Window."
-            if autoplay_picker else "Select a preview, then Capture & Detect."
+            if live_picker else "Select a preview, then Capture & Detect."
         )
     detail_s = font_tiny.render(_elide_text(detail, font_tiny, panel.width - 64), True, TEXT_MUTED)
     screen.blit(detail_s, (panel.x + 32, panel.bottom - 92))
@@ -8047,7 +9187,7 @@ def draw_board_detection_dialog(screen):
     _draw_board_detection_button(
         screen,
         detect_rect,
-        "Working..." if board_detection_running else "Use Window" if autoplay_picker else "Capture & Detect",
+        "Working..." if board_detection_running else "Use Window" if live_picker else "Capture & Detect",
         enabled=bool(board_detection_windows) and not board_detection_running,
         primary=True,
     )
@@ -8078,6 +9218,8 @@ def handle_board_detection_click(mx, my):
     if cancel_rect.collidepoint(mx, my) or not panel.collidepoint(mx, my):
         if board_detection_picker_purpose == "autoplay":
             stop_autoplay("Auto-play cancelled before choosing a window.")
+        elif board_detection_picker_purpose == "advisor":
+            stop_advisor("Advisor Mode cancelled before choosing a window.")
         else:
             show_board_detection_dialog = False
             board_detection_picker_purpose = "detect"
@@ -8099,6 +9241,8 @@ def handle_board_detection_click(mx, my):
         selected_window = board_detection_windows[board_detection_selected]
         if board_detection_picker_purpose == "autoplay":
             _autoplay_window_selected(selected_window)
+        elif board_detection_picker_purpose == "advisor":
+            _advisor_window_selected(selected_window)
         else:
             start_board_detection(selected_window)
         return True
@@ -8111,6 +9255,8 @@ def handle_board_detection_key(key):
     if key == pygame.K_ESCAPE:
         if board_detection_picker_purpose == "autoplay":
             stop_autoplay("Auto-play cancelled before choosing a window.")
+        elif board_detection_picker_purpose == "advisor":
+            stop_advisor("Advisor Mode cancelled before choosing a window.")
         else:
             show_board_detection_dialog = False
             board_detection_picker_purpose = "detect"
@@ -8120,6 +9266,8 @@ def handle_board_detection_key(key):
             selected_window = board_detection_windows[board_detection_selected]
             if board_detection_picker_purpose == "autoplay":
                 _autoplay_window_selected(selected_window)
+            elif board_detection_picker_purpose == "advisor":
+                _advisor_window_selected(selected_window)
             else:
                 start_board_detection(selected_window)
         return True
@@ -8936,6 +10084,17 @@ def get_use_package_toggle_rect(offset_x=0, offset_y=0):
     )
 
 
+def get_advisor_toggle_rect(offset_x=0, offset_y=0):
+    """Compact Advisor row in the Analysis header space.
+
+    The rest of the Analysis page is already exactly full when Auto-Move
+    is on (Use Package ends at y836 of 860), so Advisor uses the unused
+    strip between the intro line and the Auto-Move card rather than
+    moving any established card.
+    """
+    return pygame.Rect(WIDTH // 2 - 220 + offset_x, 106 + offset_y, 440, 40)
+
+
 def _analysis_settings_button_summary():
     """Read-only Analysis status summary for the Settings main menu.
 
@@ -8971,7 +10130,7 @@ def _analysis_settings_button_summary():
 
     picker_purpose = str(board_detection_picker_purpose or "detect").lower()
     detection_picker_open = bool(
-        show_board_detection_dialog and picker_purpose != "autoplay"
+        show_board_detection_dialog and picker_purpose == "detect"
     )
     if board_detection_running:
         detection_state = "working"
@@ -9729,7 +10888,47 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
     intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
-    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 112 + offset_y))
+    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 84 + offset_y))
+
+    advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
+    advisor_shown_on = bool(
+        _advisor.get("enabled")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    )
+    draw_toggle_row(
+        screen,
+        advisor_rect,
+        "Advisor Mode",
+        "",
+        advisor_shown_on,
+        advisor_anim,
+        idle and advisor_rect.collidepoint(mx, my),
+    )
+    if _advisor.get("error"):
+        advisor_status = _advisor["error"]
+        advisor_colour = TEXT_STATUS
+    elif _advisor.get("status"):
+        advisor_status = _advisor["status"]
+        advisor_colour = TEXT_ACCENT if advisor_shown_on else TEXT_MUTED
+    else:
+        advisor_status = "cliv-gui live overlay"
+        advisor_colour = TEXT_MUTED
+    advisor_status_s = font_tiny.render(
+        _elide_text(advisor_status, font_tiny, 178),
+        True,
+        advisor_colour,
+    )
+    screen.blit(
+        advisor_status_s,
+        (
+            advisor_rect.x + 142,
+            advisor_rect.centery - advisor_status_s.get_height() // 2,
+        ),
+    )
 
     threshold = get_auto_move_depth()
     rect = get_auto_move_toggle_rect(offset_x, offset_y)
@@ -14343,6 +15542,9 @@ def handle_menu_click(mx, my):
             return True
 
     if settings_menu_state == "analysis":
+        if get_advisor_toggle_rect().collidepoint(mx, my):
+            toggle_advisor()
+            return True
         if get_auto_move_toggle_rect().collidepoint(mx, my):
             if auto_move_enabled:
                 set_auto_move(False)
@@ -15165,6 +16367,8 @@ def draw_gui(
         draw_autoplay_side_dialog(screen)
     if show_autoplay_gameover_dialog:
         draw_autoplay_gameover_dialog(screen)
+    if show_advisor_side_dialog:
+        draw_advisor_side_dialog(screen)
 
     pygame.display.flip()
 
@@ -15176,7 +16380,7 @@ def main():
     global engine_draft, engine_slider_display, engine_has_changes
     global show_game_over, game_over_anim, game_over_seen_key
     global show_auto_color_dialog, auto_color_dialog_anim, auto_move_status_text, auto_move_arm_reset
-    global show_autoplay_side_dialog, show_autoplay_gameover_dialog
+    global show_autoplay_side_dialog, show_autoplay_gameover_dialog, show_advisor_side_dialog
 
     clock = pygame.time.Clock()
     board = chess.Board()
@@ -15765,6 +16969,347 @@ def main():
                 _autoplay_set_status("Auto-play verifying move; waiting for the board to settle...")
             return
 
+    # --- Advisor Mode live-window state machine ---
+    def advisor_player_color():
+        return chess.WHITE if _autoplay_side_name(_advisor.get("side")) == "white" else chess.BLACK
+
+    def advisor_push_move(move):
+        nonlocal auto_seen_ply, auto_fired_key
+        if move not in board.legal_moves:
+            return False
+        add_move_animation_for_move(anim_mgr, board, move, reverse=False)
+        board.push(move)
+        note_new_move()
+        engine_thread.update_position(board)
+        _advisor["expected_fen"] = board.fen()
+        auto_seen_ply = len(board.move_stack)
+        auto_fired_key = None
+        return True
+
+    def advisor_finish_if_game_over():
+        result = get_game_result(board)
+        if result is None:
+            return False
+        # Stop fully and forget the window: turning Advisor on again must
+        # prompt for a broadcast window instead of silently reusing this
+        # finished game.
+        stop_advisor(
+            f"{result[0]} — Advisor Mode stopped. Turn it on again to choose a window."
+        )
+        _advisor.update({
+            "state": "game_over",
+            "game_result": result,
+        })
+        return True
+
+    def advisor_refresh_overlay():
+        """Publish the latest Stockfish move/eval/depth to cliv-gui."""
+        if not _advisor.get("running"):
+            return False
+        with engine_thread.lock:
+            depth_now = int(engine_thread.info.get("depth", 0) or 0)
+            score_now = engine_thread.info.get("score", 0)
+            mate_now = engine_thread.info.get("mate")
+            pv_now = list(engine_thread.info.get("pv", []))
+            info_fen = engine_thread.info.get("fen")
+            engine_fen = (
+                engine_thread.board.fen()
+                if getattr(engine_thread, "board", None) is not None else None
+            )
+        eval_text = _advisor_eval_text(score_now, mate_now)
+        move = None
+        move_san = ""
+        side = _autoplay_side_name(_advisor.get("side", "white"))
+        if _advisor.get("sync_pending"):
+            text = "Syncing board..."
+        elif board.turn != advisor_player_color():
+            text = (
+                f"Eval {eval_text} · Depth {depth_now} · "
+                "Waiting for opponent"
+            )
+        elif (
+            pv_now
+            and pv_now[0] in board.legal_moves
+            and info_fen == board.fen()
+            and engine_fen == board.fen()
+        ):
+            move = pv_now[0]
+            move_san = board.san(move)
+            text = f"Eval {eval_text} · Depth {depth_now} · Best {move_san}"
+        else:
+            text = f"Eval {eval_text} · Depth {depth_now} · Analysing..."
+
+        _advisor.update({
+            "best_move_uci": move.uci() if move is not None else "",
+            "best_move_san": move_san,
+            "eval_text": eval_text,
+            "depth": depth_now,
+        })
+        snapshot = _advisor_make_overlay_snapshot(
+            _advisor.get("board_rect"),
+            side,
+            move,
+            text,
+        )
+        return _advisor_overlay_service.set_snapshot(
+            snapshot,
+            generation=_advisor.get("overlay_generation"),
+        )
+
+    def advisor_import_scan_result(result):
+        nonlocal selected_sq, dragging, drag_sq, drag_offset
+        nonlocal auto_seen_ply, auto_fired_key, auto_pos_key, auto_pos_frames
+        global board_flipped, promotion_pending, show_game_over, game_over_seen_key
+        global show_autoplay_gameover_dialog
+        side = _autoplay_side_name(result.get("side", _advisor.get("side")))
+
+        if not _advisor.get("enabled"):
+            return False
+        unknown = [
+            (row, col)
+            for row in range(8)
+            for col in range(8)
+            if result.get("piece_grid", [[None] * 8] * 8)[row][col] == "?"
+        ]
+        if unknown:
+            return stop_advisor(
+                f"Advisor scan stopped: {len(unknown)} square(s) are still unknown.",
+                error=True,
+            )
+
+        try:
+            fen = _autoplay_fen_from_visual_grid(result["piece_grid"], side)
+            imported = chess.Board(fen)
+            if imported.status():
+                raise ValueError(f"scanned position is not a valid chess position ({fen})")
+        except Exception as exc:
+            return stop_advisor(
+                f"Advisor Mode could not import the scan as FEN: {exc}",
+                error=True,
+            )
+
+        old_board = board.copy()
+        anim_mgr.add_board_reset(old_board, imported.copy())
+        board.set_fen(fen)
+        reset_opening()
+        history_redo.clear()
+        selected_sq = None
+        dragging = False
+        drag_sq = None
+        drag_offset = None
+        promotion_pending = None
+        show_game_over = False
+        game_over_seen_key = None
+        show_autoplay_gameover_dialog = False
+        board_flipped = side == "black"
+        anim_mgr.capture_anims = []
+        anim_mgr.current_eval = 0.0
+        anim_mgr.target_eval = 0.0
+        anim_mgr.arrow_target_alpha = 0.0
+        anim_mgr.set_multipv_arrows({})
+        check_effect.reset()
+        engine_thread.update_position(board)
+
+        board_crop = _autoplay_board_crop_from_screenshot(
+            result.get("screenshot"), result.get("board_rect")
+        )
+        if board_crop is None:
+            return stop_advisor(
+                "Advisor scan did not include a usable board image.",
+                error=True,
+            )
+
+        _advisor.update({
+            "running": True,
+            "state": "live",
+            "board_rect": result.get("board_rect"),
+            "window_rect": result.get("window_rect"),
+            "window_size": result.get("window_size"),
+            "screen_board_rect": result.get("screen_board_rect"),
+            "window": result.get("window") or _advisor.get("window"),
+            "side": side,
+            "vision_backend": result.get(
+                "vision_backend", _advisor.get("vision_backend", "cnn")
+            ),
+            "vision_use_package": bool(
+                result.get(
+                    "vision_use_package",
+                    _advisor.get("vision_use_package", False),
+                )
+            ),
+            "last_image": board_crop,
+            "last_grid": _autoplay_board_grid_from_board(board),
+            "expected_fen": board.fen(),
+            "next_poll_at": time.monotonic() + ADVISOR_POLL_SECONDS,
+            "sync_pending": False,
+            "capture_failures": 0,
+        })
+        auto_seen_ply = len(board.move_stack)
+        auto_fired_key = None
+        auto_pos_key = None
+        auto_pos_frames = 0
+        print(f"Advisor Mode imported FEN: {fen}")
+
+        if advisor_finish_if_game_over():
+            return True
+        if board.turn == advisor_player_color():
+            _advisor_set_status(
+                f"Advisor live as {side.capitalize()}. Stockfish is analysing..."
+            )
+        else:
+            _advisor_set_status(
+                f"Advisor live as {side.capitalize()}. Waiting for the opponent..."
+            )
+        return True
+
+    def advisor_poll_candidate():
+        """Return (board crop, candidate grid or None, changed cells).
+
+        ``changed is None`` is the mouse-gate sentinel: a press began
+        during capture/classification, so that screenshot is discarded
+        rather than being allowed to affect board sync.
+        """
+        crop = _advisor_capture_board_crop()
+        if not _advisor.get("enabled"):
+            return None, None, []
+        if crop is None:
+            return None, None, []
+        if _advisor_target_mouse_down():
+            return None, None, None
+        changed = _autoplay_changed_visual_squares(
+            _advisor.get("last_image"), crop
+        )
+        if not changed:
+            return crop, None, []
+        classified = _autoplay_classify_visual_squares(
+            crop,
+            changed,
+            use_package=bool(_advisor.get("vision_use_package")),
+        )
+        if _advisor_target_mouse_down():
+            return None, None, None
+        candidate = _autoplay_candidate_grid(
+            _autoplay_board_grid_from_board(board),
+            classified,
+            _advisor.get("side", "white"),
+        )
+        return crop, candidate, changed
+
+    def update_advisor():
+        if _advisor.get("scan_ready"):
+            result = _advisor.get("scan_result")
+            _advisor["scan_ready"] = False
+            _advisor["scan_result"] = None
+            if result is not None and _advisor.get("enabled"):
+                advisor_import_scan_result(result)
+
+        if not _advisor.get("enabled"):
+            return
+
+        overlay_generation = int(_advisor.get("overlay_generation", 0) or 0)
+        if overlay_generation:
+            overlay_error = _advisor_overlay_service.error_for(
+                overlay_generation
+            )
+            if overlay_error:
+                stop_advisor(
+                    f"Advisor overlay failed: {overlay_error}", error=True
+                )
+                return
+
+        if not _advisor.get("running"):
+            return
+
+        expected_fen = _advisor.get("expected_fen")
+        if expected_fen is not None and board.fen() != expected_fen:
+            stop_advisor(
+                "Advisor Mode stopped: the ChessBot board was changed manually and is no longer synced.",
+                error=True,
+            )
+            return
+        if advisor_finish_if_game_over():
+            return
+
+        now = time.monotonic()
+        mouse_down = _advisor_target_mouse_down()
+        if mouse_down:
+            if not _advisor.get("mouse_down"):
+                _advisor_set_status(
+                    "Advisor paused while the mouse is held in the target window..."
+                )
+            _advisor["mouse_down"] = True
+        else:
+            if _advisor.get("mouse_down"):
+                _advisor.update({
+                    "mouse_down": False,
+                    "mouse_released_at": now,
+                    "next_poll_at": now + ADVISOR_RELEASE_SETTLE_SECONDS,
+                })
+                _advisor_set_status(
+                    "Mouse released; checking the board..."
+                )
+
+            if now >= float(_advisor.get("next_poll_at", 0.0)):
+                _advisor["next_poll_at"] = now + ADVISOR_POLL_SECONDS
+                crop, candidate, changed = advisor_poll_candidate()
+                if not _advisor.get("enabled") or not _advisor.get("running"):
+                    return
+                if changed is None:
+                    _advisor["mouse_down"] = True
+                    _advisor_set_status(
+                        "Advisor paused while the mouse is held in the target window..."
+                    )
+                    advisor_refresh_overlay()
+                    return
+                if crop is None:
+                    failures = int(_advisor.get("capture_failures", 0) or 0) + 1
+                    _advisor["capture_failures"] = failures
+                    if failures >= 40:
+                        stop_advisor(
+                            "Advisor Mode stopped: the target window is no longer available.",
+                            error=True,
+                        )
+                        return
+                    _advisor_set_status(
+                        "Advisor waiting: could not screenshot the target board; retrying..."
+                    )
+                elif not changed:
+                    _advisor["capture_failures"] = 0
+                    _advisor["sync_pending"] = False
+                else:
+                    _advisor["capture_failures"] = 0
+                    sequence = _advisor_find_move_sequence(board, candidate)
+                    if sequence is not None:
+                        move_sans = []
+                        for move in sequence:
+                            move_sans.append(board.san(move))
+                            if not advisor_push_move(move):
+                                stop_advisor(
+                                    "Advisor Mode lost sync while applying a detected move.",
+                                    error=True,
+                                )
+                                return
+                            if advisor_finish_if_game_over():
+                                return
+                        _advisor.update({
+                            "last_image": crop,
+                            "last_grid": _autoplay_board_grid_from_board(board),
+                            "sync_pending": False,
+                        })
+                        if move_sans:
+                            _advisor_set_status(
+                                "Advisor detected "
+                                + " → ".join(move_sans)
+                                + ". Stockfish is analysing..."
+                            )
+                    else:
+                        _advisor["sync_pending"] = True
+                        _advisor_set_status(
+                            "Advisor syncing the board; waiting for it to settle..."
+                        )
+
+        advisor_refresh_overlay()
+
     while running:
         anim_mgr.update()
         update_board_layout_anim()
@@ -15772,6 +17317,7 @@ def main():
         update_global_anims()
         update_board_detection()
         update_autoplay()
+        update_advisor()
 
         is_check = board.is_check()
         is_mate = board.is_checkmate()
@@ -15837,6 +17383,7 @@ def main():
         if (
             auto_move_enabled
             and not _autoplay.get("enabled")
+            and not _advisor.get("enabled")
             and auto_stage == 2
             and not history_redo
             and menu_anim_progress == 0
@@ -15895,6 +17442,9 @@ def main():
                     continue
                 if show_autoplay_gameover_dialog:
                     handle_autoplay_gameover_click(mx, my)
+                    continue
+                if show_advisor_side_dialog:
+                    handle_advisor_side_click(mx, my)
                     continue
 
                 # Confirmation dialog has priority over everything
@@ -16111,6 +17661,16 @@ def main():
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         show_autoplay_gameover_dialog = False
                         restart_autoplay_scan()
+                    continue
+                if show_advisor_side_dialog:
+                    if event.key == pygame.K_ESCAPE:
+                        stop_advisor("Advisor Mode cancelled before scanning.")
+                    elif event.key == pygame.K_w:
+                        show_advisor_side_dialog = False
+                        start_advisor_scan("white")
+                    elif event.key == pygame.K_b:
+                        show_advisor_side_dialog = False
+                        start_advisor_scan("black")
                     continue
                 if event.key == pygame.K_ESCAPE:
                     if show_newgame_confirm:
