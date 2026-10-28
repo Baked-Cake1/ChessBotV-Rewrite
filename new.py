@@ -1,5 +1,6 @@
+import base64
 import ctypes
-import importlib
+import importlib.util
 import json
 import math
 import os
@@ -536,7 +537,6 @@ _advisor = {
     "overlay_generation": 0,
     "game_result": None,
 }
-_cliv_process_overlay_class = None
 
 
 def apply_always_on_top(enabled, persist=False):
@@ -7514,30 +7514,28 @@ def _autoplay_invalidate_drag():
 
 
 # --- Advisor Mode overlay (cliv-gui / ProcessOverlay) ---
-def _load_cliv_process_overlay():
-    """Load cliv-gui's ``ProcessOverlay`` lazily.
+_ADVISOR_OVERLAY_READY_PREFIX = "CHESSBOTV_ADVISOR_OVERLAY_READY"
+_ADVISOR_OVERLAY_ERROR_PREFIX = "CHESSBOTV_ADVISOR_OVERLAY_ERROR "
 
-    The PyPI distribution is named ``cliv-gui``. Version 1.0.4 installs
-    the import package as ``clivgui`` even though its documentation's
-    examples say ``cliv_gui``, so accept either import name.
+
+def _ensure_cliv_gui_available():
+    """Check that cliv-gui is discoverable without importing Tk here.
+
+    ``clivgui`` imports tkinter at module import time. Advisor therefore
+    does not import it in ChessBotV's multithreaded pygame process at all;
+    the overlay child process below performs the real import on its own
+    main thread. The PyPI distribution is named ``cliv-gui``. Version
+    1.0.4 installs the import package as ``clivgui`` even though its
+    documentation examples say ``cliv_gui``, so accept either name.
     """
-    global _cliv_process_overlay_class
-    if _cliv_process_overlay_class is not None:
-        return _cliv_process_overlay_class
-
     errors = []
     for module_name in ("clivgui", "cliv_gui"):
         try:
-            module = importlib.import_module(module_name)
+            if importlib.util.find_spec(module_name) is not None:
+                return module_name
+            errors.append(f"{module_name}: not found")
         except Exception as exc:
             errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
-            continue
-        overlay_class = getattr(module, "ProcessOverlay", None)
-        if overlay_class is None:
-            errors.append(f"{module_name}: ProcessOverlay not found")
-            continue
-        _cliv_process_overlay_class = overlay_class
-        return overlay_class
 
     raise RuntimeError(
         "Advisor Mode needs the optional cliv-gui package. "
@@ -7560,7 +7558,7 @@ def _advisor_overlay_square_rect(board_rect, square, side, inset=2):
 
 
 def _advisor_make_overlay_snapshot(board_rect, side, move, text):
-    """Thread-safe drawing snapshot consumed by the Tk overlay thread."""
+    """JSON-safe drawing snapshot consumed by the overlay child process."""
     if not board_rect:
         return None
     board_rect = tuple(int(value) for value in board_rect)
@@ -7581,12 +7579,66 @@ def _advisor_make_overlay_snapshot(board_rect, side, move, text):
     }
 
 
-def _advisor_draw_overlay_snapshot(overlay, snapshot):
-    """Draw origin/destination boxes and the under-board readout.
+# cliv-gui's ProcessOverlay creates a Tk root in its constructor. Running
+# that root on a side thread inside ChessBotV proved unsafe on Windows:
+# Tk interpreters are thread-bound, their Python wrappers can be released
+# by garbage collection running on another ChessBotV thread, and Tcl then
+# aborts with "Tcl_AsyncDelete: async handler deleted by the wrong
+# thread". ProcessOverlay.stop() also destroys the root while its 16 ms
+# update_position timer is still pending, which prints the matching
+# "invalid command name ...update_position" after-script error.
+#
+# The child below therefore owns ProcessOverlay on a separate process's
+# main thread. ChessBotV sends it only JSON snapshots. On shutdown the
+# child cancels every pending Tcl after callback, quits mainloop, and
+# only then destroys the root and collects garbage on that same main
+# thread. Cyclic GC is disabled except for explicit collections in the
+# child's Tk tick, so its stdin reader thread cannot free Tk objects.
+_ADVISOR_OVERLAY_CHILD_CODE = r'''
+import gc
+import importlib
+import json
+import sys
+import threading
+import time
+import traceback
 
-    This must only be called from the overlay service's Tk thread; every
-    canvas call goes through cliv-gui's ``ProcessOverlay`` API.
-    """
+gc.disable()
+
+READY_PREFIX = "CHESSBOTV_ADVISOR_OVERLAY_READY"
+ERROR_PREFIX = "CHESSBOTV_ADVISOR_OVERLAY_ERROR "
+
+
+def emit_ready():
+    print(READY_PREFIX, flush=True)
+
+
+def emit_error(message):
+    text = " ".join(str(message or "").split())
+    print(ERROR_PREFIX + text, flush=True)
+
+
+def load_overlay_class():
+    errors = []
+    for module_name in ("clivgui", "cliv_gui"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            errors.append(
+                module_name + ": " + type(exc).__name__ + ": " + str(exc)
+            )
+            continue
+        overlay_class = getattr(module, "ProcessOverlay", None)
+        if overlay_class is not None:
+            return overlay_class
+        errors.append(module_name + ": ProcessOverlay not found")
+    raise RuntimeError(
+        "Advisor Mode needs the optional cliv-gui package. "
+        "Run `pip install cliv-gui`. Import errors: " + "; ".join(errors)
+    )
+
+
+def draw_snapshot(overlay, snapshot):
     overlay.clear_drawings()
     if not snapshot:
         return
@@ -7634,21 +7686,270 @@ def _advisor_draw_overlay_snapshot(overlay, snapshot):
     )
 
 
-class _AdvisorOverlayService:
-    """Own every cliv-gui/Tk call on one persistent background thread.
+def cancel_after_callbacks(root):
+    if root is None:
+        return
+    try:
+        after_ids = root.tk.splitlist(root.tk.call("after", "info"))
+    except Exception:
+        return
+    for after_id in after_ids:
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
 
-    A fresh Tk interpreter is created per Advisor session, but always in
-    this same service thread. That keeps Tk calls confined to one thread
-    and makes the required stop -> choose-a-window-again restart reliable
-    instead of creating Tk roots from many short-lived Python threads.
+
+def read_messages(state):
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(message, dict):
+            continue
+        kind = message.get("type")
+        if kind == "snapshot":
+            with state["lock"]:
+                state["snapshot"] = message.get("snapshot")
+                state["version"] += 1
+        elif kind == "stop":
+            with state["lock"]:
+                state["stop"] = True
+            break
+    with state["lock"]:
+        state["stop"] = True
+
+
+def main(argv):
+    if len(argv) < 5:
+        emit_error("Advisor overlay child was started without a target window")
+        return 2
+
+    try:
+        target_hwnd = int(argv[1])
+        process_name = str(argv[2] or "unknown.exe")
+        extra_bottom = int(argv[3])
+        alpha = float(argv[4])
+    except Exception as exc:
+        emit_error(type(exc).__name__ + ": " + str(exc))
+        return 2
+
+    state = {
+        "lock": threading.Lock(),
+        "snapshot": None,
+        "version": 0,
+        "stop": False,
+    }
+    reader = threading.Thread(
+        target=read_messages,
+        args=(state,),
+        name="ChessBotV-AdvisorOverlayInput",
+        daemon=True,
+    )
+    reader.start()
+
+    overlay = None
+    root = None
+    try:
+        overlay_class = load_overlay_class()
+        overlay = overlay_class(
+            process_name,
+            bg_color="#000000",
+            alpha=alpha,
+        )
+        root = overlay.root
+
+        # ProcessOverlay's stock finder takes the first visible window
+        # belonging to an executable. Advisor requires the exact
+        # picker-selected HWND (important for browsers with several
+        # windows), so narrow that lookup to this window.
+        try:
+            overlay.find_process_window = (
+                lambda target=target_hwnd: target
+            )
+        except Exception:
+            pass
+
+        # Extend only the overlay's bottom edge so the readout can sit
+        # directly under a board that reaches the target window's own
+        # bottom edge. Board coordinates do not move.
+        try:
+            original_get_window_rect = overlay.get_window_rect
+
+            def get_window_rect(hwnd, original=original_get_window_rect):
+                rect = original(hwnd)
+                if not rect:
+                    return rect
+                x, y, width, height = rect
+                return (x, y, width, height + extra_bottom)
+
+            overlay.get_window_rect = get_window_rect
+        except Exception:
+            pass
+
+        with state["lock"]:
+            stop_requested = bool(state["stop"])
+        if stop_requested:
+            return 0
+        if not overlay.start():
+            raise RuntimeError(
+                "cliv-gui could not find/start the selected window overlay"
+            )
+        try:
+            overlay.hwnd = target_hwnd
+        except Exception:
+            pass
+
+        emit_ready()
+        drawn_version = -1
+        last_gc_at = time.monotonic()
+
+        def shutdown_mainloop():
+            # Do not call ProcessOverlay.stop() here: it destroys the
+            # root while update_position's Tcl timer can still be
+            # pending. Cancel timers first, leave mainloop, and let
+            # the finally block destroy the root afterwards.
+            try:
+                overlay.running = False
+            except Exception:
+                pass
+            cancel_after_callbacks(root)
+            try:
+                overlay.clear_drawings()
+            except Exception:
+                pass
+            try:
+                root.quit()
+            except Exception:
+                pass
+
+        def tick():
+            nonlocal drawn_version, last_gc_at
+            with state["lock"]:
+                stopping = bool(state["stop"])
+                snapshot = state["snapshot"]
+                version = int(state["version"])
+            if stopping:
+                shutdown_mainloop()
+                return
+            try:
+                if version != drawn_version:
+                    draw_snapshot(overlay, snapshot)
+                    drawn_version = version
+                now = time.monotonic()
+                if now - last_gc_at >= 2.0:
+                    gc.collect()
+                    last_gc_at = now
+            except Exception as exc:
+                emit_error(type(exc).__name__ + ": " + str(exc))
+                shutdown_mainloop()
+                return
+            try:
+                root.after(40, tick)
+            except Exception:
+                return
+
+        root.after(25, tick)
+        root.mainloop()
+        return 0
+    except Exception as exc:
+        emit_error(type(exc).__name__ + ": " + str(exc))
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    finally:
+        # This finally block is on the child's main/Tk thread, after
+        # mainloop has returned (or before it ever started). Destroy
+        # and collect here so the Tcl interpreter is deleted by the
+        # thread that created it.
+        if overlay is not None:
+            try:
+                overlay.running = False
+            except Exception:
+                pass
+            cancel_after_callbacks(root)
+            try:
+                overlay.clear_drawings()
+            except Exception:
+                pass
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        # Break frame-local cycles (the patched get_window_rect and
+        # tick closures) before collecting, so the Tk interpreter is
+        # actually released here rather than at interpreter shutdown.
+        tick = None
+        shutdown_mainloop = None
+        get_window_rect = None
+        original_get_window_rect = None
+        overlay_class = None
+        overlay = None
+        root = None
+        gc.collect()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+'''
+
+
+# A multiline -c script is not reliable in a Windows command line, where
+# the C runtime can treat newlines as ordinary argument separators. Send
+# the child source as one base64 argument and keep the bootstrap to one
+# line; the bootstrap restores sys.argv before executing the child as
+# __main__ on the child process's main thread.
+_ADVISOR_OVERLAY_CHILD_BOOTSTRAP = (
+    "import base64,sys;"
+    "code=base64.b64decode(sys.argv[1]).decode('utf-8');"
+    "sys.argv=[sys.argv[0]]+sys.argv[2:];"
+    "exec(compile(code,'<advisor-overlay-child>','exec'),"
+    "{'__name__':'__main__','__file__':'<advisor-overlay-child>'})"
+)
+
+
+def _advisor_overlay_child_command(hwnd, process_name):
+    """Command for the isolated Tk/cliv-gui overlay process."""
+    encoded_child_code = base64.b64encode(
+        _ADVISOR_OVERLAY_CHILD_CODE.encode("utf-8")
+    ).decode("ascii")
+    return [
+        sys.executable or "python",
+        "-u",
+        "-c",
+        _ADVISOR_OVERLAY_CHILD_BOOTSTRAP,
+        encoded_child_code,
+        str(int(hwnd)),
+        str(process_name or "unknown.exe"),
+        str(int(ADVISOR_OVERLAY_EXTRA_BOTTOM)),
+        str(float(ADVISOR_OVERLAY_ALPHA)),
+    ]
+
+
+# Assigned through a module global so tests can substitute a fake process
+# factory without patching subprocess.Popen for the whole interpreter.
+_advisor_overlay_process_factory = subprocess.Popen
+
+
+class _AdvisorOverlayService:
+    """Manage the isolated cliv-gui overlay child process.
+
+    ChessBotV never imports or calls Tk in this process. It starts one
+    short-lived Python child per Advisor session; that child's main
+    thread owns ``ProcessOverlay`` and its Tcl interpreter. Snapshots are
+    coalesced here and sent as JSON lines by a sender thread, while a
+    reader thread consumes the child's READY/ERROR protocol lines.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._wake = threading.Event()
-        self._thread = None
+        self._io_lock = threading.Lock()
+        self._snapshot_event = threading.Event()
         self._generation = 0
-        self._pending = None
         self._active_generation = 0
         self._ready_generation = 0
         self._stop_generation = 0
@@ -7656,39 +7957,87 @@ class _AdvisorOverlayService:
         self._error_generation = 0
         self._snapshot = None
         self._snapshot_version = 0
+        self._process = None
+        self._process_generation = 0
+        self._shutdown_process_ids = set()
 
     def start_session(self, hwnd, process_name):
-        """Queue an overlay for one exact HWND; returns its generation."""
+        """Launch an overlay child for one exact HWND; return its generation."""
         hwnd = _hwnd_value(hwnd)
         if not hwnd:
             return 0
+
         with self._lock:
-            previous = self._active_generation
-            if self._pending:
-                previous = int(self._pending.get("generation", previous) or previous)
-            if previous:
-                self._stop_generation = int(previous)
+            old_process = self._process
+            old_generation = int(self._process_generation or 0)
+            if old_process is not None and old_generation:
+                self._stop_generation = old_generation
+            self._process = None
+            self._process_generation = 0
             self._generation += 1
             generation = self._generation
-            self._pending = {
-                "generation": generation,
-                "hwnd": int(hwnd),
-                "process_name": str(process_name or "unknown.exe"),
-            }
+            self._active_generation = generation
+            self._ready_generation = 0
             self._snapshot = None
             self._snapshot_version += 1
             self._error = ""
             self._error_generation = 0
-            start_thread = self._thread is None or not self._thread.is_alive()
-            if start_thread:
-                self._thread = threading.Thread(
-                    target=self._run,
-                    name="ChessBotV-AdvisorOverlay",
-                    daemon=True,
-                )
-        if start_thread:
-            self._thread.start()
-        self._wake.set()
+        self._snapshot_event.set()
+
+        if old_process is not None:
+            self._begin_process_shutdown(old_process)
+
+        command = _advisor_overlay_child_command(
+            hwnd, process_name or "unknown.exe"
+        )
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        try:
+            process = _advisor_overlay_process_factory(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            self._set_error(
+                generation,
+                f"{type(exc).__name__}: {exc}",
+            )
+            with self._lock:
+                if self._active_generation == generation:
+                    self._active_generation = 0
+            return generation
+
+        with self._lock:
+            self._process = process
+            self._process_generation = generation
+            stop_requested = self._stop_generation == generation
+
+        reader = threading.Thread(
+            target=self._read_child_output,
+            args=(process, generation),
+            name=f"ChessBotV-AdvisorOverlayReader-{generation}",
+            daemon=True,
+        )
+        reader.start()
+        sender = threading.Thread(
+            target=self._send_snapshots,
+            args=(process, generation),
+            name=f"ChessBotV-AdvisorOverlaySender-{generation}",
+            daemon=True,
+        )
+        sender.start()
+        self._snapshot_event.set()
+
+        if stop_requested:
+            self._begin_process_shutdown(process)
         return generation
 
     def set_snapshot(self, snapshot, generation=None):
@@ -7701,23 +8050,30 @@ class _AdvisorOverlayService:
                 return False
             self._snapshot = new_snapshot
             self._snapshot_version += 1
-            return True
+        self._snapshot_event.set()
+        return True
 
     def stop_session(self, generation=None):
+        process = None
         with self._lock:
             if generation is None:
-                if self._pending:
-                    generation = self._pending.get("generation")
-                else:
-                    generation = self._active_generation or self._generation
+                generation = (
+                    self._process_generation
+                    or self._active_generation
+                    or self._generation
+                )
             generation = int(generation or 0)
             if generation:
                 self._stop_generation = generation
-            if self._pending and int(self._pending.get("generation", 0)) == generation:
-                self._pending = None
+            if int(self._process_generation or 0) == generation:
+                process = self._process
+                if self._ready_generation == generation:
+                    self._ready_generation = 0
             self._snapshot = None
             self._snapshot_version += 1
-        self._wake.set()
+        self._snapshot_event.set()
+        if process is not None:
+            self._begin_process_shutdown(process)
 
     def is_ready(self, generation):
         with self._lock:
@@ -7743,148 +8099,161 @@ class _AdvisorOverlayService:
             self._error_generation = int(generation or 0)
             self._error = str(message or "")
 
-    def _run(self):
+    def _write_child_message(self, process, message):
+        try:
+            if process is None or process.stdin is None:
+                return False
+            if process.poll() is not None:
+                return False
+            payload = json.dumps(message, separators=(",", ":")) + "\n"
+            with self._io_lock:
+                process.stdin.write(payload)
+                process.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def _send_snapshots(self, process, generation):
+        last_sent_version = -1
         while True:
-            self._wake.wait()
-            self._wake.clear()
-            with self._lock:
-                pending = self._pending
-                self._pending = None
-                if pending:
-                    generation = int(pending.get("generation", 0) or 0)
-                    self._active_generation = generation
-                else:
-                    generation = 0
-            if not pending or not generation:
-                continue
-
-            overlay = None
             try:
-                overlay_class = _load_cliv_process_overlay()
-                target_hwnd = int(pending.get("hwnd", 0) or 0)
-                overlay = overlay_class(
-                    str(pending.get("process_name") or "unknown.exe"),
-                    bg_color="#000000",
-                    alpha=ADVISOR_OVERLAY_ALPHA,
+                if process.poll() is not None:
+                    return
+            except Exception:
+                return
+
+            with self._lock:
+                if (
+                    self._process is not process
+                    or int(self._process_generation or 0) != int(generation)
+                    or int(self._stop_generation or 0) == int(generation)
+                ):
+                    return
+                snapshot = (
+                    dict(self._snapshot) if self._snapshot else None
                 )
+                version = int(self._snapshot_version)
 
-                # ProcessOverlay's stock finder takes the first visible
-                # window belonging to an executable. Advisor requires the
-                # exact picker-selected HWND (important for browsers with
-                # several windows), so narrow that lookup to this window.
-                try:
-                    overlay.find_process_window = (
-                        lambda target=target_hwnd: target
-                    )
-                except Exception:
-                    pass
+            if version != last_sent_version:
+                if not self._write_child_message(
+                    process,
+                    {"type": "snapshot", "snapshot": snapshot},
+                ):
+                    return
+                last_sent_version = version
 
-                # Extend only the overlay's bottom edge so the readout can
-                # sit directly under a board that reaches the target
-                # window's own bottom edge. Board coordinates do not move.
-                try:
-                    original_get_window_rect = overlay.get_window_rect
+            self._snapshot_event.wait(0.04)
+            self._snapshot_event.clear()
 
-                    def get_window_rect(hwnd, original=original_get_window_rect):
-                        rect = original(hwnd)
-                        if not rect:
-                            return rect
-                        x, y, width, height = rect
-                        return (
-                            x,
-                            y,
-                            width,
-                            height + ADVISOR_OVERLAY_EXTRA_BOTTOM,
-                        )
-
-                    overlay.get_window_rect = get_window_rect
-                except Exception:
-                    pass
-
-                with self._lock:
-                    stop_requested = self._stop_generation == generation
-                if stop_requested:
-                    try:
-                        overlay.stop()
-                    except Exception:
-                        pass
-                    continue
-                if not overlay.start():
-                    raise RuntimeError(
-                        "cliv-gui could not find/start the selected window overlay"
-                    )
-                try:
-                    overlay.hwnd = target_hwnd
-                except Exception:
-                    pass
-                with self._lock:
-                    self._ready_generation = generation
-                    if self._error_generation == generation:
-                        self._error = ""
-                        self._error_generation = 0
-
-                drawn_version = -1
-
-                def tick():
-                    nonlocal drawn_version
-                    try:
+    def _read_child_output(self, process, generation):
+        last_plain_line = ""
+        try:
+            stdout = process.stdout
+            if stdout is not None:
+                while True:
+                    line = stdout.readline()
+                    if not line:
+                        break
+                    line = str(line).strip()
+                    if not line:
+                        continue
+                    if line.startswith(_ADVISOR_OVERLAY_READY_PREFIX):
                         with self._lock:
-                            stopping = self._stop_generation == generation
-                            snapshot = (
-                                dict(self._snapshot) if self._snapshot else None
-                            )
-                            version = int(self._snapshot_version)
-                        if stopping:
-                            try:
-                                overlay.clear_drawings()
-                            except Exception:
-                                pass
-                            try:
-                                overlay.stop()
-                            except Exception:
-                                pass
-                            return
-                        if version != drawn_version:
-                            _advisor_draw_overlay_snapshot(overlay, snapshot)
-                            drawn_version = version
-                    except Exception as exc:
+                            if (
+                                self._process is process
+                                and int(self._process_generation or 0) == int(generation)
+                                and int(self._stop_generation or 0) != int(generation)
+                            ):
+                                self._ready_generation = int(generation)
+                                if self._error_generation == int(generation):
+                                    self._error = ""
+                                    self._error_generation = 0
+                    elif line.startswith(_ADVISOR_OVERLAY_ERROR_PREFIX):
                         self._set_error(
                             generation,
-                            f"{type(exc).__name__}: {exc}",
+                            line[len(_ADVISOR_OVERLAY_ERROR_PREFIX):].strip(),
                         )
-                        try:
-                            overlay.stop()
-                        except Exception:
-                            pass
-                        return
-                    try:
-                        overlay.root.after(40, tick)
-                    except Exception:
-                        return
+                    else:
+                        last_plain_line = line
+        except Exception:
+            pass
 
-                overlay.root.after(25, tick)
-                overlay.root.mainloop()
+        try:
+            returncode = process.wait()
+        except Exception:
+            returncode = None
 
-                with self._lock:
-                    stop_requested = self._stop_generation == generation
-                if not stop_requested:
-                    self._set_error(generation, "Advisor overlay closed.")
-            except Exception as exc:
-                self._set_error(
-                    generation,
-                    f"{type(exc).__name__}: {exc}",
-                )
-                if overlay is not None:
-                    try:
-                        overlay.stop()
-                    except Exception:
-                        pass
-            finally:
-                with self._lock:
-                    if self._active_generation == generation:
-                        self._active_generation = 0
-                    if self._ready_generation == generation:
-                        self._ready_generation = 0
+        with self._lock:
+            if self._process is process:
+                self._process = None
+                self._process_generation = 0
+            if self._active_generation == int(generation):
+                self._active_generation = 0
+            if self._ready_generation == int(generation):
+                self._ready_generation = 0
+            stopped = int(self._stop_generation or 0) == int(generation)
+            has_error = bool(
+                int(self._error_generation or 0) == int(generation)
+                and self._error
+            )
+            if not stopped and not has_error:
+                if returncode in (0, None):
+                    message = "Advisor overlay closed."
+                else:
+                    message = (
+                        f"Advisor overlay process exited (code {returncode})."
+                    )
+                    if last_plain_line:
+                        message += f" {last_plain_line[:240]}"
+                self._error_generation = int(generation)
+                self._error = message
+        self._snapshot_event.set()
+
+    def _begin_process_shutdown(self, process):
+        process_id = id(process)
+        with self._lock:
+            if process_id in self._shutdown_process_ids:
+                return
+            self._shutdown_process_ids.add(process_id)
+        thread = threading.Thread(
+            target=self._shutdown_process,
+            args=(process,),
+            name="ChessBotV-AdvisorOverlayShutdown",
+            daemon=True,
+        )
+        thread.start()
+
+    def _shutdown_process(self, process):
+        try:
+            try:
+                if process.poll() is None:
+                    self._write_child_message(process, {"type": "stop"})
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=0.8)
+                return
+            except Exception:
+                pass
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=0.5)
+                return
+            except Exception:
+                pass
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                self._shutdown_process_ids.discard(id(process))
+            self._snapshot_event.set()
 
 
 _advisor_overlay_service = _AdvisorOverlayService()
@@ -8515,7 +8884,7 @@ def request_advisor_start():
         _advisor_set_status(message, error=message)
         return False
     try:
-        _load_cliv_process_overlay()
+        _ensure_cliv_gui_available()
     except Exception as exc:
         message = str(exc)
         display_message = (
