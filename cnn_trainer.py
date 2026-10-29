@@ -23,11 +23,11 @@ from tqdm import tqdm
 
 # ============================================================
 # CHESSBOTV CNN TRAINER
-# Preferred input is datasets/<class>/ created by board-vision.py. The
-# trainer derives its training, validation, and held-out test sets from
-# those same class folders (using whole-game groups when board-vision's
-# filenames provide game IDs). Legacy board-vision CSVs remain available
-# through an explicit --csv argument.
+# Preferred input is the physical datasets/training/<class>/ and
+# datasets/validation/<class>/ layout created by board-vision.py.
+# Validation is also the final evaluation set; there is no separate test
+# split. Legacy unsplit folders still work through an internal 80/20
+# fallback, and legacy board-vision CSVs remain available through --csv.
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,15 +40,14 @@ IMAGE_SIZE = 64
 BATCH_SIZE = 32
 EPOCHS = 25
 LEARNING_RATE = 0.001
-TRAIN_SPLIT = 0.70
-VALIDATION_SPLIT = 0.15
-TEST_SPLIT = 0.15
-BALANCE_TOLERANCE = 2
+TRAIN_SPLIT = 0.80
+VALIDATION_SPLIT = 0.20
 RANDOM_SEED = 42
 NORMALIZE_MEAN = (0.5, 0.5, 0.5)
 NORMALIZE_STD = (0.5, 0.5, 0.5)
 
-# Duplicate removal happens before splitting. These match board-vision.py:
+# Duplicate removal happens before training/validation use. These match
+# board-vision.py:
 # exact hashes always collide, while a near duplicate must be almost
 # pixel-identical at the model's 64x64 input size.
 NEAR_DUPLICATE_MAX_MEAN_ABS_ERROR = 4.0
@@ -100,8 +99,10 @@ SPLIT_FOLDER_TO_SPLIT = {
     "validation": "validation",
     "valid": "validation",
     "val": "validation",
-    "test": "test",
-    "testing": "test",
+    # There is no separate test set any more. Read old test folders as
+    # validation so those images still participate in final evaluation.
+    "test": "validation",
+    "testing": "validation",
 }
 
 SUPPORTED_EXTENSIONS = {
@@ -135,18 +136,6 @@ class ChessImageDataset(Dataset):
                 std=NORMALIZE_STD,
             ),
         ])
-        # Highlighted examples are trained without colour jitter: their
-        # changed square colour is part of what the model must learn to
-        # ignore, rather than another colour to randomly recolour.
-        self.highlighted_transform = transforms.Compose([
-            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-            transforms.RandomRotation(8),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=NORMALIZE_MEAN,
-                std=NORMALIZE_STD,
-            ),
-        ])
         self.eval_transform = transforms.Compose([
             transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
             transforms.ToTensor(),
@@ -164,17 +153,10 @@ class ChessImageDataset(Dataset):
         if isinstance(record, dict):
             image_path = record["path"]
             class_name = record["label"]
-            square_type = record.get("square_type")
         else:  # backwards-compatible tuple records
             image_path, class_name = record
-            square_type = None
 
-        if not self.training:
-            transform = self.eval_transform
-        elif square_type == "highlighted":
-            transform = self.highlighted_transform
-        else:
-            transform = self.transform
+        transform = self.transform if self.training else self.eval_transform
 
         with Image.open(image_path) as image:
             image = image.convert("RGB")
@@ -256,36 +238,15 @@ def _print_record_summary(records):
     return counts
 
 
-def light_dark_balance(records, tolerance=BALANCE_TOLERANCE):
-    """Return classes whose light/dark counts differ by more than tolerance.
+def _normalise_split(value):
+    """Return ``train``, ``validation``, or ``unsplit`` for a split value.
 
-    Highlighted records are intentionally excluded from this check.
-    Legacy prefix-only records have no square type and therefore cannot be
-    balance-checked; they simply produce no balance issues here.
+    Old ``test`` values deliberately become validation: this trainer no
+    longer maintains a third held-out set, and validation is its final
+    evaluation set.
     """
-    counts = {
-        class_name: {"light": 0, "dark": 0, "highlighted": 0}
-        for class_name in PREFIX_TO_CLASS.values()
-    }
-    has_square_types = False
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        label = record.get("label")
-        square_type = record.get("square_type")
-        if label in counts and square_type in counts[label]:
-            counts[label][square_type] += 1
-            has_square_types = True
-
-    if not has_square_types:
-        return counts, {}
-
-    imbalanced = {
-        label: values
-        for label, values in counts.items()
-        if abs(values["light"] - values["dark"]) > tolerance
-    }
-    return counts, imbalanced
+    split = str(value or "unsplit").strip().lower()
+    return SPLIT_FOLDER_TO_SPLIT.get(split, "unsplit")
 
 
 def _resolve_csv_image_path(value, csv_path, dataset_dir):
@@ -307,10 +268,10 @@ def _resolve_csv_image_path(value, csv_path, dataset_dir):
 def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
     """Load board-vision's dataset.csv into trainer records.
 
-    Expected columns include image_path/filename, label/label_code,
-    square_type, and split. The first CSV creation may contain only
-    ``unsplit`` rows; split_records() handles those without changing the
-    CSV on disk.
+    Expected columns include image_path/filename, label/label_code, and
+    split. Old ``test`` split values are read as validation. A legacy CSV
+    may contain only ``unsplit`` rows; split_records() handles those with
+    an internal 80/20 fallback without changing the CSV on disk.
     """
     csv_path = Path(csv_path)
     dataset_dir = Path(dataset_dir)
@@ -346,15 +307,7 @@ def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
             skipped_bad.append(str(image_path))
             continue
 
-        square_type = (row.get("square_type") or "").strip().lower()
-        if square_type not in ("light", "dark", "highlighted"):
-            square_type = None
-
-        split = (row.get("split") or "unsplit").strip().lower()
-        if split in ("val", "valid"):
-            split = "validation"
-        if split not in ("train", "validation", "test"):
-            split = "unsplit"
+        split = _normalise_split(row.get("split"))
 
         game_id = (
             row.get("game_id")
@@ -367,7 +320,6 @@ def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
             "path": image_path,
             "label": label,
             "label_code": label_code,
-            "square_type": square_type,
             "split": split,
             "game_id": game_id,
             "board_id": (row.get("board_id") or "").strip() or None,
@@ -386,13 +338,10 @@ def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
 
     _print_record_summary(records)
 
-    square_counts = defaultdict(int)
     split_counts = defaultdict(int)
     for record in records:
-        square_counts[record.get("square_type") or "unknown"] += 1
         split_counts[record.get("split") or "unsplit"] += 1
-    print("\nSquare types:", dict(sorted(square_counts.items())))
-    print("CSV splits:", dict(sorted(split_counts.items())))
+    print("\nCSV splits:", dict(sorted(split_counts.items())))
     game_ids = {record.get("game_id") for record in records if record.get("game_id")}
     print(f"Game IDs: {len(game_ids)}")
     return records
@@ -465,15 +414,15 @@ def _duplicate_metrics(first, second):
 
 
 def deduplicate_records(records, mode="exact-near"):
-    """Remove exact/near duplicate pixels before any train/val/test split.
+    """Remove exact/near duplicate pixels before training/validation use.
 
     Returns ``(unique_records, duplicate_reports)``. Matching is deliberately
     across every label: identical pixels under two classes are conflicting
     faulty training data, and the first path in deterministic sorted order
     is retained while later copies are reported and excluded.
 
-    Removing duplicates before splitting is essential; otherwise the same
-    tile could appear in both training and validation, making validation
+    Removing duplicates before training/validation use is essential;
+    otherwise the same tile could appear in both sets, making validation
     look artificially good while also wasting training time.
     """
     if mode not in ("exact-near", "exact", "off"):
@@ -572,11 +521,10 @@ def deduplicate_records(records, mode="exact-near"):
 
 
 def _split_target_counts(total):
-    """Exact integer 70/15/15 target counts for a temporary split."""
+    """Exact integer 80/20 target counts for a temporary split."""
     quotas = [
         ("train", total * TRAIN_SPLIT),
         ("validation", total * VALIDATION_SPLIT),
-        ("test", total * TEST_SPLIT),
     ]
     counts = {name: int(quota) for name, quota in quotas}
     remaining = total - sum(counts.values())
@@ -590,96 +538,22 @@ def _split_target_counts(total):
     return counts
 
 
-def _record_game_id(record):
-    """Explicit game/board grouping ID for a trainer record, if present."""
-    if not isinstance(record, dict):
-        return None
-    for field in ("game_id", "board_id", "source_image"):
-        value = str(record.get(field, "") or "").strip()
-        if value:
-            return value
-    return None
-
-
-def _game_split_target_counts(total_games):
-    """Whole-game split counts matching board-vision's small-game rules."""
-    counts = _split_target_counts(max(0, int(total_games)))
-    if total_games >= 2 and counts["validation"] == 0 and counts["train"] > 1:
-        counts["train"] -= 1
-        counts["validation"] += 1
-    if total_games >= 3 and counts["test"] == 0:
-        donor = "train" if counts["train"] > 1 else "validation"
-        if counts[donor] > 1:
-            counts[donor] -= 1
-            counts["test"] += 1
-    return counts
-
-
-def _internal_game_split(records):
-    """Temporary whole-game split, or None when fewer than 3 games exist."""
-    groups = defaultdict(list)
-    for record in records:
-        game_id = _record_game_id(record)
-        if game_id is None:
-            return None
-        groups[game_id].append(record)
-    if len(groups) < 3:
-        return None
-
-    ordered_game_ids = sorted(
-        groups,
-        key=lambda game_id: (
-            random.Random(f"{RANDOM_SEED}:{game_id}").random(),
-            game_id,
-        ),
-    )
-    targets = _game_split_target_counts(len(ordered_game_ids))
-    split_records_by_name = {"train": [], "validation": [], "test": []}
-    cursor = 0
-    for split_name in ("train", "validation", "test"):
-        count = targets[split_name]
-        for game_id in ordered_game_ids[cursor:cursor + count]:
-            split_records_by_name[split_name].extend(groups[game_id])
-        cursor += count
-
-    rng = random.Random(RANDOM_SEED)
-    for split in split_records_by_name.values():
-        rng.shuffle(split)
-    return (
-        split_records_by_name["train"],
-        split_records_by_name["validation"],
-        split_records_by_name["test"],
-    )
-
-
-def _internal_temporary_split(records):
-    """Prefer whole-game temporary splits; use image split only if needed."""
-    game_split = _internal_game_split(records)
-    if game_split is not None:
-        return game_split
-    return _internal_stratified_split(records)
-
-
 def _internal_stratified_split(records):
-    """Temporary exact-count 70/15/15 split for unsplit/legacy records.
+    """Temporary label-stratified 80/20 split for unsplit/legacy records.
 
-    Allocations start from each (label, square_type) group's proportional
-    floor, then remainders are assigned so the global train/validation/test
-    totals hit the requested percentages as exactly as integer counts allow.
+    Allocations start from each label group's proportional floor, then
+    remainders are assigned so the global training/validation totals hit
+    the requested percentages as exactly as integer counts allow.
     """
     groups = defaultdict(list)
     for record in records:
-        if isinstance(record, dict):
-            key = (record["label"], record.get("square_type") or "")
-        else:
-            key = (record[1], "")
+        key = record["label"] if isinstance(record, dict) else record[1]
         groups[key].append(record)
 
-    split_names = ("train", "validation", "test")
+    split_names = ("train", "validation")
     fractions = {
         "train": TRAIN_SPLIT,
         "validation": VALIDATION_SPLIT,
-        "test": TEST_SPLIT,
     }
     targets = _split_target_counts(len(records))
     allocations = {}
@@ -722,13 +596,13 @@ def _internal_stratified_split(records):
 
     for key, count in remainders.items():
         if count:
-            allocations[key]["test"] += count
+            allocations[key]["train"] += count
 
     split_records_by_name = {name: [] for name in split_names}
     rng = random.Random(RANDOM_SEED)
     for key in sorted(groups):
         group = list(groups[key])
-        random.Random(f"{RANDOM_SEED}:{key[0]}:{key[1]}").shuffle(group)
+        random.Random(f"{RANDOM_SEED}:{key}").shuffle(group)
         cursor = 0
         for name in split_names:
             count = allocations[key][name]
@@ -740,64 +614,67 @@ def _internal_stratified_split(records):
     return (
         split_records_by_name["train"],
         split_records_by_name["validation"],
-        split_records_by_name["test"],
     )
 
 
 def split_records(records):
-    """Use pre-assigned split fields/folders, else split the same folders.
+    """Return physical training/validation records, with an 80/20 fallback.
 
-    Folder records from ``datasets/<class>/`` normally arrive unsplit. They
-    are divided here into training/validation/test from that one shared
-    source, preferring whole-game groups when game IDs are available.
+    Records from ``datasets/training/<class>/`` and
+    ``datasets/validation/<class>/`` keep their folder assignment. Legacy
+    records marked ``test`` are normalised to validation because validation
+    is now the final evaluation set and there is no separate test set.
+
+    Direct legacy class-folder records and other ``unsplit`` records are
+    divided only in memory with a deterministic label-stratified 80/20
+    split; no files are moved. If duplicate removal leaves a physically
+    assigned dataset without validation images, all remaining records are
+    temporarily re-split the same way. At least two unique images are
+    required to form non-empty training and validation sets.
     """
-    assigned = {"train": [], "validation": [], "test": []}
+    assigned = {"train": [], "validation": []}
     unsplit = []
     for record in records:
-        split = record.get("split") if isinstance(record, dict) else None
+        split = (
+            _normalise_split(record.get("split"))
+            if isinstance(record, dict)
+            else "unsplit"
+        )
         if split in assigned:
             assigned[split].append(record)
         else:
             unsplit.append(record)
 
     if unsplit:
-        extra_train, extra_val, extra_test = _internal_temporary_split(unsplit)
+        extra_train, extra_val = _internal_stratified_split(unsplit)
         assigned["train"].extend(extra_train)
         assigned["validation"].extend(extra_val)
-        assigned["test"].extend(extra_test)
         print(
-            "Some/all images were 'unsplit'; deriving training/validation/test "
-            "from the same dataset with a temporary whole-game 70/15/15 split "
-            "when at least 3 game IDs are available (otherwise an image-level "
-            "fallback), without moving or changing files on disk."
+            "Some/all images were 'unsplit'; deriving training/validation "
+            "with a temporary label-stratified 80/20 split, without moving "
+            "or changing files on disk."
         )
 
     if not assigned["train"]:
         raise RuntimeError("No training images after applying dataset splits")
-    if not assigned["validation"] or not assigned["test"]:
-        print("Assigned split had an empty validation/test set; re-splitting temporarily.")
-        return _internal_temporary_split(records)
-    return assigned["train"], assigned["validation"], assigned["test"]
-
-
-def filter_highlighted_records(records, highlighted_mode="include"):
-    if highlighted_mode == "include":
-        return records
-    highlighted = [
-        record for record in records
-        if isinstance(record, dict) and record.get("square_type") == "highlighted"
-    ]
-    if highlighted_mode == "only":
-        return highlighted
-    if highlighted_mode == "exclude":
-        return [
-            record for record in records
-            if not (
-                isinstance(record, dict)
-                and record.get("square_type") == "highlighted"
+    if not assigned["validation"]:
+        if len(records) < 2:
+            raise RuntimeError(
+                "At least two unique images are required so both training "
+                "and validation are non-empty"
             )
-        ]
-    raise ValueError(f"Unsupported highlighted mode: {highlighted_mode}")
+        print(
+            "The assigned folders had no validation images after duplicate "
+            "removal; re-splitting temporarily with a label-stratified "
+            "80/20 split."
+        )
+        train_records, validation_records = _internal_stratified_split(records)
+        if not train_records or not validation_records:
+            raise RuntimeError(
+                "Could not form non-empty training and validation sets"
+            )
+        return train_records, validation_records
+    return assigned["train"], assigned["validation"]
 
 
 def _parse_folder_filename(path):
@@ -805,7 +682,6 @@ def _parse_folder_filename(path):
     stem = Path(path).stem
     parsed = {
         "label_code": "",
-        "square_type": None,
         "game_id": None,
         "row": None,
         "col": None,
@@ -815,10 +691,6 @@ def _parse_folder_filename(path):
     first_parts = sections[0].split("_") if sections else []
     if first_parts and first_parts[0].lower() in PREFIX_TO_CLASS:
         parsed["label_code"] = first_parts[0].lower()
-    for part in first_parts[1:]:
-        if part.lower() in ("light", "dark", "highlighted"):
-            parsed["square_type"] = part.lower()
-            break
 
     for section in sections[1:]:
         lower = section.lower()
@@ -830,11 +702,6 @@ def _parse_folder_filename(path):
                 parsed["row"] = int(match.group(1))
                 parsed["col"] = int(match.group(2))
 
-    if parsed["square_type"] is None:
-        for token in re.split(r"[^A-Za-z]+", stem.lower()):
-            if token in ("light", "dark", "highlighted"):
-                parsed["square_type"] = token
-                break
     if parsed["game_id"] is None:
         match = re.search(r"(game[_-][A-Za-z0-9_.-]+?)(?:__|$)", stem)
         if match:
@@ -856,8 +723,7 @@ def _make_folder_record(path, label, split="unsplit"):
         "path": Path(path),
         "label": label,
         "label_code": label_code,
-        "square_type": parsed["square_type"],
-        "split": split,
+        "split": _normalise_split(split),
         "game_id": parsed["game_id"],
         "board_id": parsed["game_id"],
         "source_image": None,
@@ -905,22 +771,32 @@ def discover_images(dataset_dir=DATASET_DIR):
     Preferred layout::
 
         datasets/
-          white_king/*.png
-          white_queen/*.png
-          ...
-          empty/*.png
+          training/
+            white_king/*.png
+            white_queen/*.png
+            ...
+            empty/*.png
+          validation/
+            white_king/*.png
+            white_queen/*.png
+            ...
+            empty/*.png
 
-    All splits are derived from these same class folders by
-    ``split_records``. Optional ``train/<class>``, ``validation/<class>``,
-    and ``test/<class>`` folders are also understood. If no class-folder
-    images exist, the old flat filename-prefix layout is used as a fallback.
+    The physical parent folder assigns each record to training or
+    validation. A legacy ``train/<class>`` folder is read as training, and
+    a legacy ``test/<class>`` folder is read as validation because there is
+    no separate test set. Direct legacy ``datasets/<class>/`` folders are
+    read as ``unsplit`` for the internal fallback in ``split_records``. If
+    no class-folder images exist, the old flat filename-prefix layout is
+    used as a fallback.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.exists():
         raise FileNotFoundError(
             f"Dataset folder does not exist: {dataset_dir}\n"
-            "Run board-vision.py to create datasets/<class>/ folders, "
-            "or pass --dataset-dir/--csv for a legacy dataset."
+            "Run board-vision.py to create datasets/training/<class>/ and "
+            "datasets/validation/<class>/ folders, or pass "
+            "--dataset-dir/--csv for a legacy dataset."
         )
 
     candidates, unknown_folders = _class_folder_candidates(dataset_dir)
@@ -950,23 +826,20 @@ def discover_images(dataset_dir=DATASET_DIR):
 
         counts = _print_record_summary(records)
         small_classes = {
-            name: count for name, count in counts.items() if count < 3
+            name: count for name, count in counts.items() if count < 2
         }
         if small_classes:
             print(
-                "WARNING: Very small classes may not appear in every split: "
-                f"{small_classes}"
+                "WARNING: Very small classes may not appear in both training "
+                f"and validation: {small_classes}"
             )
-        square_counts = defaultdict(int)
         split_counts = defaultdict(int)
         game_ids = set()
         for record in records:
-            square_counts[record.get("square_type") or "unknown"] += 1
             split_counts[record.get("split") or "unsplit"] += 1
             if record.get("game_id"):
                 game_ids.add(record["game_id"])
-        print("\nSquare types:", dict(sorted(square_counts.items())))
-        print("Folder splits:", dict(sorted(split_counts.items())))
+        print("\nFolder splits:", dict(sorted(split_counts.items())))
         print(f"Game IDs parsed from filenames: {len(game_ids)}")
         return records
 
@@ -1006,17 +879,19 @@ def discover_images(dataset_dir=DATASET_DIR):
         print("Ignored unknown class folders:", unknown_folders[:10])
     if not records:
         raise RuntimeError(
-            "No usable images found. Expected datasets/<class>/*.png "
-            "(for example datasets/white_pawn/...), optional split/class "
+            "No usable images found. Expected "
+            "datasets/training/<class>/*.png and "
+            "datasets/validation/<class>/*.png (for example "
+            "datasets/training/white_pawn/...), legacy unsplit class "
             "folders, or legacy prefix-named files in the dataset root."
         )
 
     counts = _print_record_summary(records)
-    small_classes = {name: count for name, count in counts.items() if count < 3}
+    small_classes = {name: count for name, count in counts.items() if count < 2}
     if small_classes:
         print(
-            "WARNING: Very small classes may not appear in every split: "
-            f"{small_classes}"
+            "WARNING: Very small classes may not appear in both training "
+            f"and validation: {small_classes}"
         )
     return records
 
@@ -1073,19 +948,25 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train the ChessBotV square CNN")
     parser.add_argument(
         "--dataset-dir", type=Path, default=DATASET_DIR,
-        help="Dataset root containing <class>/ image folders (default: datasets/)",
+        help=(
+            "Dataset root containing training/<class>/ and "
+            "validation/<class>/ folders (default: datasets/)"
+        ),
     )
     parser.add_argument(
         "--csv", type=Path, default=None,
-        help="Optional legacy board-vision CSV; class folders are used when omitted",
+        help=(
+            "Optional legacy board-vision CSV; training/validation folders "
+            "are used when omitted"
+        ),
     )
     parser.add_argument(
         "--dedupe",
         choices=("exact-near", "exact", "off"),
         default="exact-near",
         help=(
-            "Remove exact/near duplicate pixels before splitting "
-            "(default: exact-near)"
+            "Remove exact/near duplicate pixels before training/validation "
+            "use (default: exact-near)"
         ),
     )
     parser.add_argument(
@@ -1093,16 +974,6 @@ def parse_args(argv=None):
         help="Output .pth model path",
     )
     parser.add_argument("--epochs", type=int, default=EPOCHS)
-    parser.add_argument(
-        "--highlighted-mode",
-        choices=("include", "exclude", "only"),
-        default="include",
-        help="How highlighted-square examples participate in this run",
-    )
-    parser.add_argument(
-        "--allow-imbalance", action="store_true",
-        help="Train even if a class light/dark counts differ by more than 2",
-    )
     return parser.parse_args(argv)
 
 
@@ -1124,7 +995,7 @@ def main(argv=None):
 
     records_before_dedupe = 0
     duplicate_reports = []
-    dataset_layout = "class_folders"
+    dataset_layout = "training_validation_folders"
     if args.csv is not None:
         dataset_layout = "csv"
         csv_path = Path(args.csv)
@@ -1137,19 +1008,19 @@ def main(argv=None):
         and DEFAULT_CSV.is_file()
         and not _dataset_has_discoverable_images(dataset_dir)
     ):
-        # Migration-friendly fallback: a checkout may contain the new empty
-        # datasets/<class>/ placeholders while the user's older local data
-        # is still in board_debug/. New folder data always wins when present.
+        # Migration-friendly fallback: a checkout may contain new empty
+        # training/validation placeholders while the user's older local
+        # data is still in board_debug/. New folder data always wins.
         dataset_layout = "legacy_csv_fallback"
         print(
-            "No images found in datasets/<class>/ yet; using the legacy "
-            f"board_debug CSV at {DEFAULT_CSV}."
+            "No images found in datasets/training/ or datasets/validation/ "
+            f"yet; using the legacy board_debug CSV at {DEFAULT_CSV}."
         )
         records = load_csv_records(DEFAULT_CSV, LEGACY_DATASET_DIR)
     else:
         print(
-            "Using class folders as the shared training/validation/test "
-            f"source: {dataset_dir}"
+            "Using the physical training/validation class folders: "
+            f"{dataset_dir}"
         )
         records = discover_images(dataset_dir)
 
@@ -1158,9 +1029,10 @@ def main(argv=None):
     if duplicate_reports:
         print(
             f"\nRemoved {len(duplicate_reports)} duplicate image(s) before "
-            f"splitting ({records_before_dedupe} -> {len(records)}). "
-            "Duplicates slow training and can make the model faulty/leaky "
-            "if copies land in different splits."
+            f"training/validation use ({records_before_dedupe} -> "
+            f"{len(records)}). Duplicates slow training and can make the "
+            "model faulty/leaky if copies appear in both training and "
+            "validation."
         )
         for report in duplicate_reports[:10]:
             duplicate_path, duplicate_label = _record_path_and_label(
@@ -1177,32 +1049,15 @@ def main(argv=None):
             print(f"  ... and {len(duplicate_reports) - 10} more duplicate(s)")
         _print_record_summary(records)
     elif args.dedupe != "off":
-        print("\nNo exact/near duplicate images found before splitting.")
+        print(
+            "\nNo exact/near duplicate images found before "
+            "training/validation use."
+        )
     if not records:
         raise RuntimeError("No unique images remain after duplicate removal")
 
-    _balance_counts, imbalanced = light_dark_balance(records)
-    if imbalanced:
-        details = "; ".join(
-            f"{label}: light={values['light']}, dark={values['dark']}"
-            for label, values in sorted(imbalanced.items())
-        )
-        message = (
-            "Light/dark counts for each class must differ by at most "
-            f"{BALANCE_TOLERANCE} (highlighted excluded). Imbalanced: {details}"
-        )
-        if not args.allow_imbalance:
-            raise RuntimeError(message)
-        print("WARNING:", message)
-
-    records = filter_highlighted_records(records, args.highlighted_mode)
-    if not records:
-        raise RuntimeError(
-            f"No records remain with --highlighted-mode={args.highlighted_mode}"
-        )
-
     labels = [record["label"] for record in records]
-    train_records, val_records, test_records = split_records(records)
+    train_records, val_records = split_records(records)
 
     class_names = sorted(set(labels))
     class_to_idx = {
@@ -1212,7 +1067,6 @@ def main(argv=None):
 
     print(f"\nTraining images:   {len(train_records)}")
     print(f"Validation images: {len(val_records)}")
-    print(f"Test images:       {len(test_records)}")
     print(f"Classes: {len(class_names)}")
 
     train_dataset = ChessImageDataset(
@@ -1220,9 +1074,6 @@ def main(argv=None):
     )
     val_dataset = ChessImageDataset(
         val_records, class_to_idx, training=False
-    )
-    test_dataset = ChessImageDataset(
-        test_records, class_to_idx, training=False
     )
 
     train_loader = DataLoader(
@@ -1241,13 +1092,6 @@ def main(argv=None):
         pin_memory=(device.type == "cuda"),
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
-    )
 
     model = ChessCNN(num_classes=len(class_names)).to(device)
     criterion = nn.CrossEntropyLoss()
@@ -1334,8 +1178,8 @@ def main(argv=None):
                     "model_name": "ChessCNN",
                     "mean": list(NORMALIZE_MEAN),
                     "std": list(NORMALIZE_STD),
-                    "square_types": ["light", "dark", "highlighted"],
-                    "highlighted_mode": args.highlighted_mode,
+                    "training_images": len(train_records),
+                    "validation_images": len(val_records),
                     "dataset_dir": str(dataset_dir),
                     "dataset_layout": dataset_layout,
                     "dedupe_mode": args.dedupe,
@@ -1347,14 +1191,16 @@ def main(argv=None):
 
             print(f"  Saved new best model: {output_model}")
 
-    # Evaluate the best validation checkpoint on the held-out test split.
+    # Validation is the final evaluation set; there is no separate test set.
+    # Reload the best checkpoint selected by validation accuracy and report
+    # its per-class validation performance.
     checkpoint = torch.load(
         output_model, map_location=device, weights_only=True
     )
     model.load_state_dict(checkpoint["model_state_dict"])
 
     _, final_accuracy, true_labels, predicted_labels = evaluate(
-        model, test_loader, device, criterion
+        model, val_loader, device, criterion
     )
 
     idx_to_class = {
@@ -1367,11 +1213,11 @@ def main(argv=None):
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
     print(f"Best validation accuracy during training: {best_accuracy:.2%}")
-    print(f"Held-out test accuracy: {final_accuracy:.2%}")
+    print(f"Final validation accuracy: {final_accuracy:.2%}")
     print(f"Model saved to: {output_model.resolve()}")
     print("=" * 60)
 
-    print("\nPer-class test report:")
+    print("\nPer-class validation report:")
     print(
         classification_report(
             true_labels,

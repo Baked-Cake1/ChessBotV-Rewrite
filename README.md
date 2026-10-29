@@ -184,20 +184,19 @@ pip install numpy Pillow pygame
 
 Training additionally uses the existing trainer dependencies (`torch`, `torchvision`, `scikit-learn`, and `tqdm`).
 
-1. Run `python board-vision.py` (or drag a screenshot onto it). It creates `datasets/` and one folder for every CNN class: `white_king`, `white_queen`, `white_rook`, `white_bishop`, `white_knight`, `white_pawn`, `black_king`, `black_queen`, `black_rook`, `black_bishop`, `black_knight`, `black_pawn`, and `empty`. Each uploaded board receives a new `game_id`, shared by its tiles and encoded in their filenames for whole-game splitting.
+1. Run `python board-vision.py` (or drag a screenshot onto it). On startup it creates `datasets/training/` and `datasets/validation/`, each containing the same 13 CNN class folders: `white_king`, `white_queen`, `white_rook`, `white_bishop`, `white_knight`, `white_pawn`, `black_king`, `black_queen`, `black_rook`, `black_bishop`, `black_knight`, `black_pawn`, and `empty`. Each uploaded board receives a new `game_id` for provenance; tiles from one board may be exported to different splits when the weighted class split is applied.
 2. Select the outer edge of the chessboard exactly as before; mouse-wheel zoom and right-drag pan still allow pixel-accurate selection. The board is cropped and split into the same 64 squares, followed by the grid/tile inspection view.
-3. **Manually mark every square.** First click the piece/blank on the square; there are no OpenCV or learned suggestions. Immediately after the piece is marked, board-vision compares that tile's normalised 64×64 RGB pixels against every image already in the class folders and every unique tile accepted earlier on the current board.
-4. If the pixels are an **exact duplicate** or a **near duplicate**, the GUI and terminal say so, name the existing match, and explain the problem: duplicate images make training slower and can make the model faulty/over-confident (and can leak between training and validation). You still choose **Light square**, **Dark square**, or **Highlighted square** to complete the mark for FEN/board bookkeeping, but the duplicate tile itself is **not saved**. The duplicate check searches across all classes so identical pixels under a conflicting label are also caught; a genuinely different light- versus dark-square version remains unique.
-5. Unique tiles are saved only after the complete board is reviewed, directly into their class folder—for example `datasets/white_pawn/wp_light__game_...__r6c4__000001.png` or `datasets/empty/blank_dark__game_...__r4c4__000002.png`. `datasets/metadata.csv` keeps provenance and each skipped duplicate's match details, while board crops, grid-debug images, and FEN files go under `datasets/_boards/<game_id>/` so they cannot be mistaken for training classes. After review, the terminal still asks **“Is this board flipped?”** before generating/saving the FEN.
+3. **Manually mark every square with one click:** choose only the piece/blank on the square. There is no Light/Dark/Highlighted square step, and there are no OpenCV or learned suggestions. Immediately after the piece is marked, board-vision compares that tile's normalised 64×64 RGB pixels against every image already in both training and validation and every unique tile accepted earlier on the current board.
+4. If the pixels are an **exact duplicate** or a **near duplicate**, the GUI and terminal say so, name the existing match, and explain the problem: duplicate images make training slower and can make the model faulty/over-confident (and can leak between training and validation). The duplicate tile is **not saved**. The duplicate check searches across all classes and both splits, so identical pixels under a conflicting label—or a copy placed in the opposite split—are also caught.
+5. Unique tiles are saved only after the complete board is reviewed. At export, board-vision assigns them separately within each class using a deterministic cumulative **80% training / 20% validation** split, so training receives more images and single-image classes stay in training. Examples include `datasets/training/white_pawn/wp__game_...__r6c4__000001.png` and `datasets/validation/empty/blank__game_...__r4c4__000002.png`. `datasets/metadata.csv` keeps each image's assigned split, provenance, and skipped-duplicate details, while board crops, grid-debug images, and FEN files go under `datasets/_boards/<game_id>/`. After review, the terminal still asks **“Is this board flipped?”** before generating/saving the FEN.
 6. At the end of a board, answer whether to create the CNN model now:
    - **Yes** runs `cnn_trainer.py --dataset-dir datasets` and writes `chessbotv_cnn.pth`.
-   - **No** returns to the terminal and waits for Enter before opening the next file picker. Adding another board appends only its unique tiles to the same class folders.
-7. **Training and validation use the same `datasets/<class>/` folders as their source.** The trainer also holds out its existing test set from those folders. It first removes any exact/near duplicates still present (including manually copied files), then creates an internal 70% train / 15% validation / 15% test split without moving files. When board-vision filenames provide at least three `game_id`s, whole games are kept in one split (for example, 4 games → 2 train / 1 validation / 1 test); otherwise it uses the existing stratified image-level fallback. Optional pre-made `train/<class>`, `validation/<class>`, and `test/<class>` folders are also recognised.
-8. For every class, light-square and dark-square counts must still differ by at most **2** before training. Highlighted-square images are excluded from that balance check; `cnn_trainer.py` trains them without colour jitter and supports `--highlighted-mode exclude|only` for separate experiments.
+   - **No** returns to the terminal and waits for Enter before opening the next file picker. Adding another board appends only its unique tiles to the physical training/validation folders.
+7. **The trainer reads the physical `datasets/training/<class>/` and `datasets/validation/<class>/` folders.** It first removes any exact/near duplicates still present across both folders (including manually copied files), trains on the training records, and uses validation both to select the best checkpoint and for the final per-class evaluation report. There is **no separate test set**. Legacy direct class folders, flat prefix files, and unsplit CSV records remain readable through a temporary label-stratified 80/20 fallback; legacy `train/<class>` is treated as training and legacy `test/<class>` as validation.
 
 The generated FEN's piece placement comes directly from the manually marked squares. Because one still image cannot prove every remaining FEN field, side-to-move follows the normal/flipped answer (with the exact starting position always White to move), castling is inferred from home king/rook squares, and en passant/clocks are `- 0 1`.
 
-Train directly from the shared class folders with:
+Train directly from the physical training/validation folders with:
 
 ```bash
 python cnn_trainer.py --dataset-dir datasets
@@ -215,7 +214,7 @@ To migrate an old local `board_debug` dataset once, run:
 python board-vision.py --import-legacy
 ```
 
-It copies only unique legacy tiles into `datasets/<class>/`, preserves their game IDs for whole-game splitting, records skipped exact/near duplicates in `metadata.csv`, and leaves the old files untouched. If the new class folders are still empty but an old local `board_debug/dataset.csv` exists, a default trainer run also uses that legacy CSV as a temporary fallback and says so; as soon as class-folder images exist, they take precedence. Generated images and metadata under `datasets/` are ignored by Git—the repository tracks only the empty class-folder placeholders.
+It copies only unique legacy tiles into the physical `datasets/training/<class>/` and `datasets/validation/<class>/` folders using the same deterministic per-class 80/20 export split, records skipped exact/near duplicates in `metadata.csv`, and leaves the old files untouched. If the physical folders are still empty but an old local `board_debug/dataset.csv` exists, a default trainer run also uses that legacy CSV as a temporary fallback and says so; as soon as folder images exist, they take precedence. Generated images and metadata under `datasets/` are ignored by Git—the repository tracks only the 26 empty training/validation class-folder placeholders.
 
 ---
 
@@ -225,10 +224,11 @@ It copies only unique legacy tiles into `datasets/<class>/`, preserves their gam
 ChessBotV-Rewrite/
 ├── new.py              # Main GUI + engine thread (60 FPS, 640x640 board)
 ├── board-vision.py      # Screenshot → 64 manually marked, duplicate-checked squares
-├── cnn_trainer.py       # Trains chessbotv_cnn.pth from datasets/<class>/
-├── datasets/            # Class folders; generated images/metadata are local & ignored
-│   ├── white_king/ … black_pawn/ empty/
-│   ├── metadata.csv     # Generated provenance/duplicate log (ignored)
+├── cnn_trainer.py       # Trains chessbotv_cnn.pth from datasets/training + validation
+├── datasets/            # Physical split folders; generated data is local & ignored
+│   ├── training/        # white_king/ … black_pawn/ empty/
+│   ├── validation/      # white_king/ … black_pawn/ empty/
+│   ├── metadata.csv     # Generated split/provenance/duplicate log (ignored)
 │   └── _boards/         # Generated board crops/grid/FEN per game (ignored)
 ├── start.bat            # Windows launcher (auto-close + restart loop on exit 42)
 ├── configuration.cfg    # Engine settings (hash/threads/skill/depth)

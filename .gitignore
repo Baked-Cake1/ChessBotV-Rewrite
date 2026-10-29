@@ -6,21 +6,41 @@ __pycache__/
 board_debug/
 board_vision_assistant/
 
-# New folder dataset: keep only the class-folder placeholders in Git.
-# Local training images, board crops/debug files, and metadata stay ignored.
+# New folder dataset: keep only the training/validation class-folder
+# placeholders in Git. Local dataset images, board crops/debug files, and
+# metadata stay ignored.
 datasets/*
-!datasets/white_king/
-!datasets/white_queen/
-!datasets/white_rook/
-!datasets/white_bishop/
-!datasets/white_knight/
-!datasets/white_pawn/
-!datasets/black_king/
-!datasets/black_queen/
-!datasets/black_rook/
-!datasets/black_bishop/
-!datasets/black_knight/
-!datasets/black_pawn/
-!datasets/empty/
-datasets/*/*
-!datasets/*/.gitkeep
+!datasets/training/
+!datasets/validation/
+datasets/training/*
+datasets/validation/*
+!datasets/training/white_king/
+!datasets/training/white_queen/
+!datasets/training/white_rook/
+!datasets/training/white_bishop/
+!datasets/training/white_knight/
+!datasets/training/white_pawn/
+!datasets/training/black_king/
+!datasets/training/black_queen/
+!datasets/training/black_rook/
+!datasets/training/black_bishop/
+!datasets/training/black_knight/
+!datasets/training/black_pawn/
+!datasets/training/empty/
+!datasets/validation/white_king/
+!datasets/validation/white_queen/
+!datasets/validation/white_rook/
+!datasets/validation/white_bishop/
+!datasets/validation/white_knight/
+!datasets/validation/white_pawn/
+!datasets/validation/black_king/
+!datasets/validation/black_queen/
+!datasets/validation/black_rook/
+!datasets/validation/black_bishop/
+!datasets/validation/black_knight/
+!datasets/validation/black_pawn/
+!datasets/validation/empty/
+datasets/training/*/*
+datasets/validation/*/*
+!datasets/training/*/.gitkeep
+!datasets/validation/*/.gitkeep
