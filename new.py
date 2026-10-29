@@ -4811,14 +4811,17 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
 
 # --- Board Detection ---
 # The Analysis page can capture another Windows application window, find a
-# supported chessboard palette in that screenshot, and display the result
-# with a blue 8x8 overlay. Detection is deliberately scoped to finding the
-# board itself (White orientation: a8 top-left, h1 bottom-right); it does
-# not sync or play moves from the external board yet.
+# chessboard in that screenshot, and display the result with a blue 8x8
+# overlay. Board location first asks OpenCV's findChessboardCornersSB for
+# the 7x7 internal corners of an 8x8 board. If OpenCV cannot supply a valid
+# corner grid, the older supported-palette colour search is the fallback.
+# Detection assumes White orientation: a8 top-left, h1 bottom-right.
 BOARD_DETECTION_WINDOWS_PER_PAGE = 6
 BOARD_DETECTION_MIN_SIDE = 120
 BOARD_DETECTION_BLUE_BGR = (255, 0, 0)       # blue in OpenCV's BGR order
 BOARD_DETECTION_LINE_BGR = (255, 140, 0)     # lighter blue/cyan in BGR
+BOARD_SB_INTERNAL_CORNERS = (7, 7)
+BOARD_SB_MAX_GRID_ERROR_RATIO = 0.20
 
 # Piece/empty-square recognition normally uses the trained PyTorch CNN in
 # chessbotv_cnn.pth; Analysis > Use Package can select chess-fen-detector
@@ -5704,8 +5707,8 @@ def _board_colour_masks(image, palette=None):
     """Return ``(light, dark, combined)`` square-colour masks.
 
     With no ``palette`` this is the union of every supported palette
-    (Chess.com and Basic/Lichess), which is what board location uses: a
-    real board normally contributes pixels from only one pair, while the
+    (Chess.com and Basic/Lichess), which is what the colour fallback uses:
+    a real board normally contributes pixels from only one pair, while the
     existing coverage/parity scoring still rejects unrelated coloured
     blobs. A palette may be one of ``BOARD_SQUARE_PALETTES``, its ``id``,
     or a ``(light_bgr, dark_bgr)`` pair.
@@ -5851,8 +5854,209 @@ def _add_board_candidate(candidates, x, y, side, image_w, image_h):
     candidates.add((x, y, side, side))
 
 
+def _board_sb_grayscale(image):
+    """Return an 8-bit grayscale image for ``findChessboardCornersSB``."""
+    import cv2
+    import numpy as np
+
+    array = np.asarray(image)
+    if array.dtype != np.uint8:
+        if np.issubdtype(array.dtype, np.floating) and array.size:
+            maximum = float(np.nanmax(array))
+            if maximum <= 1.0:
+                array = array * 255.0
+        array = np.clip(array, 0, 255).astype(np.uint8)
+
+    if array.ndim == 2:
+        gray = array
+    elif array.ndim == 3:
+        channels = array.shape[2]
+        if channels == 1 or channels == 2:
+            gray = array[:, :, 0]
+        elif channels == 3:
+            gray = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+        elif channels >= 4:
+            gray = cv2.cvtColor(array[:, :, :4], cv2.COLOR_BGRA2GRAY)
+        else:
+            raise ValueError("Board screenshot has no usable colour channels")
+    else:
+        raise ValueError("Board detection needs a 2D or 3D screenshot")
+    return np.ascontiguousarray(gray)
+
+
+def _board_rect_from_sb_corners(corners, image_w, image_h):
+    """Convert 7x7 internal corners into the outer 8x8 board rectangle.
+
+    OpenCV reports only the internal corners where four squares meet. For
+    an 8x8 chessboard there are seven such positions along each axis, and
+    the distance between neighbouring internal corners is one square. The
+    outer board therefore starts one square before the first internal
+    corner and is eight squares wide.
+
+    ChessBotV's board rectangles are axis-aligned squares, so this helper
+    deliberately returns ``None`` for a rotated/perspective grid whose
+    corners cannot be represented safely by ``(x, y, side, side)``. The
+    caller then uses the existing colour detector as its fallback.
+    """
+    import numpy as np
+
+    pattern_w, pattern_h = BOARD_SB_INTERNAL_CORNERS
+    if (pattern_w, pattern_h) != (7, 7):
+        return None
+    try:
+        points = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    except (TypeError, ValueError):
+        return None
+    if points.shape != (49, 2) or not np.all(np.isfinite(points)):
+        return None
+
+    axis_coordinates = []
+    axis_spacings = []
+    for axis in range(2):
+        # An axis-aligned grid has seven corners at (nearly) each of its
+        # seven x coordinates and seven at each y coordinate. Sorting the
+        # 49 values into seven groups is independent of OpenCV's corner
+        # ordering and also rejects noticeably rotated boards.
+        groups = np.sort(points[:, axis]).reshape(7, 7)
+        coordinates = np.median(groups, axis=1)
+        differences = np.diff(coordinates)
+        if np.any(differences <= 0):
+            return None
+        spacing = float(np.median(differences))
+        if spacing <= 0:
+            return None
+        group_tolerance = max(2.5, 0.15 * spacing)
+        if np.any(groups.max(axis=1) - groups.min(axis=1) > group_tolerance):
+            return None
+        spacing_tolerance = max(2.0, 0.20 * spacing)
+        if np.any(np.abs(differences - spacing) > spacing_tolerance):
+            return None
+        axis_coordinates.append(coordinates)
+        axis_spacings.append(spacing)
+
+    x_coordinates, y_coordinates = axis_coordinates
+    step_x, step_y = axis_spacings
+    step = (step_x + step_y) / 2.0
+    if step <= 0 or abs(step_x - step_y) > max(3.0, 0.06 * step):
+        return None
+
+    x_errors = np.min(
+        np.abs(points[:, 0][:, None] - x_coordinates[None, :]), axis=1
+    )
+    y_errors = np.min(
+        np.abs(points[:, 1][:, None] - y_coordinates[None, :]), axis=1
+    )
+    point_errors = np.sqrt(x_errors ** 2 + y_errors ** 2)
+    grid_error = float(np.sqrt(np.mean(point_errors ** 2)))
+    max_grid_error = float(np.max(point_errors))
+    if max_grid_error > max(3.0, BOARD_SB_MAX_GRID_ERROR_RATIO * step):
+        return None
+
+    side = 8.0 * step
+    centre_x = float((x_coordinates[0] + x_coordinates[-1]) / 2.0)
+    centre_y = float((y_coordinates[0] + y_coordinates[-1]) / 2.0)
+    candidates = set()
+    _add_board_candidate(
+        candidates,
+        centre_x - side / 2.0,
+        centre_y - side / 2.0,
+        side,
+        image_w,
+        image_h,
+    )
+    if not candidates:
+        return None
+
+    return {
+        "board_rect": next(iter(candidates)),
+        "corners": [[float(x), float(y)] for x, y in points],
+        "cell_size": float(step),
+        "cell_size_x": float(step_x),
+        "cell_size_y": float(step_y),
+        "grid_error": grid_error,
+        "max_grid_error": max_grid_error,
+    }
+
+
+def _find_board_with_opencv_sb(image):
+    """Locate a board with ``cv2.findChessboardCornersSB``, or return None.
+
+    This is the primary board locator. It first searches the screenshot's
+    grayscale image. Piece silhouettes can obscure the saddle pattern at
+    internal corners, so a miss is retried on median- and Gaussian-blurred
+    copies that suppress piece detail while preserving the 8x8 square
+    edges. All SB attempts happen before the caller's colour fallback.
+
+    Every failure mode—OpenCV missing, an older OpenCV without the SB
+    function, no corner pattern found, or a corner grid that cannot be
+    represented as an axis-aligned square—is reported as ``None`` so the
+    caller can run its colour fallback.
+    """
+    try:
+        import cv2
+
+        finder = getattr(cv2, "findChessboardCornersSB", None)
+        if finder is None:
+            return None
+        gray = _board_sb_grayscale(image)
+        image_h, image_w = gray.shape[:2]
+        if image_w < BOARD_DETECTION_MIN_SIDE:
+            return None
+        if image_h < BOARD_DETECTION_MIN_SIDE:
+            return None
+
+        flags = 0
+        for flag_name in ("CALIB_CB_EXHAUSTIVE", "CALIB_CB_ACCURACY"):
+            flags |= int(getattr(cv2, flag_name, 0))
+    except Exception:
+        return None
+
+    attempts = [("none", gray)]
+    try:
+        attempts.append(("median_blur_9", cv2.medianBlur(gray, 9)))
+    except Exception:
+        pass
+    try:
+        gaussian_kernel = max(
+            9,
+            min(21, ((min(image_w, image_h) // 60) | 1)),
+        )
+        attempts.append(
+            (
+                f"gaussian_blur_{gaussian_kernel}",
+                cv2.GaussianBlur(
+                    gray,
+                    (gaussian_kernel, gaussian_kernel),
+                    0,
+                ),
+            )
+        )
+    except Exception:
+        pass
+
+    for preprocessing, attempt_gray in attempts:
+        try:
+            found, corners = finder(
+                attempt_gray,
+                BOARD_SB_INTERNAL_CORNERS,
+                flags,
+            )
+        except Exception:
+            continue
+        if not found or corners is None:
+            continue
+        result = _board_rect_from_sb_corners(corners, image_w, image_h)
+        if result is None:
+            continue
+        result["method"] = "opencv_findChessboardCornersSB"
+        result["pattern_size"] = BOARD_SB_INTERNAL_CORNERS
+        result["preprocessing"] = preprocessing
+        return result
+    return None
+
+
 def _board_candidate_rects(bg_mask):
-    """Generate plausible square board rectangles from board-colour blobs."""
+    """Colour fallback: generate board rectangles from board-colour blobs."""
     import cv2
     import numpy as np
 
@@ -6186,14 +6390,14 @@ def _sync_board_anchor_labels(result):
 
 
 def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
-    """Find a White-oriented supported-colour board in a BGR screenshot.
+    """Find a White-oriented board in a BGR screenshot.
 
-    The grid-colour geometry does the locating in both modes. With Use
-    Package off, the local CNN classifies the two corner anchors and then
-    all 64 squares. With it on, each refined candidate crop is sent to
-    ``chess-fen-detector`` once; its full-board grid supplies both the
-    anchors and (for the winning candidate) the final labels. Returns a
-    detection dict or None.
+    Board location first asks OpenCV's ``findChessboardCornersSB`` for the
+    7x7 internal corners of an 8x8 board. Only when that returns no usable
+    axis-aligned corner grid does ChessBotV fall back to its supported
+    Chess.com/Basic-Lichess colour candidates. The selected CNN/package
+    recogniser and the established anchor/final-classification flow then
+    remain unchanged. Returns a detection dict or None.
     """
     if image is None or getattr(image, "ndim", 0) != 3:
         return None
@@ -6205,30 +6409,50 @@ def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
     else:
         classifier = _get_cnn_classifier()
     image_h, image_w = image.shape[:2]
+
+    # Primary locator: OpenCV's chessboard-corner detector. Its helper
+    # deliberately turns every import/API/not-found/invalid-grid outcome
+    # into None, which selects the colour fallback below.
+    sb_detection = _find_board_with_opencv_sb(image)
+
+    # Colour integrals are still useful with an SB rectangle: they supply
+    # the established palette/geometry fields and can offer a small
+    # colour-aligned variant of the SB rectangle for candidate scoring.
+    # When SB finds nothing, they drive the complete colour fallback.
     light_mask, dark_mask, bg_mask = _board_colour_masks(image)
     integrals = {
         "light": _mask_integral(light_mask),
         "dark": _mask_integral(dark_mask),
         "bg": _mask_integral(bg_mask),
     }
-    candidates = _board_candidate_rects(bg_mask)
-    if not candidates:
-        return None
-
-    geometry_scored = []
-    for rect in candidates:
-        metrics = _board_geometry_score(rect, integrals)
-        if metrics["parity"] >= 0.35 and metrics["coverage"] >= 0.15:
-            geometry_scored.append((metrics["score"], rect))
-    if not geometry_scored:
-        return None
-    geometry_scored.sort(key=lambda item: item[0], reverse=True)
 
     refined_rects = []
-    for _score, rect in geometry_scored[:3]:
-        refined = _refine_board_rect(rect, integrals, image_w, image_h)
-        if refined not in refined_rects:
-            refined_rects.append(refined)
+    if sb_detection is not None:
+        sb_rect = sb_detection["board_rect"]
+        colour_refined_rect = _refine_board_rect(
+            sb_rect, integrals, image_w, image_h
+        )
+        for rect in (sb_rect, colour_refined_rect):
+            if rect not in refined_rects:
+                refined_rects.append(rect)
+    else:
+        candidates = _board_candidate_rects(bg_mask)
+        if not candidates:
+            return None
+
+        geometry_scored = []
+        for rect in candidates:
+            metrics = _board_geometry_score(rect, integrals)
+            if metrics["parity"] >= 0.35 and metrics["coverage"] >= 0.15:
+                geometry_scored.append((metrics["score"], rect))
+        if not geometry_scored:
+            return None
+        geometry_scored.sort(key=lambda item: item[0], reverse=True)
+
+        for _score, rect in geometry_scored[:3]:
+            refined = _refine_board_rect(rect, integrals, image_w, image_h)
+            if refined not in refined_rects:
+                refined_rects.append(refined)
 
     expected = expected_anchors or _expected_anchor_symbols()
 
@@ -6243,11 +6467,46 @@ def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
         for rect in refined_rects
     ]
     best = max(scored, key=lambda item: item["score"])
-    if best["parity"] < 0.55 or best["coverage"] < 0.30:
+
+    # A validated SB corner grid is itself geometric evidence of a board,
+    # including one whose square colours are outside the two supported
+    # palettes. Do not discard it solely for low supported-colour metrics.
+    # Colour-fallback candidates retain their original acceptance gate.
+    if sb_detection is None and (
+        best["parity"] < 0.55 or best["coverage"] < 0.30
+    ):
         return None
     best["expected_anchors"] = expected
     best["image_size"] = (image_w, image_h)
     palette = _board_palette_for_rect(image, best["board_rect"])
+    if sb_detection is not None:
+        raw_sb_rect = sb_detection["board_rect"]
+        best["board_detection_method"] = sb_detection["method"]
+        best["board_sb_rect"] = raw_sb_rect
+        best["board_sb_corners"] = sb_detection["corners"]
+        best["board_sb_pattern_size"] = sb_detection["pattern_size"]
+        best["board_sb_cell_size"] = sb_detection["cell_size"]
+        best["board_sb_grid_error"] = sb_detection["grid_error"]
+        best["board_sb_max_grid_error"] = sb_detection["max_grid_error"]
+        best["board_sb_preprocessing"] = sb_detection.get(
+            "preprocessing", "none"
+        )
+        best["board_colour_refined"] = best["board_rect"] != raw_sb_rect
+        palette_supported = (
+            palette.get("coverage", 0.0) >= 0.30
+            and palette.get("parity", 0.0) >= 0.55
+        )
+        if not palette_supported:
+            palette = {
+                "id": "unknown",
+                "name": "Unknown",
+                "coverage": float(palette.get("coverage", 0.0)),
+                "parity": float(palette.get("parity", 0.0)),
+                "score": float(palette.get("score", 0.0)),
+            }
+    else:
+        best["board_detection_method"] = "colour_fallback"
+        best["board_colour_refined"] = True
     best["board_palette"] = palette
     best["board_palette_id"] = palette.get("id", "chesscom")
     best["board_palette_name"] = palette.get("name", "Chess.com")
@@ -8326,6 +8585,13 @@ def _board_detection_summary(result):
         f"{_anchor_summary(anchors.get('top_left'))}; "
         f"{_anchor_summary(anchors.get('bottom_right'))}."
     )
+    detection_method = str(
+        result.get("board_detection_method", "") or ""
+    ).strip()
+    if detection_method == "opencv_findChessboardCornersSB":
+        summary += " Locator: OpenCV corners."
+    elif detection_method == "colour_fallback":
+        summary += " Locator: colour fallback."
     palette_name = str(result.get("board_palette_name", "") or "").strip()
     if not palette_name and isinstance(result.get("board_palette"), dict):
         palette_name = str(result["board_palette"].get("name", "") or "").strip()
@@ -8379,9 +8645,9 @@ def _board_detection_worker(window_info, use_package=None):
         )
         if detection is None:
             board_detection_error = (
-                "No supported 8x8 board found in that window (Chess.com "
-                "or Basic/Lichess colours). Make sure the full board is "
-                "visible and try again."
+                "No 8x8 board found in that window (OpenCV corners or "
+                "Chess.com/Basic-Lichess colour fallback). Make sure the "
+                "full board is visible and try again."
             )
             board_detection_last_summary = board_detection_error
             return
@@ -8626,9 +8892,9 @@ def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
         )
         if detection is None:
             raise RuntimeError(
-                "No supported 8x8 board found in that window (Chess.com "
-                "or Basic/Lichess colours). Make sure the full board is "
-                "visible and try again."
+                "No 8x8 board found in that window (OpenCV corners or "
+                "Chess.com/Basic-Lichess colour fallback). Make sure the "
+                "full board is visible and try again."
             )
         board_rect = detection["board_rect"]
         detection["window"] = dict(window_info)
@@ -9014,9 +9280,9 @@ def _advisor_scan_worker(window_info, side, scan_id, use_package=None):
         )
         if detection is None:
             raise RuntimeError(
-                "No supported 8x8 board found in that window (Chess.com "
-                "or Basic/Lichess colours). Make sure the full board is "
-                "visible and try again."
+                "No 8x8 board found in that window (OpenCV corners or "
+                "Chess.com/Basic-Lichess colour fallback). Make sure the "
+                "full board is visible and try again."
             )
         board_rect = detection["board_rect"]
         detection["window"] = dict(window_info)

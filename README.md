@@ -37,7 +37,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 
 ### Board vision, Advisor & Auto-play
 - **Advisor Mode:** the compact toggle at the top of **Analysis Settings** asks for the window to broadcast on, asks which side you are playing, then scans/imports that board without ever clicking or dragging in the target window. Its `cliv-gui` `ProcessOverlay` runs in an isolated child process whose main thread owns Tk, follows the exact selected window, outlines Stockfish's current best-move origin in **red** and destination in **blue**, and shows a live `Eval · Depth · Best` readout directly under the board. Advisor polls every 0.25s but suppresses screenshots while a mouse button that was pressed in the target remains held, waits briefly after release, and only then checks for a unique 0/1/2-ply board sync. Checkmate (and other terminal results) turns Advisor fully off and forgets the window, so turning it on again asks for a window again. Advisor is session-only and cannot run at the same time as Auto-play
-- **Board Detection / Auto-play palettes:** board location accepts Chess.com (`#ebecd0` / `#739552`) and Basic/Lichess (`#f0d9b5` / `#b58863`) square colours; the detection summary names the palette that matched, while the selected CNN/package recogniser still classifies the located board
+- **Board Detection / Auto-play locator:** board location first uses OpenCV `cv2.findChessboardCornersSB` to find the 7×7 internal corners of an 8×8 board. If OpenCV finds no usable corner grid, ChessBotV falls back to the Chess.com (`#ebecd0` / `#739552`) and Basic/Lichess (`#f0d9b5` / `#b58863`) square-colour search. The detection summary names the locator (and palette when known), while the selected CNN/package recogniser still classifies the located board
 - **Auto-play finish + F8:** when a verified Auto-play move ends the game (including checkmate), Auto-play turns itself fully off and waits. **F8** is the universal Auto-play toggle — it stops an active setup/scan/game, rescans the retained window/side after a finished game, or starts the normal setup flow when no reusable session exists
 - **Non-blocking external drag:** focusing the target window and dragging/promotion-clicking runs on a cancellable background thread, so ChessBotV keeps rendering and responding (including to F8) while Always on Top is enabled; screenshot verification and the one-drag retry still happen on the GUI thread
 - **Auto-play depth:** the stepper inside the Auto-play card saves `autoplay_depth` (`1-40`, default `20`). Auto-play drags when the shared search reaches that depth, capped by the current Depth Limit (shown as `chosen>effective` when capped)
@@ -65,6 +65,12 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 
   ```bash
   pip install pygame python-chess
+  ```
+
+- **Board Detection / Auto-play / Advisor screenshots:** OpenCV and NumPy locate the external board (OpenCV corners first, then the colour fallback) before the selected recogniser classifies it:
+
+  ```bash
+  pip install opencv-python numpy
   ```
 
 - **Optional package recogniser:** only needed when **Analysis → Use Package** is on. ChessBotV imports it lazily for a Board Detection/Auto-play vision operation, so its TensorFlow/scikit-image dependencies are not needed for normal play or for the built-in CNN path:
