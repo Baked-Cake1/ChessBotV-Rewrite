@@ -21,8 +21,25 @@ except ImportError:  # The non-GUI dataset helpers remain importable.
 
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "datasets"
-# Kept as a descriptive alias for the new folder-based dataset root.
+# Kept as a descriptive alias for the folder-based dataset root.
 OUTPUT_DIR = DATASET_DIR
+TRAINING_FOLDER_NAME = "training"
+VALIDATION_FOLDER_NAME = "validation"
+DATASET_SPLIT_NAMES = (TRAINING_FOLDER_NAME, VALIDATION_FOLDER_NAME)
+DATASET_SPLIT_FOLDER_TO_SPLIT = {
+    "training": TRAINING_FOLDER_NAME,
+    "train": TRAINING_FOLDER_NAME,
+    "validation": VALIDATION_FOLDER_NAME,
+    "valid": VALIDATION_FOLDER_NAME,
+    "val": VALIDATION_FOLDER_NAME,
+    # There is no separate test export any more; old test folders are read
+    # as validation data so their images are not silently ignored.
+    "test": VALIDATION_FOLDER_NAME,
+    "testing": VALIDATION_FOLDER_NAME,
+}
+TRAINING_WEIGHT = 0.80
+VALIDATION_WEIGHT = 0.20
+EXPORT_SPLIT_SEED = 42
 BOARDS_DIR = DATASET_DIR / "_boards"
 METADATA_CSV = DATASET_DIR / "metadata.csv"
 LEGACY_DATASET_DIR = BASE_DIR / "board_debug"
@@ -95,18 +112,12 @@ FEN_SYMBOL_BY_CODE = {
     "bp": "p",
     "blank": ".",
 }
-SQUARE_TYPE_OPTIONS = (
-    ("light", "Light square"),
-    ("dark", "Dark square"),
-    ("highlighted", "Highlighted square"),
-)
-SQUARE_TYPE_DISPLAY = dict(SQUARE_TYPE_OPTIONS)
 METADATA_FIELDS = (
     "image_path",
     "filename",
     "label",
     "label_code",
-    "square_type",
+    "split",
     "row",
     "col",
     "source_image",
@@ -120,7 +131,6 @@ METADATA_FIELDS = (
 )
 # Compatibility alias for callers that used the old master-CSV field name.
 CSV_FIELDS = METADATA_FIELDS
-BALANCE_TOLERANCE = 2
 
 
 def _clean_input_path(value):
@@ -251,6 +261,25 @@ def dataset_game_counts(records):
     return {record_game_id(record) for record in records}
 
 
+def _answer_label_option(answer):
+    """Return a label option from a new answer or an old answer tuple.
+
+    New manual-review answers are simply label-option tuples. Older callers
+    used ``(label_option, square_type)``; accepting that shape here keeps
+    FEN generation and saving tolerant of legacy in-memory callers while the
+    GUI itself no longer asks for a square type.
+    """
+    if answer is None:
+        return None
+    if (
+        isinstance(answer, tuple)
+        and len(answer) == 2
+        and isinstance(answer[0], tuple)
+    ):
+        return answer[0]
+    return answer
+
+
 def _fen_castling_rights(board_grid):
     """Best-effort FEN castling field from home king/rook squares."""
     rights = ""
@@ -284,10 +313,11 @@ def fen_from_answers(tile_entries, answers, flipped=False):
         raise ValueError("Every tile must have a classification before FEN generation")
 
     visual_grid = [["."] * 8 for _ in range(8)]
-    for (row, col, _tile), (label_option, _square_type) in zip(tile_entries, answers):
+    for (row, col, _tile), answer in zip(tile_entries, answers):
         if not (0 <= row < 8 and 0 <= col < 8):
             continue
-        symbol = FEN_SYMBOL_BY_CODE.get(label_option[0], ".")
+        label_option = _answer_label_option(answer)
+        symbol = FEN_SYMBOL_BY_CODE.get(label_option[0], ".") if label_option else "."
         visual_grid[row][col] = symbol
 
     if flipped:
@@ -391,15 +421,37 @@ def canonical_tile_array(tile, size=CANONICAL_TILE_SIZE):
 
 
 def ensure_dataset_layout(dataset_dir=DATASET_DIR):
-    """Create ``datasets/`` and one folder for every CNN class."""
+    """Create the training/validation class-folder layout if needed.
+
+    The export layout is::
+
+        datasets/
+          training/<each of the 13 classes>/
+          validation/<each of the 13 classes>/
+          _boards/
+
+    Existing direct ``datasets/<class>/`` folders from the previous layout
+    are left untouched and are still scanned for duplicate checks/trainer
+    fallback, but new exports are written only below training/validation.
+    """
     dataset_dir = Path(dataset_dir)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     (dataset_dir / "_boards").mkdir(parents=True, exist_ok=True)
-    for _code, label, _display in LABEL_OPTIONS:
-        (dataset_dir / CLASS_FOLDER_BY_LABEL[label]).mkdir(
-            parents=True, exist_ok=True
-        )
+    for split_name in DATASET_SPLIT_NAMES:
+        split_dir = dataset_dir / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for _code, label, _display in LABEL_OPTIONS:
+            (split_dir / CLASS_FOLDER_BY_LABEL[label]).mkdir(
+                parents=True, exist_ok=True
+            )
     return dataset_dir
+
+
+def _split_class_dir(dataset_dir, split_name, label):
+    """Physical class folder for one exported training/validation image."""
+    if split_name not in DATASET_SPLIT_NAMES:
+        raise ValueError(f"Unsupported dataset split folder: {split_name}")
+    return Path(dataset_dir) / split_name / CLASS_FOLDER_BY_LABEL[label]
 
 
 def _class_folder_label(folder_name):
@@ -408,12 +460,11 @@ def _class_folder_label(folder_name):
 
 
 def _parse_tile_filename(path):
-    """Best-effort label-code/square/game/row/col data from a tile name."""
+    """Best-effort label-code/game/row/col data from a tile name."""
     path = Path(path)
     stem = path.stem
     parsed = {
         "label_code": "",
-        "square_type": "",
         "game_id": "",
         "row": "",
         "col": "",
@@ -424,10 +475,6 @@ def _parse_tile_filename(path):
     first_parts = first.split("_")
     if first_parts and first_parts[0].lower() in LABEL_OPTION_BY_CODE:
         parsed["label_code"] = first_parts[0].lower()
-    for part in first_parts[1:]:
-        if part.lower() in SQUARE_TYPE_DISPLAY:
-            parsed["square_type"] = part.lower()
-            break
 
     for section in sections[1:]:
         if section.lower().startswith("game_") or section.lower().startswith("game-"):
@@ -437,12 +484,6 @@ def _parse_tile_filename(path):
             if match:
                 parsed["row"], parsed["col"] = match.groups()
 
-    if not parsed["square_type"]:
-        tokens = [token.lower() for token in re.split(r"[^A-Za-z]+", stem)]
-        for token in tokens:
-            if token in SQUARE_TYPE_DISPLAY:
-                parsed["square_type"] = token
-                break
     if not parsed["game_id"]:
         match = re.search(r"(game[_-][A-Za-z0-9_.-]+?)(?:__|$)", stem)
         if match:
@@ -455,26 +496,24 @@ def _parse_tile_filename(path):
 
 
 def scan_dataset_records(dataset_dir=DATASET_DIR):
-    """Scan ``datasets/<class>/`` folders into trainer-style records.
+    """Scan training/validation class folders into trainer-style records.
 
-    The folder is authoritative for the label; board-vision filenames also
-    carry the square type, game ID, and board row/column. Manually added
-    images are accepted too, with any missing metadata left blank.
+    The class folder is authoritative for the label and the parent split
+    folder is authoritative for ``split``. Direct ``datasets/<class>/``
+    folders from the previous layout are also scanned as ``unsplit`` so
+    their pixels still participate in duplicate checks and can be used as a
+    trainer fallback. Board-vision filenames carry the game ID and row/col;
+    manually added images are accepted with missing metadata left blank.
     """
     dataset_dir = Path(dataset_dir)
     records = []
     if not dataset_dir.is_dir():
         return records
 
-    for folder in sorted(
-        (item for item in dataset_dir.iterdir() if item.is_dir()),
-        key=lambda item: item.name.lower(),
-    ):
-        if folder.name.startswith("_"):
-            continue
+    def add_class_folder(folder, split_name):
         label = _class_folder_label(folder.name)
         if label is None:
-            continue
+            return
         default_code = CODE_BY_LABEL[label]
         for path in sorted(folder.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
@@ -488,8 +527,7 @@ def scan_dataset_records(dataset_dir=DATASET_DIR):
                 "filename": path.name,
                 "label": label,
                 "label_code": label_code,
-                "square_type": parsed["square_type"],
-                "split": "unsplit",
+                "split": split_name,
                 "row": parsed["row"],
                 "col": parsed["col"],
                 "source_image": "",
@@ -497,6 +535,22 @@ def scan_dataset_records(dataset_dir=DATASET_DIR):
                 "game_id": parsed["game_id"] or "manually-added",
                 "path": path,
             })
+
+    for folder in sorted(
+        (item for item in dataset_dir.iterdir() if item.is_dir()),
+        key=lambda item: item.name.lower(),
+    ):
+        if folder.name.startswith(("_", ".")):
+            continue
+        split_name = DATASET_SPLIT_FOLDER_TO_SPLIT.get(folder.name.strip().lower())
+        if split_name is not None:
+            for class_folder in sorted(
+                (item for item in folder.iterdir() if item.is_dir()),
+                key=lambda item: item.name.lower(),
+            ):
+                add_class_folder(class_folder, split_name)
+        else:
+            add_class_folder(folder, "unsplit")
     return records
 
 
@@ -505,12 +559,51 @@ def load_dataset_records(dataset_dir=DATASET_DIR):
     return scan_dataset_records(dataset_dir)
 
 
+def _metadata_split_from_path(value):
+    """Physical split represented by a metadata image path, if any."""
+    parts = {part.strip().lower() for part in Path(str(value)).parts}
+    for folder_name, split_name in DATASET_SPLIT_FOLDER_TO_SPLIT.items():
+        if folder_name in parts:
+            return split_name
+    return "unsplit"
+
+
+def _ensure_metadata_schema(metadata_path):
+    """Migrate an older metadata.csv header to the current field layout."""
+    metadata_path = Path(metadata_path)
+    if not metadata_path.is_file() or metadata_path.stat().st_size == 0:
+        return
+    with metadata_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) == METADATA_FIELDS:
+            return
+        old_rows = list(reader)
+
+    migrated_rows = []
+    for old_row in old_rows:
+        row = {field: old_row.get(field, "") or "" for field in METADATA_FIELDS}
+        if not row["split"]:
+            old_split = str(old_row.get("split") or "").strip().lower()
+            row["split"] = DATASET_SPLIT_FOLDER_TO_SPLIT.get(
+                old_split, _metadata_split_from_path(row["image_path"])
+            )
+        migrated_rows.append(row)
+
+    temporary = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=METADATA_FIELDS)
+        writer.writeheader()
+        writer.writerows(migrated_rows)
+    temporary.replace(metadata_path)
+
+
 def append_metadata_records(records, dataset_dir=DATASET_DIR):
     """Append board-review provenance/duplicate outcomes to metadata.csv."""
     if not records:
         return Path(dataset_dir) / "metadata.csv"
     dataset_dir = ensure_dataset_layout(dataset_dir)
     metadata_path = Path(dataset_dir) / "metadata.csv"
+    _ensure_metadata_schema(metadata_path)
     write_header = not metadata_path.is_file() or metadata_path.stat().st_size == 0
     with metadata_path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=METADATA_FIELDS)
@@ -521,14 +614,21 @@ def append_metadata_records(records, dataset_dir=DATASET_DIR):
     return metadata_path
 
 
-def dataset_balance(records, tolerance=BALANCE_TOLERANCE):
-    """Per-class light/dark/highlighted counts and imbalance details.
+def _normalise_record_split(record):
+    """Physical split name for a scanned record, including old aliases."""
+    split = str(record.get("split", "") or "").strip().lower()
+    return DATASET_SPLIT_FOLDER_TO_SPLIT.get(split, "other")
 
-    Highlighted squares are reported but excluded from the light-vs-dark
-    tolerance check, as requested.
-    """
+
+def dataset_split_counts(records):
+    """Per-class training/validation/other image counts."""
     counts = {
-        label: {"light": 0, "dark": 0, "highlighted": 0, "unknown": 0, "total": 0}
+        label: {
+            TRAINING_FOLDER_NAME: 0,
+            VALIDATION_FOLDER_NAME: 0,
+            "other": 0,
+            "total": 0,
+        }
         for _code, label, _display in LABEL_OPTIONS
     }
     for record in records:
@@ -536,56 +636,110 @@ def dataset_balance(records, tolerance=BALANCE_TOLERANCE):
         if label not in counts:
             continue
         counts[label]["total"] += 1
-        square_type = record.get("square_type", "")
-        if square_type in ("light", "dark", "highlighted"):
-            counts[label][square_type] += 1
-        else:
-            counts[label]["unknown"] += 1
+        counts[label][_normalise_record_split(record)] += 1
+    return counts
 
-    imbalanced = {}
-    for label, values in counts.items():
-        if abs(values["light"] - values["dark"]) > tolerance:
-            imbalanced[label] = dict(values)
-    return counts, imbalanced
+
+def _target_validation_count(total):
+    """Cumulative validation target for one class at an 80/20 export ratio.
+
+    A class with at least two unique images gets one validation example as
+    soon as possible; after that the count follows the weighted 20% target.
+    This keeps the long-run ratio at 80/20 without leaving every small class
+    absent from validation during the first screenshots.
+    """
+    total = max(0, int(total))
+    if total < 2:
+        return 0
+    return max(1, int(round(total * VALIDATION_WEIGHT)))
+
+
+def _assign_export_splits(candidates, existing_records):
+    """Assign unique export candidates to training/validation folders.
+
+    ``candidates`` are dictionaries containing at least ``label`` and a
+    stable ``split_key``. Assignment is deterministic, uses the existing
+    physical folder counts, and is stratified by class. The returned list is
+    aligned with ``candidates`` and contains ``training``/``validation``.
+    """
+    counts = dataset_split_counts(existing_records)
+    assignments = [TRAINING_FOLDER_NAME] * len(candidates)
+
+    # Decide in a stable pseudo-random order within each class so board
+    # position/import order does not determine which examples validate.
+    assignment_order = sorted(
+        range(len(candidates)),
+        key=lambda candidate_index: (
+            str(candidates[candidate_index].get("label", "")),
+            hashlib.sha256(
+                (
+                    f"{EXPORT_SPLIT_SEED}:"
+                    f"{candidates[candidate_index].get('label', '')}:"
+                    f"{candidates[candidate_index].get('split_key', candidate_index)}"
+                ).encode("utf-8")
+            ).hexdigest(),
+        ),
+    )
+
+    for candidate_index in assignment_order:
+        label = candidates[candidate_index].get("label", "")
+        values = counts.setdefault(
+            label,
+            {
+                TRAINING_FOLDER_NAME: 0,
+                VALIDATION_FOLDER_NAME: 0,
+                "other": 0,
+                "total": 0,
+            },
+        )
+        physical_total = values[TRAINING_FOLDER_NAME] + values[VALIDATION_FOLDER_NAME]
+        desired_validation = _target_validation_count(physical_total + 1)
+        split_name = (
+            VALIDATION_FOLDER_NAME
+            if values[VALIDATION_FOLDER_NAME] < desired_validation
+            else TRAINING_FOLDER_NAME
+        )
+        assignments[candidate_index] = split_name
+        values[split_name] += 1
+        values["total"] += 1
+    return assignments
 
 
 def print_dataset_report(records, dataset_dir=DATASET_DIR):
-    """Print class-folder totals and the light/dark balance report."""
+    """Print training/validation totals for the physical folder dataset."""
+    counts = dataset_split_counts(records)
+    training_total = sum(
+        values[TRAINING_FOLDER_NAME] for values in counts.values()
+    )
+    validation_total = sum(
+        values[VALIDATION_FOLDER_NAME] for values in counts.values()
+    )
+    other_total = sum(values["other"] for values in counts.values())
     total_games = len(dataset_game_counts(records))
+
     print(f"\nDataset folder: {Path(dataset_dir).resolve()}")
-    print(f"Total unique labelled images in class folders: {len(records)}")
+    print(f"Total unique labelled images found: {len(records)}")
+    print(f"Training folder images:   {training_total}")
+    print(f"Validation folder images: {validation_total}")
+    if other_total:
+        print(f"Other/legacy unsplit images: {other_total}")
     print(f"Total game IDs: {total_games}")
     print(
-        "Training split: cnn_trainer.py will read these same class folders "
-        "and create its training/validation/test split internally."
+        "New unique exports are weighted 80% training / 20% validation. "
+        "cnn_trainer.py trains from datasets/training and evaluates on "
+        "datasets/validation."
     )
 
-    counts, imbalanced = dataset_balance(records)
-    print("\nPer-class square counts (highlighted is excluded from balance):")
+    print("\nPer-class folder counts:")
     for _code, label, display in LABEL_OPTIONS:
         values = counts[label]
-        difference = abs(values["light"] - values["dark"])
-        marker = "  <-- needs balancing" if label in imbalanced else ""
         print(
             f"  {display:15s}: total={values['total']:4d}, "
-            f"light={values['light']:4d}, dark={values['dark']:4d}, "
-            f"highlighted={values['highlighted']:4d}, "
-            f"unknown={values['unknown']:4d}, "
-            f"light/dark difference={difference}{marker}"
+            f"training={values[TRAINING_FOLDER_NAME]:4d}, "
+            f"validation={values[VALIDATION_FOLDER_NAME]:4d}, "
+            f"other={values['other']:4d}"
         )
-
-    if imbalanced:
-        print(
-            f"\nBalance requirement not met: light and dark counts for each "
-            f"class must differ by at most {BALANCE_TOLERANCE}."
-        )
-        for label, values in sorted(imbalanced.items()):
-            needed_type = "light" if values["light"] < values["dark"] else "dark"
-            needed = abs(values["light"] - values["dark"]) - BALANCE_TOLERANCE
-            print(f"  {label}: add at least {needed} more {needed_type}-square image(s).")
-    else:
-        print("\nLight/dark balance requirement met for every class.")
-    return counts, imbalanced
+    return counts
 
 
 def _next_dataset_sequence(existing_records, dataset_dir=DATASET_DIR):
@@ -668,12 +822,12 @@ def _is_near_duplicate(mean_abs_error, changed_fraction, ahash_distance):
 
 
 class DuplicateIndex:
-    """Exact/near duplicate index over every image in the class folders.
+    """Exact/near duplicate index over every image in the dataset folders.
 
-    The index intentionally searches across *all* classes and square types:
-    an exact/near pixel match under another label is a conflicting training
-    example, not a useful new one. Board-vision reports such a match as
-    soon as the user marks the piece and does not save the duplicate.
+    The index intentionally searches across *all* classes and both physical
+    splits: an exact/near pixel match under another label is a conflicting
+    training example, not a useful new one. Board-vision reports such a
+    match as soon as the user marks the piece and does not save it.
     """
 
     def __init__(self, dataset_dir=DATASET_DIR, records=None):
@@ -696,7 +850,7 @@ class DuplicateIndex:
                     _load_rgb_image(path),
                     label=record.get("label", ""),
                     label_code=record.get("label_code", ""),
-                    square_type=record.get("square_type", ""),
+                    split=_normalise_record_split(record),
                     path=path,
                     source="datasets folder",
                 )
@@ -718,10 +872,10 @@ class DuplicateIndex:
         self,
         tile,
         label_option=None,
-        square_type="",
         *,
         label="",
         label_code="",
+        split="",
         path=None,
         source="current board",
     ):
@@ -732,7 +886,7 @@ class DuplicateIndex:
             "path": path,
             "label": label,
             "label_code": label_code,
-            "square_type": square_type or "",
+            "split": split or "",
             "source": source,
             "exact_hash": _exact_tile_hash(canonical),
             "average_hash": _average_hash(canonical),
@@ -759,7 +913,7 @@ class DuplicateIndex:
             tile,
             label=record.get("label", ""),
             label_code=record.get("label_code", ""),
-            square_type=record.get("square_type", ""),
+            split=_normalise_record_split(record),
             path=path,
             source="datasets folder",
         )
@@ -773,25 +927,24 @@ class DuplicateIndex:
             "path": str(path) if path is not None else entry.get("source", "current board"),
             "label": entry.get("label", ""),
             "label_code": entry.get("label_code", ""),
-            "square_type": entry.get("square_type", ""),
+            "split": entry.get("split", ""),
             "source": entry.get("source", ""),
             "mean_abs_error": float(mean_abs_error),
             "changed_fraction": float(changed_fraction),
             "average_hash_distance": int(ahash_distance),
         }
 
-    def find_duplicate(self, tile, label_option=None, square_type="", extra_entries=()):
+    def find_duplicate(self, tile, label_option=None, extra_entries=()):
         """Return an exact/near duplicate report for ``tile``, or None.
 
-        ``label_option`` and ``square_type`` describe the user's new mark for
-        API clarity; matching itself is pixel-based across every class.
-        ``extra_entries`` are unique tiles already accepted from the board
-        currently being reviewed but not saved to disk yet.
+        ``label_option`` describes the user's new mark for API clarity;
+        matching itself is pixel-based across every class and both physical
+        dataset splits. ``extra_entries`` are unique tiles already accepted
+        from the board currently being reviewed but not saved to disk yet.
         """
         candidate = self.make_entry(
             tile,
             label_option=label_option,
-            square_type=square_type,
             path=None,
             source="candidate",
         )
@@ -848,10 +1001,10 @@ def duplicate_message(report):
         return ""
     kind = "exact-pixel" if report.get("kind") == "exact" else "near-duplicate"
     existing_label = report.get("label") or "an existing class"
-    square = report.get("square_type") or "unknown square type"
+    split_name = report.get("split") or "the dataset"
     return (
         f"DUPLICATE ({kind}) — not saved. It matches {existing_label} "
-        f"({square}) at {report.get('path', 'an existing tile')}. "
+        f"in {split_name} at {report.get('path', 'an existing tile')}. "
         "Duplicate images make CNN training slower and can make the model "
         "faulty/over-confident, so only the first unique copy is kept."
     )
@@ -867,15 +1020,17 @@ def save_labelled_tiles(
     duplicate_index=None,
     dataset_dir=DATASET_DIR,
 ):
-    """Save unique reviewed tiles into ``datasets/<class>/`` folders.
+    """Save unique reviewed tiles into the training/validation folders.
 
     Returns ``(saved_records, skipped_duplicate_records)``. A tile already
     reported as a duplicate during manual review is not written. As a final
-    safety check, every other tile is checked again against the folders and
-    against unique tiles saved earlier from this same board.
+    safety check, every other tile is checked again against both physical
+    dataset folders and against unique tiles accepted earlier from this
+    same board. Unique tiles are then assigned deterministically, per
+    class, at the weighted 80% training / 20% validation export ratio.
     """
     if len(tile_entries) != len(answers):
-        raise ValueError("Every tile must have a manual label and square type")
+        raise ValueError("Every tile must have a manual label")
     if duplicate_reports is not None and len(duplicate_reports) != len(answers):
         raise ValueError("Every tile must have a duplicate-check result")
 
@@ -888,18 +1043,25 @@ def save_labelled_tiles(
     saved_records = []
     skipped_records = []
     metadata_records = []
+    unique_candidates = []
+    unique_entries = []
     game_id = game_id or board_id
 
-    for tile_index, ((row, col, tile), (label_option, square_type)) in enumerate(
+    for tile_index, ((row, col, tile), answer) in enumerate(
         zip(tile_entries, answers)
     ):
+        label_option = _answer_label_option(answer)
+        if label_option is None:
+            raise ValueError("Every tile must have a manual label")
         label_code, label, _display = label_option
         report = None
         if duplicate_reports is not None:
             report = duplicate_reports[tile_index]
         if report is None:
             report = duplicate_index.find_duplicate(
-                tile, label_option=label_option, square_type=square_type
+                tile,
+                label_option=label_option,
+                extra_entries=unique_entries,
             )
 
         metadata = {
@@ -907,7 +1069,7 @@ def save_labelled_tiles(
             "filename": "",
             "label": label,
             "label_code": label_code,
-            "square_type": square_type,
+            "split": "",
             "row": str(row),
             "col": str(col),
             "source_image": _path_for_csv(source_image),
@@ -933,10 +1095,43 @@ def save_labelled_tiles(
             metadata_records.append(metadata)
             continue
 
-        class_dir = dataset_dir / CLASS_FOLDER_BY_LABEL[label]
+        # Keep the metadata object in board order now, but defer the
+        # physical write until every unique tile on this board is known.
+        # That lets the 80/20 assignment consider the complete export
+        # batch rather than whichever tile happened to be reviewed first.
+        entry = duplicate_index.make_entry(
+            tile,
+            label_option=label_option,
+            source=f"current board square r{row} c{col}",
+        )
+        unique_entries.append(entry)
+        unique_candidates.append({
+            "tile_index": tile_index,
+            "row": row,
+            "col": col,
+            "tile": tile,
+            "label": label,
+            "label_code": label_code,
+            "metadata": metadata,
+            "split_key": (
+                f"{game_id}:{entry['exact_hash']}:r{row}c{col}"
+            ),
+        })
+        metadata_records.append(metadata)
+
+    assignments = _assign_export_splits(unique_candidates, existing)
+    for candidate, split_name in zip(unique_candidates, assignments):
+        row = candidate["row"]
+        col = candidate["col"]
+        tile = candidate["tile"]
+        label = candidate["label"]
+        label_code = candidate["label_code"]
+        metadata = candidate["metadata"]
+
+        class_dir = _split_class_dir(dataset_dir, split_name, label)
         while True:
             filename = (
-                f"{label_code}_{square_type}__{game_id}__"
+                f"{label_code}__{game_id}__"
                 f"r{row}c{col}__{sequence:06d}.png"
             )
             image_path = class_dir / filename
@@ -948,13 +1143,12 @@ def save_labelled_tiles(
         metadata.update({
             "image_path": _path_for_csv(image_path),
             "filename": filename,
+            "split": split_name,
             "saved": "1",
         })
         record = dict(metadata)
-        record["split"] = "unsplit"
         record["path"] = image_path
         saved_records.append(record)
-        metadata_records.append(metadata)
         duplicate_index.add_saved(record, tile)
 
     append_metadata_records(metadata_records, dataset_dir)
@@ -1007,11 +1201,6 @@ def load_legacy_records(csv_path=LEGACY_DATASET_CSV, legacy_dir=LEGACY_DATASET_D
         label_option = LABEL_OPTION_BY_LABEL[label]
         label_code = label_option[0]
 
-        square_type = str(row.get("square_type") or "").strip().lower()
-        if square_type not in SQUARE_TYPE_DISPLAY:
-            parsed = _parse_tile_filename(image_value)
-            square_type = parsed["square_type"] or "light"
-
         image_path = _resolve_legacy_image_path(image_value, csv_path, legacy_dir)
         game_id = str(
             row.get("game_id")
@@ -1024,7 +1213,6 @@ def load_legacy_records(csv_path=LEGACY_DATASET_CSV, legacy_dir=LEGACY_DATASET_D
             "label": label,
             "label_code": label_code,
             "label_option": label_option,
-            "square_type": square_type,
             "row": str(row.get("row") or "0"),
             "col": str(row.get("col") or "0"),
             "source_image": str(row.get("source_image") or image_value),
@@ -1040,13 +1228,13 @@ def import_legacy_dataset(
     dataset_dir=DATASET_DIR,
     duplicate_index=None,
 ):
-    """Copy unique old board_debug tiles into ``datasets/<class>/``.
+    """Copy unique old board_debug tiles into training/validation folders.
 
-    This is a one-time migration helper. The legacy split columns are not
-    copied: the migrated images become part of the same shared class-folder
-    source, and cnn_trainer.py derives fresh whole-game splits from the
-    preserved game IDs. Exact/near duplicates—including duplicates already
-    inside the old dataset—are reported in the summary/metadata and skipped.
+    This is a one-time migration helper. Imported unique tiles use the same
+    deterministic per-class 80% training / 20% validation assignment as a
+    newly reviewed board. Exact/near duplicates—including duplicates
+    already inside the old dataset—are reported in the summary/metadata and
+    skipped.
     """
     legacy_dir = Path(legacy_dir)
     csv_path = Path(csv_path) if csv_path is not None else legacy_dir / "dataset.csv"
@@ -1061,18 +1249,19 @@ def import_legacy_dataset(
     skipped_records = []
     missing_records = []
     metadata_records = []
+    unique_candidates = []
+    unique_entries = []
 
     print(f"\nImporting {len(legacy_records)} legacy row(s) from {csv_path}...")
     for legacy in legacy_records:
         label_option = legacy["label_option"]
         label_code, label, _display = label_option
-        square_type = legacy["square_type"]
         metadata = {
             "image_path": "",
             "filename": "",
             "label": label,
             "label_code": label_code,
-            "square_type": square_type,
+            "split": "",
             "row": legacy["row"],
             "col": legacy["col"],
             "source_image": _path_for_csv(legacy["source_image"]),
@@ -1093,7 +1282,9 @@ def import_legacy_dataset(
             continue
 
         report = duplicate_index.find_duplicate(
-            tile, label_option=label_option, square_type=square_type
+            tile,
+            label_option=label_option,
+            extra_entries=unique_entries,
         )
         if report is not None:
             metadata.update({
@@ -1114,10 +1305,43 @@ def import_legacy_dataset(
         except (TypeError, ValueError):
             row = col = 0
         safe_game_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(legacy["game_id"]))
-        class_dir = dataset_dir / CLASS_FOLDER_BY_LABEL[label]
+
+        entry = duplicate_index.make_entry(
+            tile,
+            label_option=label_option,
+            source=f"legacy import {legacy['path']}",
+        )
+        unique_entries.append(entry)
+        unique_candidates.append({
+            "tile_index": len(unique_candidates),
+            "row": row,
+            "col": col,
+            "tile": tile,
+            "label": label,
+            "label_code": label_code,
+            "safe_game_id": safe_game_id,
+            "metadata": metadata,
+            "split_key": (
+                f"{safe_game_id}:{entry['exact_hash']}:"
+                f"r{row}c{col}:{legacy['path']}"
+            ),
+        })
+        metadata_records.append(metadata)
+
+    assignments = _assign_export_splits(unique_candidates, existing)
+    for candidate, split_name in zip(unique_candidates, assignments):
+        row = candidate["row"]
+        col = candidate["col"]
+        tile = candidate["tile"]
+        label = candidate["label"]
+        label_code = candidate["label_code"]
+        safe_game_id = candidate["safe_game_id"]
+        metadata = candidate["metadata"]
+
+        class_dir = _split_class_dir(dataset_dir, split_name, label)
         while True:
             filename = (
-                f"{label_code}_{square_type}__{safe_game_id}__"
+                f"{label_code}__{safe_game_id}__"
                 f"r{row}c{col}__{sequence:06d}.png"
             )
             image_path = class_dir / filename
@@ -1129,13 +1353,12 @@ def import_legacy_dataset(
         metadata.update({
             "image_path": _path_for_csv(image_path),
             "filename": filename,
+            "split": split_name,
             "saved": "1",
         })
         record = dict(metadata)
-        record["split"] = "unsplit"
         record["path"] = image_path
         saved_records.append(record)
-        metadata_records.append(metadata)
         duplicate_index.add_saved(record, tile)
 
     append_metadata_records(metadata_records, dataset_dir)
@@ -1160,13 +1383,22 @@ def import_legacy_dataset(
 
 
 def run_cnn_trainer(records, dataset_dir=DATASET_DIR):
-    """Run cnn_trainer.py against the shared ``datasets/<class>/`` folders."""
-    _counts, imbalanced = dataset_balance(records)
-    if imbalanced:
-        print("\nCNN training was not started because the light/dark balance")
-        print(f"requirement (difference <= {BALANCE_TOLERANCE}) is not met yet.")
-        print("Add another screenshot and label more of the needed square colour.")
+    """Run cnn_trainer.py against the physical training/validation folders."""
+    if not records:
+        print("\nCNN training was not started because no dataset images were found.")
+        print("Review a screenshot first so unique tiles can be exported.")
         return False
+    counts = dataset_split_counts(records)
+    training_total = sum(
+        values[TRAINING_FOLDER_NAME] for values in counts.values()
+    )
+    validation_total = sum(
+        values[VALIDATION_FOLDER_NAME] for values in counts.values()
+    )
+    print(
+        f"\nDataset ready for CNN training: {training_total} training "
+        f"image(s), {validation_total} validation image(s)."
+    )
     if not CNN_TRAINER_PATH.is_file():
         print(f"Could not find CNN trainer: {CNN_TRAINER_PATH}")
         return False
@@ -1550,15 +1782,17 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
                         semi_auto_enabled=False):
     """Manually mark every tile and immediately check it for duplicates.
 
-    There are deliberately no OpenCV/model suggestions: the user first
-    clicks the piece/blank on the square, then Light, Dark, or Highlighted.
-    As soon as the piece is marked, the tile's normalised pixels are checked
-    against all existing class-folder images and unique tiles accepted
-    earlier on this board. Exact/near duplicates are announced in the GUI
-    and terminal and returned as skipped items; they are not saved.
+    There are deliberately no OpenCV/model suggestions and no separate
+    light/dark/highlighted square question: one click chooses the
+    piece/blank on each square. As soon as it is marked, the tile's
+    normalised pixels are checked against all existing training/validation
+    images and unique tiles accepted earlier on this board. Exact/near
+    duplicates are announced in the GUI and terminal and returned as
+    skipped items; they are not saved.
 
-    Returns ``(answers, duplicate_reports)``, or None if cancelled. The two
-    legacy keyword arguments are accepted and ignored for compatibility.
+    ``answers`` contains plain label-option tuples. Returns
+    ``(answers, duplicate_reports)``, or None if cancelled. The two legacy
+    keyword arguments are accepted and ignored for compatibility.
     """
     _ = (assistant, semi_auto_enabled)  # Manual marking is now always used.
     if not tile_entries:
@@ -1569,13 +1803,8 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
     duplicate_reports = [None] * len(tile_entries)
     preview_cache = {}
     index = 0
-    stage = "label"
-    selected_label = None
-    pending_duplicate = None
-    pending_duplicate_checked = False
     status_message = ""
     status_colour = (210, 225, 255)
-    duplicate_warning_printed = False
 
     def preview_surface(tile_index):
         if tile_index not in preview_cache:
@@ -1609,21 +1838,19 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
             entries.append(
                 duplicate_checker.make_entry(
                     prior_tile,
-                    label_option=answer[0],
-                    square_type=answer[1],
+                    label_option=_answer_label_option(answer),
                     source=f"current board square r{prior_row} c{prior_col}",
                 )
             )
         return entries
 
-    def check_current(label_option, square_type=""):
+    def check_current(label_option):
         if duplicate_checker is None:
             return None
         try:
             return duplicate_checker.find_duplicate(
                 tile_entries[index][2],
                 label_option=label_option,
-                square_type=square_type,
                 extra_entries=provisional_entries(),
             )
         except Exception as exc:
@@ -1644,30 +1871,18 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
 
     def make_buttons():
         buttons = []
-        if stage == "label":
-            start_x, start_y = 424, 108
-            button_w, button_h, gap = 208, 54, 12
-            for option_index, option in enumerate(LABEL_OPTIONS):
-                grid_col = option_index % 3
-                grid_row = option_index // 3
-                rect = pygame.Rect(
-                    start_x + grid_col * (button_w + gap),
-                    start_y + grid_row * (button_h + gap),
-                    button_w,
-                    button_h,
-                )
-                buttons.append((rect, "label", option))
-        else:
-            start_x, start_y = 460, 140
-            button_w, button_h, gap = 360, 68, 18
-            for option_index, (square_type, _display) in enumerate(SQUARE_TYPE_OPTIONS):
-                rect = pygame.Rect(
-                    start_x,
-                    start_y + option_index * (button_h + gap),
-                    button_w,
-                    button_h,
-                )
-                buttons.append((rect, "square", square_type))
+        start_x, start_y = 424, 108
+        button_w, button_h, gap = 208, 54, 12
+        for option_index, option in enumerate(LABEL_OPTIONS):
+            grid_col = option_index % 3
+            grid_row = option_index // 3
+            rect = pygame.Rect(
+                start_x + grid_col * (button_w + gap),
+                start_y + grid_row * (button_h + gap),
+                button_w,
+                button_h,
+            )
+            buttons.append((rect, "label", option))
 
         back_rect = pygame.Rect(424, MANUAL_H - 78, 190, 48)
         cancel_rect = pygame.Rect(630, MANUAL_H - 78, 190, 48)
@@ -1685,18 +1900,12 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
             size=27,
             bold=True,
         )
-        if stage == "label":
-            instruction = "Step 1: click the piece/blank that is on this square"
-        elif pending_duplicate is not None:
-            instruction = (
-                f"Step 2: {selected_label[2]} is a duplicate — still choose its "
-                "square type to finish marking it"
-            )
-        else:
-            instruction = (
-                f"Step 2: {selected_label[2]} - light, dark, or highlighted square?"
-            )
-        _draw_text(screen, instruction, (24, 55), size=20)
+        _draw_text(
+            screen,
+            "Click the piece/blank that is on this square",
+            (24, 55),
+            size=20,
+        )
 
         preview_rect = pygame.Rect(24, 104, MANUAL_TILE_SIZE, MANUAL_TILE_SIZE)
         screen.blit(preview_surface(index), preview_rect)
@@ -1723,22 +1932,11 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
             if kind == "label":
                 _manual_button(
                     screen, rect, f"{value[2]} ({value[0]})",
-                    selected=(selected_label == value),
                 )
-            elif kind == "square":
-                _manual_button(screen, rect, SQUARE_TYPE_DISPLAY[value])
             elif kind == "back":
                 _manual_button(screen, rect, "Back (B)")
             elif kind == "cancel":
                 _manual_button(screen, rect, "Cancel (Esc)")
-
-        if stage == "square":
-            _draw_text(
-                screen,
-                "Keys: L = Light square, D = Dark square, H = Highlighted square",
-                (430, 424),
-                size=19,
-            )
 
         if status_message:
             y = 486
@@ -1774,12 +1972,6 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
                         action = ("cancel", None)
                     elif event.key in (pygame.K_BACKSPACE, pygame.K_b):
                         action = ("back", None)
-                    elif stage == "square" and event.key == pygame.K_l:
-                        action = ("square", "light")
-                    elif stage == "square" and event.key == pygame.K_d:
-                        action = ("square", "dark")
-                    elif stage == "square" and event.key == pygame.K_h:
-                        action = ("square", "highlighted")
                 if action is not None:
                     break
 
@@ -1788,65 +1980,29 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
                 if kind == "cancel":
                     return None
                 if kind == "back":
-                    if stage == "square":
-                        stage = "label"
-                        pending_duplicate = None
-                        pending_duplicate_checked = False
-                        status_message = ""
-                    elif index > 0:
+                    if index > 0:
                         index -= 1
-                        previous = answers[index]
-                        selected_label = previous[0] if previous else None
-                        stage = "label"
-                        pending_duplicate = None
-                        pending_duplicate_checked = False
                         status_message = ""
-                elif kind == "label" and stage == "label":
-                    selected_label = value
-                    stage = "square"
-                    # Check immediately after the piece is marked, before
-                    # asking for its square type.
-                    pending_duplicate = check_current(selected_label)
-                    pending_duplicate_checked = True
-                    duplicate_warning_printed = False
-                    if pending_duplicate is not None:
-                        status_message = duplicate_message(pending_duplicate)
-                        status_colour = (255, 150, 150)
-                    else:
-                        status_message = (
-                            "No exact/near pixel duplicate found yet. Choose the "
-                            "square type to finish this unique tile."
-                        )
-                        status_colour = (170, 255, 190)
-                elif kind == "square" and stage == "square" and selected_label is not None:
-                    answers[index] = (selected_label, value)
-                    report = (
-                        pending_duplicate
-                        if pending_duplicate_checked
-                        else check_current(selected_label, value)
-                    )
+                elif kind == "label":
+                    label_option = value
+                    report = check_current(label_option)
+                    answers[index] = label_option
                     duplicate_reports[index] = report
                     row, col, _tile = tile_entries[index]
                     if report is not None:
                         status_message = duplicate_message(report)
                         status_colour = (255, 150, 150)
-                        if not duplicate_warning_printed:
-                            print(
-                                f"Duplicate at r{row} c{col}: "
-                                f"{duplicate_message(report)}"
-                            )
-                            duplicate_warning_printed = True
+                        print(
+                            f"Duplicate at r{row} c{col}: "
+                            f"{duplicate_message(report)}"
+                        )
                     else:
                         status_message = (
-                            f"Unique tile — it will be saved to "
-                            f"datasets/{selected_label[1]}/ after this board."
+                            "Unique tile — after this board it will be assigned "
+                            "to training or validation by the weighted 80/20 export."
                         )
                         status_colour = (170, 255, 190)
                     index += 1
-                    selected_label = None
-                    pending_duplicate = None
-                    pending_duplicate_checked = False
-                    stage = "label"
 
             if index >= len(tile_entries):
                 break
@@ -2036,10 +2192,11 @@ def process_image(image_path, game_id=None, duplicate_index=None,
     """Crop one screenshot, manually mark 64 squares, and save unique tiles.
 
     A new game ID is created for this upload unless one is supplied. The
-    user manually marks every piece/blank and square type; no OpenCV or
-    learned suggestion is used. Each marked tile is checked for exact/near
-    pixel duplicates in ``datasets/<class>/`` and only unique tiles are
-    saved, after the complete board has been reviewed.
+    user manually marks every piece/blank; no OpenCV or learned suggestion
+    is used. Each marked tile is checked for exact/near pixel duplicates in
+    both training and validation. After the complete board is reviewed,
+    unique tiles are physically exported with the weighted 80/20
+    training/validation split.
     """
     image_path = Path(image_path)
     dataset_dir = ensure_dataset_layout(dataset_dir)
@@ -2092,10 +2249,9 @@ def process_image(image_path, game_id=None, duplicate_index=None,
           "wheel zooms, right-drag pans, Q/ESC closes.")
     show_grid_debug(board, square_size)
 
-    print("\nManual review: mark what piece/blank is on each square, then")
-    print("confirm Light square, Dark square, or Highlighted square.")
-    print("After each piece is marked, its pixels are checked against the")
-    print("existing class folders. Duplicates are announced and skipped because")
+    print("\nManual review: mark what piece/blank is on each square.")
+    print("After each piece is marked, its pixels are checked against both")
+    print("training and validation. Duplicates are announced and skipped because")
     print("duplicate images make training slower and can make the model faulty.")
 
     review = manual_review_tiles(
@@ -2136,14 +2292,14 @@ def process_image(image_path, game_id=None, duplicate_index=None,
     print(f"Saved grid debug: {grid_path}")
     print(f"Saved FEN: {fen_path}")
     print(
-        f"Saved {len(saved_records)} unique square image(s) into class "
-        f"folders under: {Path(dataset_dir).resolve()}"
+        f"Saved {len(saved_records)} unique square image(s) into the "
+        f"training/validation class folders under: {Path(dataset_dir).resolve()}"
     )
     if skipped_records:
         print(
             f"Skipped {len(skipped_records)} duplicate square image(s). "
             "Duplicates slow CNN training and can make the model faulty, so "
-            "they were not added to the class folders."
+            "they were not added to training or validation."
         )
     else:
         print("No duplicate square images were found on this board.")
@@ -2183,13 +2339,16 @@ def _wait_ready_for_another(next_path=None):
 
 
 def main(argv=None):
-    """Build ``datasets/<class>/`` one manually marked board at a time.
+    """Build the training/validation dataset one manually marked board at a time.
 
-    Old ``--manual-only``/``--no-semi-auto`` flags are accepted but are now
+    Startup creates ``datasets/training/<class>/`` and
+    ``datasets/validation/<class>/`` when they do not exist. Old
+    ``--manual-only``/``--no-semi-auto`` flags are accepted but are now
     redundant: manual marking is the only workflow, OpenCV is not used, and
-    every marked tile is duplicate-checked before it can be saved. Use
+    every marked tile is duplicate-checked before it can be saved. Unique
+    exports are split 80% training / 20% validation. Use
     ``--import-legacy`` for a one-time duplicate-cleaning migration of an
-    old ``board_debug/dataset.csv`` dataset into the class folders.
+    old ``board_debug/dataset.csv`` dataset into those folders.
     """
     args = list(sys.argv[1:] if argv is None else argv)
     ignored_flags = {"--manual-only", "--no-semi-auto", "--semi-auto"}
@@ -2229,8 +2388,8 @@ def main(argv=None):
     duplicate_index = DuplicateIndex.load(DATASET_DIR)
     print(f"Dataset folder: {DATASET_DIR.resolve()}")
     print(
-        f"Loaded {duplicate_index.example_count} existing image(s) from the "
-        "class folders for exact/near duplicate checks."
+        f"Loaded {duplicate_index.example_count} existing image(s) from training "
+        "and validation for exact/near duplicate checks."
     )
     if duplicate_index.unreadable:
         print(
@@ -2254,7 +2413,8 @@ def main(argv=None):
     elif duplicate_index.example_count == 0 and LEGACY_DATASET_CSV.is_file():
         print(
             "An old board_debug dataset was found. To copy its unique images "
-            "into datasets/<class>/ (skipping duplicates), run: "
+            "into datasets/training/ and datasets/validation/ "
+            "(skipping duplicates), run: "
             "python board-vision.py --import-legacy"
         )
 
