@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -21,15 +23,17 @@ from tqdm import tqdm
 
 # ============================================================
 # CHESSBOTV CNN TRAINER
-# Preferred input is board_debug/dataset.csv created by board-vision.py.
-# The CSV contains the manual piece label, light/dark/highlighted square
-# type, game ID, and whole-game train/validation/test split. A legacy flat folder whose
-# labels are inferred from filename prefixes is still supported.
+# Preferred input is datasets/<class>/ created by board-vision.py. The
+# trainer derives its training, validation, and held-out test sets from
+# those same class folders (using whole-game groups when board-vision's
+# filenames provide game IDs). Legacy board-vision CSVs remain available
+# through an explicit --csv argument.
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DATASET_DIR = BASE_DIR / "board_debug"
-DEFAULT_CSV = DATASET_DIR / "dataset.csv"
+DATASET_DIR = BASE_DIR / "datasets"
+LEGACY_DATASET_DIR = BASE_DIR / "board_debug"
+DEFAULT_CSV = LEGACY_DATASET_DIR / "dataset.csv"
 OUTPUT_MODEL = BASE_DIR / "chessbotv_cnn.pth"
 
 IMAGE_SIZE = 64
@@ -43,6 +47,17 @@ BALANCE_TOLERANCE = 2
 RANDOM_SEED = 42
 NORMALIZE_MEAN = (0.5, 0.5, 0.5)
 NORMALIZE_STD = (0.5, 0.5, 0.5)
+
+# Duplicate removal happens before splitting. These match board-vision.py:
+# exact hashes always collide, while a near duplicate must be almost
+# pixel-identical at the model's 64x64 input size.
+NEAR_DUPLICATE_MAX_MEAN_ABS_ERROR = 4.0
+NEAR_DUPLICATE_MAX_CHANGED_FRACTION = 0.02
+NEAR_DUPLICATE_MAX_AHASH_DISTANCE = 8
+NEAR_DUPLICATE_PREFILTER_MAX_MAE = 6.0
+_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
+PIL_RESAMPLE_LANCZOS = _PIL_RESAMPLING.LANCZOS
+PIL_RESAMPLE_BILINEAR = _PIL_RESAMPLING.BILINEAR
 
 # Windows: 0 workers is the simplest reliable starting point.
 NUM_WORKERS = 0
@@ -67,8 +82,30 @@ PREFIX_TO_CLASS = {
     "blank": "empty",
 }
 
+CLASS_TO_PREFIX = {
+    class_name: prefix for prefix, class_name in PREFIX_TO_CLASS.items()
+}
+
+# Folder name -> class. board-vision.py creates canonical class names;
+# accepting the short codes too makes manually assembled datasets forgiving.
+CLASS_FOLDER_TO_CLASS = {}
+for _prefix, _class_name in PREFIX_TO_CLASS.items():
+    CLASS_FOLDER_TO_CLASS[_prefix.lower()] = _class_name
+    CLASS_FOLDER_TO_CLASS[_class_name.lower()] = _class_name
+CLASS_FOLDER_TO_CLASS["blank"] = "empty"
+
+SPLIT_FOLDER_TO_SPLIT = {
+    "train": "train",
+    "training": "train",
+    "validation": "validation",
+    "valid": "validation",
+    "val": "validation",
+    "test": "test",
+    "testing": "test",
+}
+
 SUPPORTED_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".bmp", ".webp"
+    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"
 }
 
 
@@ -361,6 +398,179 @@ def load_csv_records(csv_path, dataset_dir=DATASET_DIR):
     return records
 
 
+def _record_path_and_label(record):
+    if isinstance(record, dict):
+        return Path(record["path"]), str(record.get("label", ""))
+    return Path(record[0]), str(record[1])
+
+
+def _canonical_image_array(path):
+    """Load one tile at the CNN's canonical RGB input size."""
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        if rgb.size != (IMAGE_SIZE, IMAGE_SIZE):
+            rgb = rgb.resize(
+                (IMAGE_SIZE, IMAGE_SIZE), resample=PIL_RESAMPLE_LANCZOS
+            )
+        return np.asarray(rgb).copy()
+
+
+def _exact_image_hash(canonical):
+    digest = hashlib.sha256()
+    digest.update(repr(tuple(canonical.shape)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(np.ascontiguousarray(canonical, dtype=np.uint8).tobytes())
+    return digest.hexdigest()
+
+
+def _average_image_hash(canonical):
+    grey = np.rint(np.mean(canonical.astype(np.float32), axis=2)).astype(np.uint8)
+    with Image.fromarray(grey) as image:
+        small = np.asarray(
+            image.resize((8, 8), resample=PIL_RESAMPLE_BILINEAR),
+            dtype=np.float32,
+        )
+    threshold = float(np.mean(small))
+    value = 0
+    for pixel in small.ravel():
+        value = (value << 1) | int(pixel > threshold)
+    return value
+
+
+def _image_fingerprint(canonical):
+    size = canonical.shape[0]
+    if size != canonical.shape[1] or size % 16:
+        with Image.fromarray(canonical) as image:
+            return np.asarray(
+                image.resize((16, 16), resample=PIL_RESAMPLE_BILINEAR),
+                dtype=np.float32,
+            ).reshape(-1)
+    block = size // 16
+    return canonical.astype(np.float32).reshape(
+        16, block, 16, block, 3
+    ).mean(axis=(1, 3)).reshape(-1)
+
+
+def _ahash_bands(average_hash):
+    for band in range(16):
+        yield band, (int(average_hash) >> (band * 4)) & 0xF
+
+
+def _duplicate_metrics(first, second):
+    difference = np.abs(first.astype(np.int16) - second.astype(np.int16))
+    return (
+        float(np.mean(difference)),
+        float(np.mean(np.max(difference, axis=2) > 16)),
+    )
+
+
+def deduplicate_records(records, mode="exact-near"):
+    """Remove exact/near duplicate pixels before any train/val/test split.
+
+    Returns ``(unique_records, duplicate_reports)``. Matching is deliberately
+    across every label: identical pixels under two classes are conflicting
+    faulty training data, and the first path in deterministic sorted order
+    is retained while later copies are reported and excluded.
+
+    Removing duplicates before splitting is essential; otherwise the same
+    tile could appear in both training and validation, making validation
+    look artificially good while also wasting training time.
+    """
+    if mode not in ("exact-near", "exact", "off"):
+        raise ValueError(f"Unsupported dedupe mode: {mode}")
+    if mode == "off" or not records:
+        return list(records), []
+
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            str(_record_path_and_label(record)[0]).lower(),
+            _record_path_and_label(record)[1],
+        ),
+    )
+    kept_entries = []
+    exact_entries = {}
+    bands = defaultdict(list)
+    reports = []
+
+    for record in tqdm(ordered, desc="Checking duplicate images"):
+        path, label = _record_path_and_label(record)
+        canonical = _canonical_image_array(path)
+        exact_hash = _exact_image_hash(canonical)
+        exact_entry = exact_entries.get(exact_hash)
+        if exact_entry is not None:
+            reports.append({
+                "record": record,
+                "duplicate_of": exact_entry["record"],
+                "kind": "exact",
+                "mean_abs_error": 0.0,
+                "changed_fraction": 0.0,
+                "average_hash_distance": 0,
+            })
+            continue
+
+        average_hash = _average_image_hash(canonical)
+        fingerprint = _image_fingerprint(canonical)
+        best = None
+
+        if mode == "exact-near":
+            candidate_indices = set()
+            for band_key in _ahash_bands(average_hash):
+                candidate_indices.update(bands.get(band_key, ()))
+            for candidate_index in sorted(candidate_indices):
+                entry = kept_entries[candidate_index]
+                ahash_distance = int(
+                    (average_hash ^ entry["average_hash"]).bit_count()
+                )
+                if ahash_distance > NEAR_DUPLICATE_MAX_AHASH_DISTANCE:
+                    continue
+                fingerprint_mae = float(
+                    np.mean(np.abs(fingerprint - entry["fingerprint"]))
+                )
+                if fingerprint_mae > NEAR_DUPLICATE_PREFILTER_MAX_MAE:
+                    continue
+                other_path, _other_label = _record_path_and_label(entry["record"])
+                mean_abs_error, changed_fraction = _duplicate_metrics(
+                    canonical, _canonical_image_array(other_path)
+                )
+                if not (
+                    mean_abs_error <= NEAR_DUPLICATE_MAX_MEAN_ABS_ERROR
+                    and changed_fraction <= NEAR_DUPLICATE_MAX_CHANGED_FRACTION
+                ):
+                    continue
+                report = {
+                    "record": record,
+                    "duplicate_of": entry["record"],
+                    "kind": "near",
+                    "mean_abs_error": mean_abs_error,
+                    "changed_fraction": changed_fraction,
+                    "average_hash_distance": ahash_distance,
+                }
+                if best is None or mean_abs_error < best["mean_abs_error"]:
+                    best = report
+
+        if best is not None:
+            reports.append(best)
+            continue
+
+        entry = {
+            "record": record,
+            "path": path,
+            "label": label,
+            "exact_hash": exact_hash,
+            "average_hash": average_hash,
+            "fingerprint": fingerprint,
+        }
+        kept_index = len(kept_entries)
+        kept_entries.append(entry)
+        exact_entries[exact_hash] = entry
+        if mode == "exact-near":
+            for band_key in _ahash_bands(average_hash):
+                bands[band_key].append(kept_index)
+
+    return [entry["record"] for entry in kept_entries], reports
+
+
 def _split_target_counts(total):
     """Exact integer 70/15/15 target counts for a temporary split."""
     quotas = [
@@ -535,7 +745,12 @@ def _internal_stratified_split(records):
 
 
 def split_records(records):
-    """Use CSV splits when present; otherwise create a temporary split."""
+    """Use pre-assigned split fields/folders, else split the same folders.
+
+    Folder records from ``datasets/<class>/`` normally arrive unsplit. They
+    are divided here into training/validation/test from that one shared
+    source, preferring whole-game groups when game IDs are available.
+    """
     assigned = {"train": [], "validation": [], "test": []}
     unsplit = []
     for record in records:
@@ -551,15 +766,16 @@ def split_records(records):
         assigned["validation"].extend(extra_val)
         assigned["test"].extend(extra_test)
         print(
-            "Some/all rows were 'unsplit'; using a temporary whole-game "
-            "70/15/15 split when at least 3 game IDs are available "
-            "(otherwise an image-level fallback) without changing the CSV."
+            "Some/all images were 'unsplit'; deriving training/validation/test "
+            "from the same dataset with a temporary whole-game 70/15/15 split "
+            "when at least 3 game IDs are available (otherwise an image-level "
+            "fallback), without moving or changing files on disk."
         )
 
     if not assigned["train"]:
         raise RuntimeError("No training images after applying dataset splits")
     if not assigned["validation"] or not assigned["test"]:
-        print("CSV split had an empty validation/test set; re-splitting temporarily.")
+        print("Assigned split had an empty validation/test set; re-splitting temporarily.")
         return _internal_temporary_split(records)
     return assigned["train"], assigned["validation"], assigned["test"]
 
@@ -584,77 +800,224 @@ def filter_highlighted_records(records, highlighted_mode="include"):
     raise ValueError(f"Unsupported highlighted mode: {highlighted_mode}")
 
 
+def _parse_folder_filename(path):
+    """Best-effort metadata encoded in a board-vision/manual tile filename."""
+    stem = Path(path).stem
+    parsed = {
+        "label_code": "",
+        "square_type": None,
+        "game_id": None,
+        "row": None,
+        "col": None,
+    }
+
+    sections = stem.split("__")
+    first_parts = sections[0].split("_") if sections else []
+    if first_parts and first_parts[0].lower() in PREFIX_TO_CLASS:
+        parsed["label_code"] = first_parts[0].lower()
+    for part in first_parts[1:]:
+        if part.lower() in ("light", "dark", "highlighted"):
+            parsed["square_type"] = part.lower()
+            break
+
+    for section in sections[1:]:
+        lower = section.lower()
+        if lower.startswith("game_") or lower.startswith("game-"):
+            parsed["game_id"] = section
+        else:
+            match = re.fullmatch(r"r(\d+)c(\d+)", lower)
+            if match:
+                parsed["row"] = int(match.group(1))
+                parsed["col"] = int(match.group(2))
+
+    if parsed["square_type"] is None:
+        for token in re.split(r"[^A-Za-z]+", stem.lower()):
+            if token in ("light", "dark", "highlighted"):
+                parsed["square_type"] = token
+                break
+    if parsed["game_id"] is None:
+        match = re.search(r"(game[_-][A-Za-z0-9_.-]+?)(?:__|$)", stem)
+        if match:
+            parsed["game_id"] = match.group(1)
+    if parsed["row"] is None:
+        match = re.search(r"\br(\d+)c(\d+)\b", stem.lower())
+        if match:
+            parsed["row"] = int(match.group(1))
+            parsed["col"] = int(match.group(2))
+    return parsed
+
+
+def _make_folder_record(path, label, split="unsplit"):
+    parsed = _parse_folder_filename(path)
+    label_code = parsed["label_code"] or CLASS_TO_PREFIX[label]
+    if PREFIX_TO_CLASS.get(label_code) != label:
+        label_code = CLASS_TO_PREFIX[label]
+    return {
+        "path": Path(path),
+        "label": label,
+        "label_code": label_code,
+        "square_type": parsed["square_type"],
+        "split": split,
+        "game_id": parsed["game_id"],
+        "board_id": parsed["game_id"],
+        "source_image": None,
+        "row": parsed["row"],
+        "col": parsed["col"],
+    }
+
+
+def _class_folder_candidates(dataset_dir):
+    """(path,label,split) candidates from class and optional split folders."""
+    candidates = []
+    unknown_folders = []
+
+    def add_class_folder(folder, split):
+        label = CLASS_FOLDER_TO_CLASS.get(folder.name.strip().lower())
+        if label is None:
+            if not folder.name.startswith(("_", ".")):
+                unknown_folders.append(str(folder))
+            return
+        for path in sorted(folder.rglob("*")):
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                candidates.append((path, label, split))
+
+    for child in sorted(
+        (item for item in dataset_dir.iterdir() if item.is_dir()),
+        key=lambda item: item.name.lower(),
+    ):
+        if child.name.startswith(("_", ".")):
+            continue
+        split = SPLIT_FOLDER_TO_SPLIT.get(child.name.strip().lower())
+        if split is not None:
+            for class_folder in sorted(
+                (item for item in child.iterdir() if item.is_dir()),
+                key=lambda item: item.name.lower(),
+            ):
+                add_class_folder(class_folder, split)
+        else:
+            add_class_folder(child, "unsplit")
+    return candidates, unknown_folders
+
+
 def discover_images(dataset_dir=DATASET_DIR):
+    """Discover the folder dataset used for training and validation.
+
+    Preferred layout::
+
+        datasets/
+          white_king/*.png
+          white_queen/*.png
+          ...
+          empty/*.png
+
+    All splits are derived from these same class folders by
+    ``split_records``. Optional ``train/<class>``, ``validation/<class>``,
+    and ``test/<class>`` folders are also understood. If no class-folder
+    images exist, the old flat filename-prefix layout is used as a fallback.
+    """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.exists():
         raise FileNotFoundError(
             f"Dataset folder does not exist: {dataset_dir}\n"
-            "Pass --dataset-dir or edit DATASET_DIR near the top of this script."
+            "Run board-vision.py to create datasets/<class>/ folders, "
+            "or pass --dataset-dir/--csv for a legacy dataset."
         )
 
+    candidates, unknown_folders = _class_folder_candidates(dataset_dir)
+    if candidates:
+        records = []
+        skipped_bad = []
+        print(
+            f"Scanning {len(candidates)} image files from class folders "
+            f"under {dataset_dir}..."
+        )
+        for path, label, split in tqdm(candidates, desc="Reading class folders"):
+            if not _verify_image(path):
+                skipped_bad.append(str(path))
+                continue
+            records.append(_make_folder_record(path, label, split))
+
+        print(f"\nUsable class-folder images: {len(records)}")
+        print(f"Unreadable/corrupt images: {len(skipped_bad)}")
+        if skipped_bad:
+            print("Unreadable examples:", skipped_bad[:10])
+        if unknown_folders:
+            print("Ignored unknown class folders:", unknown_folders[:10])
+        if not records:
+            raise RuntimeError(
+                f"No usable images found in class folders under {dataset_dir}"
+            )
+
+        counts = _print_record_summary(records)
+        small_classes = {
+            name: count for name, count in counts.items() if count < 3
+        }
+        if small_classes:
+            print(
+                "WARNING: Very small classes may not appear in every split: "
+                f"{small_classes}"
+            )
+        square_counts = defaultdict(int)
+        split_counts = defaultdict(int)
+        game_ids = set()
+        for record in records:
+            square_counts[record.get("square_type") or "unknown"] += 1
+            split_counts[record.get("split") or "unsplit"] += 1
+            if record.get("game_id"):
+                game_ids.add(record["game_id"])
+        print("\nSquare types:", dict(sorted(square_counts.items())))
+        print("Folder splits:", dict(sorted(split_counts.items())))
+        print(f"Game IDs parsed from filenames: {len(game_ids)}")
+        return records
+
+    # Legacy fallback: a flat folder such as old board_debug/*.png, where
+    # the first filename token is wp/wn/.../blank.
     records = []
     skipped_unknown = []
     skipped_bad = []
-
     files = sorted(
-        p for p in dataset_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        path for path in dataset_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
     )
 
-    print(f"Scanning {len(files)} image files...")
-
-    for path in tqdm(files, desc="Reading dataset"):
-        # Take the portion before the first underscore.
+    print(f"Scanning {len(files)} flat image files...")
+    for path in tqdm(files, desc="Reading legacy flat dataset"):
         prefix = path.stem.split("_", 1)[0].lower()
-
         if prefix not in PREFIX_TO_CLASS:
             skipped_unknown.append(path.name)
             continue
-
         if not _verify_image(path):
             skipped_bad.append(path.name)
             continue
-
-        parts = path.stem.lower().split("_")
-        square_type = parts[1] if len(parts) > 1 and parts[1] in (
-            "light", "dark", "highlighted"
-        ) else None
-        records.append({
-            "path": path,
-            "label": PREFIX_TO_CLASS[prefix],
-            "label_code": prefix,
-            "square_type": square_type,
-            "split": "unsplit",
-        })
+        record = _make_folder_record(
+            path, PREFIX_TO_CLASS[prefix], split="unsplit"
+        )
+        record["label_code"] = prefix
+        records.append(record)
 
     print(f"\nUsable images: {len(records)}")
     print(f"Unknown filename prefixes: {len(skipped_unknown)}")
     print(f"Unreadable/corrupt images: {len(skipped_bad)}")
-
     if skipped_unknown:
         print("Unknown examples:", skipped_unknown[:10])
-
     if skipped_bad:
         print("Unreadable examples:", skipped_bad[:10])
-
+    if unknown_folders:
+        print("Ignored unknown class folders:", unknown_folders[:10])
     if not records:
         raise RuntimeError(
-            "No usable images found. Check DATASET_DIR, file extensions "
-            "and PREFIX_TO_CLASS."
+            "No usable images found. Expected datasets/<class>/*.png "
+            "(for example datasets/white_pawn/...), optional split/class "
+            "folders, or legacy prefix-named files in the dataset root."
         )
 
     counts = _print_record_summary(records)
-
-    # The temporary split needs at least two examples in each present class.
-    too_small = {
-        name: count for name, count in counts.items() if count < 2
-    }
-    if too_small:
-        raise RuntimeError(
-            "Each class needs at least two images for a stratified split. "
-            f"Classes with too few images: {too_small}"
+    small_classes = {name: count for name, count in counts.items() if count < 3}
+    if small_classes:
+        print(
+            "WARNING: Very small classes may not appear in every split: "
+            f"{small_classes}"
         )
-
     return records
 
 
@@ -690,15 +1053,40 @@ def evaluate(model, loader, device, criterion):
     return average_loss, accuracy, all_labels, all_predictions
 
 
+def _dataset_has_discoverable_images(dataset_dir):
+    """Whether folder/flat discovery has anything to read in a dataset root."""
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        return False
+    candidates, _unknown = _class_folder_candidates(dataset_dir)
+    if candidates:
+        return True
+    return any(
+        path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        and path.stem.split("_", 1)[0].lower() in PREFIX_TO_CLASS
+        for path in dataset_dir.iterdir()
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train the ChessBotV square CNN")
     parser.add_argument(
         "--dataset-dir", type=Path, default=DATASET_DIR,
-        help="Folder containing labelled square images",
+        help="Dataset root containing <class>/ image folders (default: datasets/)",
     )
     parser.add_argument(
         "--csv", type=Path, default=None,
-        help="board-vision dataset.csv (default: <dataset-dir>/dataset.csv if present)",
+        help="Optional legacy board-vision CSV; class folders are used when omitted",
+    )
+    parser.add_argument(
+        "--dedupe",
+        choices=("exact-near", "exact", "off"),
+        default="exact-near",
+        help=(
+            "Remove exact/near duplicate pixels before splitting "
+            "(default: exact-near)"
+        ),
     )
     parser.add_argument(
         "--output", type=Path, default=OUTPUT_MODEL,
@@ -734,14 +1122,64 @@ def main(argv=None):
     if device.type == "cpu":
         print("CPU training enabled. This is expected on your current setup.")
 
-    csv_path = Path(args.csv) if args.csv is not None else dataset_dir / "dataset.csv"
-    if csv_path.is_file():
+    records_before_dedupe = 0
+    duplicate_reports = []
+    dataset_layout = "class_folders"
+    if args.csv is not None:
+        dataset_layout = "csv"
+        csv_path = Path(args.csv)
+        if not csv_path.is_file():
+            raise FileNotFoundError(f"Dataset CSV does not exist: {csv_path}")
+        print(f"Using explicitly supplied legacy CSV: {csv_path}")
         records = load_csv_records(csv_path, dataset_dir)
-    elif args.csv is not None:
-        raise FileNotFoundError(f"Dataset CSV does not exist: {csv_path}")
+    elif (
+        dataset_dir.resolve() == DATASET_DIR.resolve()
+        and DEFAULT_CSV.is_file()
+        and not _dataset_has_discoverable_images(dataset_dir)
+    ):
+        # Migration-friendly fallback: a checkout may contain the new empty
+        # datasets/<class>/ placeholders while the user's older local data
+        # is still in board_debug/. New folder data always wins when present.
+        dataset_layout = "legacy_csv_fallback"
+        print(
+            "No images found in datasets/<class>/ yet; using the legacy "
+            f"board_debug CSV at {DEFAULT_CSV}."
+        )
+        records = load_csv_records(DEFAULT_CSV, LEGACY_DATASET_DIR)
     else:
-        print("No dataset.csv found; falling back to filename-prefix discovery.")
+        print(
+            "Using class folders as the shared training/validation/test "
+            f"source: {dataset_dir}"
+        )
         records = discover_images(dataset_dir)
+
+    records_before_dedupe = len(records)
+    records, duplicate_reports = deduplicate_records(records, args.dedupe)
+    if duplicate_reports:
+        print(
+            f"\nRemoved {len(duplicate_reports)} duplicate image(s) before "
+            f"splitting ({records_before_dedupe} -> {len(records)}). "
+            "Duplicates slow training and can make the model faulty/leaky "
+            "if copies land in different splits."
+        )
+        for report in duplicate_reports[:10]:
+            duplicate_path, duplicate_label = _record_path_and_label(
+                report["record"]
+            )
+            kept_path, kept_label = _record_path_and_label(
+                report["duplicate_of"]
+            )
+            print(
+                f"  duplicate ({report['kind']}): {duplicate_path} "
+                f"[{duplicate_label}] matches {kept_path} [{kept_label}]"
+            )
+        if len(duplicate_reports) > 10:
+            print(f"  ... and {len(duplicate_reports) - 10} more duplicate(s)")
+        _print_record_summary(records)
+    elif args.dedupe != "off":
+        print("\nNo exact/near duplicate images found before splitting.")
+    if not records:
+        raise RuntimeError("No unique images remain after duplicate removal")
 
     _balance_counts, imbalanced = light_dark_balance(records)
     if imbalanced:
@@ -898,6 +1336,11 @@ def main(argv=None):
                     "std": list(NORMALIZE_STD),
                     "square_types": ["light", "dark", "highlighted"],
                     "highlighted_mode": args.highlighted_mode,
+                    "dataset_dir": str(dataset_dir),
+                    "dataset_layout": dataset_layout,
+                    "dedupe_mode": args.dedupe,
+                    "duplicate_images_removed": len(duplicate_reports),
+                    "dataset_images_before_dedupe": records_before_dedupe,
                 },
                 output_model,
             )

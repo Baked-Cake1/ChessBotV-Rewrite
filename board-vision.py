@@ -1,44 +1,48 @@
 import csv
+import hashlib
 import math
-import random
+import os
 import re
 import subprocess
 import sys
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageOps
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+try:
+    import pygame
+except ImportError:  # The non-GUI dataset helpers remain importable.
+    pygame = None
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "board_debug"
-DATASET_CSV = OUTPUT_DIR / "dataset.csv"
-SPLIT_CSV_PATHS = {
-    "train": OUTPUT_DIR / "train.csv",
-    "validation": OUTPUT_DIR / "validation.csv",
-    "test": OUTPUT_DIR / "test.csv",
-}
+DATASET_DIR = BASE_DIR / "datasets"
+# Kept as a descriptive alias for the new folder-based dataset root.
+OUTPUT_DIR = DATASET_DIR
+BOARDS_DIR = DATASET_DIR / "_boards"
+METADATA_CSV = DATASET_DIR / "metadata.csv"
+LEGACY_DATASET_DIR = BASE_DIR / "board_debug"
+LEGACY_DATASET_CSV = LEGACY_DATASET_DIR / "dataset.csv"
 CNN_TRAINER_PATH = BASE_DIR / "cnn_trainer.py"
 
-# Semi-auto review has its own learning library. It is deliberately kept
-# outside board_debug/ so assistant reference images can never be mixed
-# into the CNN model dataset or its train/validation/test CSVs.
-SEMI_AUTO_DIR = BASE_DIR / "board_vision_assistant"
-SEMI_AUTO_EXAMPLES_DIR = SEMI_AUTO_DIR / "examples"
-SEMI_AUTO_CSV = SEMI_AUTO_DIR / "examples.csv"
-SEMI_AUTO_FIELDS = (
-    "image_path",
-    "filename",
-    "label",
-    "label_code",
-    "square_type",
-    "source_image",
-    "board_id",
-)
-SEMI_AUTO_MAX_PER_GROUP = 16
-SEMI_AUTO_MAX_NEW_PER_BOARD_GROUP = 4
-SEMI_AUTO_FEATURE_K = 3
+# Duplicate checks compare every tile at the trainer's canonical 64x64
+# input size. Exact SHA-256 matches are always duplicates. Near matches
+# must also be almost pixel-identical after that normalisation, so the
+# same piece on a light versus a dark square is not collapsed together.
+CANONICAL_TILE_SIZE = 64
+NEAR_DUPLICATE_MAX_MEAN_ABS_ERROR = 4.0
+NEAR_DUPLICATE_MAX_CHANGED_FRACTION = 0.02
+NEAR_DUPLICATE_MAX_AHASH_DISTANCE = 8
+NEAR_DUPLICATE_PREFILTER_MAX_MAE = 6.0
+
+_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
+PIL_RESAMPLE_LANCZOS = _PIL_RESAMPLING.LANCZOS
+PIL_RESAMPLE_BILINEAR = _PIL_RESAMPLING.BILINEAR
+PIL_RESAMPLE_NEAREST = _PIL_RESAMPLING.NEAREST
 
 SUPPORTED_IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff",
@@ -46,11 +50,11 @@ SUPPORTED_IMAGE_EXTENSIONS = {
 
 VIEW_W, VIEW_H = 1152, 864
 PREVIEW_SIZE = 380
-MANUAL_W, MANUAL_H = 1120, 700
+MANUAL_W, MANUAL_H = 1120, 760
 MANUAL_TILE_SIZE = 360
 
-# (trainer filename prefix, CNN class name, display name). These codes and
-# class names intentionally match PREFIX_TO_CLASS in cnn_trainer.py.
+# (short code, CNN class/folder name, display name). These codes and class
+# names intentionally match the class folders read by cnn_trainer.py.
 LABEL_OPTIONS = (
     ("wk", "white_king", "White King"),
     ("wq", "white_queen", "White Queen"),
@@ -67,8 +71,15 @@ LABEL_OPTIONS = (
     ("blank", "empty", "Blank / Empty"),
 )
 LABEL_BY_CODE = {code: label for code, label, _display in LABEL_OPTIONS}
+CODE_BY_LABEL = {label: code for code, label, _display in LABEL_OPTIONS}
 LABEL_OPTION_BY_CODE = {option[0]: option for option in LABEL_OPTIONS}
 LABEL_OPTION_BY_LABEL = {option[1]: option for option in LABEL_OPTIONS}
+CLASS_FOLDER_BY_LABEL = {label: label for _code, label, _display in LABEL_OPTIONS}
+CLASS_FOLDER_ALIASES = {}
+for _code, _label, _display in LABEL_OPTIONS:
+    CLASS_FOLDER_ALIASES[_label.lower()] = _label
+    CLASS_FOLDER_ALIASES[_code.lower()] = _label
+CLASS_FOLDER_ALIASES["blank"] = "empty"
 FEN_SYMBOL_BY_CODE = {
     "wk": "K",
     "wq": "Q",
@@ -90,25 +101,25 @@ SQUARE_TYPE_OPTIONS = (
     ("highlighted", "Highlighted square"),
 )
 SQUARE_TYPE_DISPLAY = dict(SQUARE_TYPE_OPTIONS)
-CSV_FIELDS = (
+METADATA_FIELDS = (
     "image_path",
     "filename",
     "label",
     "label_code",
     "square_type",
-    "split",
     "row",
     "col",
     "source_image",
     "board_id",
     "game_id",
+    "saved",
+    "duplicate_of",
+    "duplicate_kind",
+    "duplicate_mean_abs_error",
+    "duplicate_changed_fraction",
 )
-SPLIT_FRACTIONS = (
-    ("train", 0.70),
-    ("validation", 0.15),
-    ("test", 0.15),
-)
-SPLIT_SEED = 42
+# Compatibility alias for callers that used the old master-CSV field name.
+CSV_FIELDS = METADATA_FIELDS
 BALANCE_TOLERANCE = 2
 
 
@@ -191,18 +202,21 @@ def choose_image_paths(argv=None):
 
 
 def load_screenshot(image_path):
-    """Load one dropped/selected screenshot with a clear error if bad."""
+    """Load one dropped/selected screenshot as an RGB NumPy array."""
     image_path = Path(image_path)
-    image = cv2.imread(str(image_path))
-    if image is None:
+    try:
+        with Image.open(image_path) as image:
+            return np.asarray(
+                ImageOps.exif_transpose(image).convert("RGB")
+            ).copy()
+    except Exception as exc:
         raise FileNotFoundError(
             f"Could not load image: {image_path.resolve()}"
-        )
-    return image
+        ) from exc
 
 
 def _path_for_csv(path):
-    """Path stored in dataset.csv (relative to this script when possible)."""
+    """Path stored in metadata.csv (relative to this script when possible)."""
     path = Path(path)
     try:
         return path.resolve().relative_to(BASE_DIR).as_posix()
@@ -226,19 +240,15 @@ def record_game_id(record):
 
 
 def _normalise_game_ids(records):
-    """Fill game_id on legacy rows from their original board grouping."""
+    """Fill game_id on scanned/manual records from their board grouping."""
     for record in records:
         record["game_id"] = record_game_id(record)
     return records
 
 
 def dataset_game_counts(records):
-    """Return {split: set(game_id)} after applying legacy game fallbacks."""
-    games = {}
-    for record in records:
-        split = record.get("split") or "unsplit"
-        games.setdefault(split, set()).add(record_game_id(record))
-    return games
+    """Return the set of game IDs represented by folder records."""
+    return {record_game_id(record) for record in records}
 
 
 def _fen_castling_rights(board_grid):
@@ -323,161 +333,192 @@ def save_fen_file(fen, game_id, output_dir=OUTPUT_DIR):
     return fen_path
 
 
-def load_dataset_records(csv_path=DATASET_CSV):
-    """Load the master dataset CSV, returning [] when it does not exist."""
-    csv_path = Path(csv_path)
-    if not csv_path.is_file():
-        return []
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    records = []
-    for row in rows:
-        record = {field: str(row.get(field, "") or "") for field in CSV_FIELDS}
-        if record["image_path"] or record["filename"]:
-            records.append(record)
-    return _normalise_game_ids(records)
+def _as_rgb_array(value):
+    """Return an image/tile as a contiguous RGB uint8 NumPy array."""
+    if isinstance(value, Image.Image):
+        return np.ascontiguousarray(np.asarray(value.convert("RGB")), dtype=np.uint8)
+
+    array = np.asarray(value)
+    if array.ndim == 2:
+        array = np.repeat(array[:, :, None], 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] >= 3:
+        # Dataset tiles are stored/displayed as RGB. Any alpha channel is
+        # ignored because the trainer also converts its inputs to RGB.
+        array = array[:, :, :3]
+    else:
+        raise ValueError(f"Unsupported image array shape: {array.shape}")
+
+    if array.dtype != np.uint8:
+        array = array.astype(np.float32, copy=False)
+        if array.size and float(np.nanmax(array)) <= 1.0:
+            array *= 255.0
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(array)
 
 
-def write_dataset_csv(records, csv_path=DATASET_CSV):
-    """Write all dataset rows to one CSV (existing rows are retained)."""
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = csv_path.with_suffix(csv_path.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for record in records:
-            writer.writerow({field: record.get(field, "") for field in CSV_FIELDS})
-    temporary.replace(csv_path)
-    return csv_path
+def _resize_rgb_array(array, size, resample=PIL_RESAMPLE_LANCZOS):
+    """Resize an RGB array to ``size`` using Pillow (no OpenCV)."""
+    rgb = _as_rgb_array(array)
+    if isinstance(size, int):
+        size = (size, size)
+    if rgb.shape[1] == size[0] and rgb.shape[0] == size[1]:
+        return rgb.copy()
+    with Image.fromarray(rgb) as image:
+        return np.asarray(image.resize(size, resample=resample)).copy()
 
 
-def write_split_csvs(records, output_dir=OUTPUT_DIR):
-    """Write train/validation/test CSVs after splits have been calculated."""
-    output_dir = Path(output_dir)
-    written = {}
-    for split_name, _fraction in SPLIT_FRACTIONS:
-        split_records = [
-            record for record in records if record.get("split") == split_name
-        ]
-        path = output_dir / f"{split_name}.csv"
-        write_dataset_csv(split_records, path)
-        written[split_name] = path
-    return written
+def _load_rgb_image(path):
+    """Load an image file as an RGB NumPy array."""
+    with Image.open(path) as image:
+        return np.asarray(
+            ImageOps.exif_transpose(image).convert("RGB")
+        ).copy()
 
 
-def _split_targets(total):
-    """Largest-remainder 70/15/15 integer counts for a total."""
-    quotas = [
-        (name, total * fraction) for name, fraction in SPLIT_FRACTIONS
-    ]
-    counts = {name: int(math.floor(quota)) for name, quota in quotas}
-    remaining = total - sum(counts.values())
-    for name, quota in sorted(
-        quotas, key=lambda item: quota_fraction(item[1]), reverse=True
-    ):
-        if remaining <= 0:
+def _save_rgb_image(path, array):
+    """Save an RGB NumPy/Pillow image, creating its parent folder."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(_as_rgb_array(array)).save(path)
+    return path
+
+
+def canonical_tile_array(tile, size=CANONICAL_TILE_SIZE):
+    """Normalise a tile to the trainer's square RGB input size."""
+    return _resize_rgb_array(tile, (size, size), PIL_RESAMPLE_LANCZOS)
+
+
+def ensure_dataset_layout(dataset_dir=DATASET_DIR):
+    """Create ``datasets/`` and one folder for every CNN class."""
+    dataset_dir = Path(dataset_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "_boards").mkdir(parents=True, exist_ok=True)
+    for _code, label, _display in LABEL_OPTIONS:
+        (dataset_dir / CLASS_FOLDER_BY_LABEL[label]).mkdir(
+            parents=True, exist_ok=True
+        )
+    return dataset_dir
+
+
+def _class_folder_label(folder_name):
+    """Canonical CNN label for a class-folder name/alias, if recognised."""
+    return CLASS_FOLDER_ALIASES.get(str(folder_name).strip().lower())
+
+
+def _parse_tile_filename(path):
+    """Best-effort label-code/square/game/row/col data from a tile name."""
+    path = Path(path)
+    stem = path.stem
+    parsed = {
+        "label_code": "",
+        "square_type": "",
+        "game_id": "",
+        "row": "",
+        "col": "",
+    }
+
+    sections = stem.split("__")
+    first = sections[0] if sections else stem
+    first_parts = first.split("_")
+    if first_parts and first_parts[0].lower() in LABEL_OPTION_BY_CODE:
+        parsed["label_code"] = first_parts[0].lower()
+    for part in first_parts[1:]:
+        if part.lower() in SQUARE_TYPE_DISPLAY:
+            parsed["square_type"] = part.lower()
             break
-        counts[name] += 1
-        remaining -= 1
-    return counts
+
+    for section in sections[1:]:
+        if section.lower().startswith("game_") or section.lower().startswith("game-"):
+            parsed["game_id"] = section
+        else:
+            match = re.fullmatch(r"r(\d+)c(\d+)", section.lower())
+            if match:
+                parsed["row"], parsed["col"] = match.groups()
+
+    if not parsed["square_type"]:
+        tokens = [token.lower() for token in re.split(r"[^A-Za-z]+", stem)]
+        for token in tokens:
+            if token in SQUARE_TYPE_DISPLAY:
+                parsed["square_type"] = token
+                break
+    if not parsed["game_id"]:
+        match = re.search(r"(game[_-][A-Za-z0-9_.-]+?)(?:__|$)", stem)
+        if match:
+            parsed["game_id"] = match.group(1)
+    if not parsed["row"]:
+        match = re.search(r"\br(\d+)c(\d+)\b", stem.lower())
+        if match:
+            parsed["row"], parsed["col"] = match.groups()
+    return parsed
 
 
-def quota_fraction(value):
-    return value - math.floor(value)
+def scan_dataset_records(dataset_dir=DATASET_DIR):
+    """Scan ``datasets/<class>/`` folders into trainer-style records.
 
-
-def _game_split_targets(total_games):
-    """Train/validation/test game counts, approximating 70/15/15 by game.
-
-    Whole games cannot be divided, so very small datasets are adjusted to
-    populate as many splits as possible: 2 games -> 1/1/0, 3 -> 1/1/1,
-    and the requested 4 -> 2/1/1. Larger totals use 70/15/15 rounding.
+    The folder is authoritative for the label; board-vision filenames also
+    carry the square type, game ID, and board row/column. Manually added
+    images are accepted too, with any missing metadata left blank.
     """
-    counts = _split_targets(max(0, int(total_games)))
-    if total_games >= 2 and counts["validation"] == 0 and counts["train"] > 1:
-        counts["train"] -= 1
-        counts["validation"] += 1
-    if total_games >= 3 and counts["test"] == 0:
-        donor = "train" if counts["train"] > 1 else "validation"
-        if counts[donor] > 1:
-            counts[donor] -= 1
-            counts["test"] += 1
-    return counts
-
-
-def recalculate_splits(records, seed=SPLIT_SEED):
-    """Recalculate train/validation/test splits by whole game ID.
-
-    Every image with the same ``game_id`` receives the same split, so one
-    uploaded board/game can never leak across training and evaluation.
-    Legacy rows without a game_id are grouped by their old board_id (then
-    source image). Game counts approximate 70/15/15, with 4 games split
-    2 train / 1 validation / 1 test.
-    """
-    if not records:
+    dataset_dir = Path(dataset_dir)
+    records = []
+    if not dataset_dir.is_dir():
         return records
 
-    _normalise_game_ids(records)
-    games = {}
-    for record in records:
-        games.setdefault(record_game_id(record), []).append(record)
-
-    # A per-game deterministic random key keeps the assignment reproducible
-    # without making it depend on upload order.
-    ordered_game_ids = sorted(
-        games,
-        key=lambda game_id: (
-            random.Random(f"{seed}:{game_id}").random(),
-            game_id,
-        ),
-    )
-    targets = _game_split_targets(len(ordered_game_ids))
-
-    cursor = 0
-    for split_name, _fraction in SPLIT_FRACTIONS:
-        count = targets[split_name]
-        for game_id in ordered_game_ids[cursor:cursor + count]:
-            for record in games[game_id]:
-                record["split"] = split_name
-        cursor += count
+    for folder in sorted(
+        (item for item in dataset_dir.iterdir() if item.is_dir()),
+        key=lambda item: item.name.lower(),
+    ):
+        if folder.name.startswith("_"):
+            continue
+        label = _class_folder_label(folder.name)
+        if label is None:
+            continue
+        default_code = CODE_BY_LABEL[label]
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+                continue
+            parsed = _parse_tile_filename(path)
+            label_code = parsed["label_code"] or default_code
+            if LABEL_BY_CODE.get(label_code) != label:
+                label_code = default_code
+            records.append({
+                "image_path": _path_for_csv(path),
+                "filename": path.name,
+                "label": label,
+                "label_code": label_code,
+                "square_type": parsed["square_type"],
+                "split": "unsplit",
+                "row": parsed["row"],
+                "col": parsed["col"],
+                "source_image": "",
+                "board_id": parsed["game_id"],
+                "game_id": parsed["game_id"] or "manually-added",
+                "path": path,
+            })
     return records
 
 
-def append_dataset_records(new_records, csv_path=DATASET_CSV):
-    """Append one reviewed board to dataset.csv without losing old rows.
+def load_dataset_records(dataset_dir=DATASET_DIR):
+    """Compatibility wrapper: load records from the class folders."""
+    return scan_dataset_records(dataset_dir)
 
-    The first creation is deliberately left as ``unsplit``. Every later
-    change recalculates all whole-game splits and refreshes
-    train/validation/test.csv. Returns ``(all_records, csv_already_existed)``.
-    """
-    csv_path = Path(csv_path)
-    csv_existed = csv_path.is_file()
-    existing = load_dataset_records(csv_path)
-    existing_paths = {
-        record.get("image_path") for record in existing if record.get("image_path")
-    }
-    duplicate_paths = [
-        record.get("image_path")
-        for record in new_records
-        if record.get("image_path") in existing_paths
-    ]
-    if duplicate_paths:
-        raise ValueError(
-            "Refusing to overwrite existing dataset row(s): "
-            + ", ".join(duplicate_paths[:5])
-        )
 
-    all_records = _normalise_game_ids(existing + list(new_records))
-    if csv_existed:
-        recalculate_splits(all_records)
-        write_dataset_csv(all_records, csv_path)
-        write_split_csvs(all_records, csv_path.parent)
-    else:
-        for record in all_records:
-            record["split"] = "unsplit"
-        write_dataset_csv(all_records, csv_path)
-    return all_records, csv_existed
+def append_metadata_records(records, dataset_dir=DATASET_DIR):
+    """Append board-review provenance/duplicate outcomes to metadata.csv."""
+    if not records:
+        return Path(dataset_dir) / "metadata.csv"
+    dataset_dir = ensure_dataset_layout(dataset_dir)
+    metadata_path = Path(dataset_dir) / "metadata.csv"
+    write_header = not metadata_path.is_file() or metadata_path.stat().st_size == 0
+    with metadata_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=METADATA_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for record in records:
+            writer.writerow({field: record.get(field, "") for field in METADATA_FIELDS})
+    return metadata_path
 
 
 def dataset_balance(records, tolerance=BALANCE_TOLERANCE):
@@ -487,14 +528,19 @@ def dataset_balance(records, tolerance=BALANCE_TOLERANCE):
     tolerance check, as requested.
     """
     counts = {
-        label: {"light": 0, "dark": 0, "highlighted": 0}
+        label: {"light": 0, "dark": 0, "highlighted": 0, "unknown": 0, "total": 0}
         for _code, label, _display in LABEL_OPTIONS
     }
     for record in records:
         label = record.get("label", "")
+        if label not in counts:
+            continue
+        counts[label]["total"] += 1
         square_type = record.get("square_type", "")
-        if label in counts and square_type in counts[label]:
+        if square_type in ("light", "dark", "highlighted"):
             counts[label][square_type] += 1
+        else:
+            counts[label]["unknown"] += 1
 
     imbalanced = {}
     for label, values in counts.items():
@@ -503,31 +549,16 @@ def dataset_balance(records, tolerance=BALANCE_TOLERANCE):
     return counts, imbalanced
 
 
-def print_dataset_report(records, splits_recalculated=False):
-    """Print split totals and the per-class light/dark balance report."""
-    split_counts = {}
-    for record in records:
-        split = record.get("split") or "unsplit"
-        split_counts[split] = split_counts.get(split, 0) + 1
-
-    game_counts = dataset_game_counts(records)
-    total_games = len({record_game_id(record) for record in records})
-
-    print(f"\nDataset CSV: {DATASET_CSV}")
-    print(f"Total labelled images: {len(records)}")
+def print_dataset_report(records, dataset_dir=DATASET_DIR):
+    """Print class-folder totals and the light/dark balance report."""
+    total_games = len(dataset_game_counts(records))
+    print(f"\nDataset folder: {Path(dataset_dir).resolve()}")
+    print(f"Total unique labelled images in class folders: {len(records)}")
     print(f"Total game IDs: {total_games}")
-    if splits_recalculated:
-        print(
-            "Game split recalculated: "
-            f"train={len(game_counts.get('train', ()))} game(s)/"
-            f"{split_counts.get('train', 0)} image(s), "
-            f"validation={len(game_counts.get('validation', ()))} game(s)/"
-            f"{split_counts.get('validation', 0)} image(s), "
-            f"test={len(game_counts.get('test', ()))} game(s)/"
-            f"{split_counts.get('test', 0)} image(s)"
-        )
-    else:
-        print("Game split: not calculated on first CSV creation (all rows are 'unsplit').")
+    print(
+        "Training split: cnn_trainer.py will read these same class folders "
+        "and create its training/validation/test split internally."
+    )
 
     counts, imbalanced = dataset_balance(records)
     print("\nPer-class square counts (highlighted is excluded from balance):")
@@ -536,8 +567,10 @@ def print_dataset_report(records, splits_recalculated=False):
         difference = abs(values["light"] - values["dark"])
         marker = "  <-- needs balancing" if label in imbalanced else ""
         print(
-            f"  {display:15s}: light={values['light']:4d}, "
-            f"dark={values['dark']:4d}, highlighted={values['highlighted']:4d}, "
+            f"  {display:15s}: total={values['total']:4d}, "
+            f"light={values['light']:4d}, dark={values['dark']:4d}, "
+            f"highlighted={values['highlighted']:4d}, "
+            f"unknown={values['unknown']:4d}, "
             f"light/dark difference={difference}{marker}"
         )
 
@@ -555,58 +588,579 @@ def print_dataset_report(records, splits_recalculated=False):
     return counts, imbalanced
 
 
-def _next_dataset_sequence(existing_records, output_dir=OUTPUT_DIR):
+def _next_dataset_sequence(existing_records, dataset_dir=DATASET_DIR):
     """Next non-overwriting numeric suffix for saved square images."""
     highest = 0
     candidates = [record.get("filename", "") for record in existing_records]
-    output_dir = Path(output_dir)
-    if output_dir.is_dir():
-        candidates.extend(path.name for path in output_dir.iterdir() if path.is_file())
+    dataset_dir = Path(dataset_dir)
+    if dataset_dir.is_dir():
+        candidates.extend(
+            path.name
+            for path in dataset_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        )
     for name in candidates:
-        match = re.search(r"_(\d+)$", Path(str(name)).stem)
+        match = re.search(r"(\d+)$", Path(str(name)).stem)
         if match:
             highest = max(highest, int(match.group(1)))
     return highest + 1
 
 
-def save_labelled_tiles(tile_entries, answers, source_image, board_id, game_id=None):
-    """Save manually reviewed tiles under unique trainer-linked names."""
+def _exact_tile_hash(canonical):
+    """SHA-256 of a canonical tile's exact RGB pixels and shape."""
+    digest = hashlib.sha256()
+    digest.update(repr(tuple(canonical.shape)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(np.ascontiguousarray(canonical, dtype=np.uint8).tobytes())
+    return digest.hexdigest()
+
+
+def _average_hash(canonical):
+    """64-bit average hash used only to find near-duplicate candidates."""
+    grey = np.rint(np.mean(canonical.astype(np.float32), axis=2)).astype(np.uint8)
+    with Image.fromarray(grey) as image:
+        small = np.asarray(
+            image.resize((8, 8), resample=PIL_RESAMPLE_BILINEAR),
+            dtype=np.float32,
+        )
+    threshold = float(np.mean(small))
+    value = 0
+    for pixel in small.ravel():
+        value = (value << 1) | int(pixel > threshold)
+    return value
+
+
+def _tile_fingerprint(canonical):
+    """16x16 block-average RGB fingerprint of a canonical 64x64 tile."""
+    size = canonical.shape[0]
+    if size != canonical.shape[1] or size % 16:
+        with Image.fromarray(canonical) as image:
+            return np.asarray(
+                image.resize((16, 16), resample=PIL_RESAMPLE_BILINEAR),
+                dtype=np.float32,
+            ).reshape(-1)
+    block = size // 16
+    return canonical.astype(np.float32).reshape(
+        16, block, 16, block, 3
+    ).mean(axis=(1, 3)).reshape(-1)
+
+
+def _ahash_bands(average_hash):
+    """Sixteen 4-bit bands; near hashes necessarily share several bands."""
+    for band in range(16):
+        yield band, (int(average_hash) >> (band * 4)) & 0xF
+
+
+def _duplicate_metrics(first, second):
+    """Mean absolute RGB error and fraction of visibly changed pixels."""
+    difference = np.abs(first.astype(np.int16) - second.astype(np.int16))
+    mean_abs_error = float(np.mean(difference))
+    changed_fraction = float(np.mean(np.max(difference, axis=2) > 16))
+    return mean_abs_error, changed_fraction
+
+
+def _is_near_duplicate(mean_abs_error, changed_fraction, ahash_distance):
+    return (
+        mean_abs_error <= NEAR_DUPLICATE_MAX_MEAN_ABS_ERROR
+        and changed_fraction <= NEAR_DUPLICATE_MAX_CHANGED_FRACTION
+        and ahash_distance <= NEAR_DUPLICATE_MAX_AHASH_DISTANCE
+    )
+
+
+class DuplicateIndex:
+    """Exact/near duplicate index over every image in the class folders.
+
+    The index intentionally searches across *all* classes and square types:
+    an exact/near pixel match under another label is a conflicting training
+    example, not a useful new one. Board-vision reports such a match as
+    soon as the user marks the piece and does not save the duplicate.
+    """
+
+    def __init__(self, dataset_dir=DATASET_DIR, records=None):
+        self.dataset_dir = Path(dataset_dir)
+        self.entries = []
+        self._exact = {}
+        self._bands = defaultdict(list)
+        self.unreadable = []
+        if records is None:
+            records = scan_dataset_records(self.dataset_dir)
+        for record in records:
+            path = record.get("path")
+            if path is None:
+                raw_path = str(record.get("image_path", ""))
+                path = Path(raw_path)
+                if not path.is_absolute():
+                    path = BASE_DIR / path
+            try:
+                entry = self.make_entry(
+                    _load_rgb_image(path),
+                    label=record.get("label", ""),
+                    label_code=record.get("label_code", ""),
+                    square_type=record.get("square_type", ""),
+                    path=path,
+                    source="datasets folder",
+                )
+            except Exception:
+                self.unreadable.append(Path(path))
+                continue
+            self._register(entry)
+
+    @classmethod
+    def load(cls, dataset_dir=DATASET_DIR):
+        ensure_dataset_layout(dataset_dir)
+        return cls(dataset_dir)
+
+    @property
+    def example_count(self):
+        return len(self.entries)
+
+    def make_entry(
+        self,
+        tile,
+        label_option=None,
+        square_type="",
+        *,
+        label="",
+        label_code="",
+        path=None,
+        source="current board",
+    ):
+        if label_option is not None:
+            label_code, label, _display = label_option
+        canonical = canonical_tile_array(tile)
+        return {
+            "path": path,
+            "label": label,
+            "label_code": label_code,
+            "square_type": square_type or "",
+            "source": source,
+            "exact_hash": _exact_tile_hash(canonical),
+            "average_hash": _average_hash(canonical),
+            "fingerprint": _tile_fingerprint(canonical),
+            "canonical": canonical if path is None else None,
+        }
+
+    def _register(self, entry):
+        index = len(self.entries)
+        self.entries.append(entry)
+        self._exact.setdefault(entry["exact_hash"], entry)
+        for band_key in _ahash_bands(entry["average_hash"]):
+            self._bands[band_key].append(index)
+        return entry
+
+    def add_saved(self, record, tile):
+        """Add one just-saved tile so later boards in this run see it."""
+        path = record.get("path")
+        if path is None and record.get("image_path"):
+            path = Path(record["image_path"])
+            if not path.is_absolute():
+                path = BASE_DIR / path
+        entry = self.make_entry(
+            tile,
+            label=record.get("label", ""),
+            label_code=record.get("label_code", ""),
+            square_type=record.get("square_type", ""),
+            path=path,
+            source="datasets folder",
+        )
+        return self._register(entry)
+
+    @staticmethod
+    def _report(kind, entry, mean_abs_error, changed_fraction, ahash_distance):
+        path = entry.get("path")
+        return {
+            "kind": kind,
+            "path": str(path) if path is not None else entry.get("source", "current board"),
+            "label": entry.get("label", ""),
+            "label_code": entry.get("label_code", ""),
+            "square_type": entry.get("square_type", ""),
+            "source": entry.get("source", ""),
+            "mean_abs_error": float(mean_abs_error),
+            "changed_fraction": float(changed_fraction),
+            "average_hash_distance": int(ahash_distance),
+        }
+
+    def find_duplicate(self, tile, label_option=None, square_type="", extra_entries=()):
+        """Return an exact/near duplicate report for ``tile``, or None.
+
+        ``label_option`` and ``square_type`` describe the user's new mark for
+        API clarity; matching itself is pixel-based across every class.
+        ``extra_entries`` are unique tiles already accepted from the board
+        currently being reviewed but not saved to disk yet.
+        """
+        candidate = self.make_entry(
+            tile,
+            label_option=label_option,
+            square_type=square_type,
+            path=None,
+            source="candidate",
+        )
+        canonical = candidate["canonical"]
+
+        exact_entry = self._exact.get(candidate["exact_hash"])
+        if exact_entry is not None:
+            return self._report("exact", exact_entry, 0.0, 0.0, 0)
+        for entry in extra_entries:
+            if entry["exact_hash"] == candidate["exact_hash"]:
+                return self._report("exact", entry, 0.0, 0.0, 0)
+
+        candidate_indices = set()
+        for band_key in _ahash_bands(candidate["average_hash"]):
+            candidate_indices.update(self._bands.get(band_key, ()))
+        possible_entries = [self.entries[index] for index in sorted(candidate_indices)]
+        possible_entries.extend(extra_entries)
+
+        best = None
+        for entry in possible_entries:
+            ahash_distance = int(
+                (candidate["average_hash"] ^ entry["average_hash"]).bit_count()
+            )
+            if ahash_distance > NEAR_DUPLICATE_MAX_AHASH_DISTANCE:
+                continue
+            fingerprint_mae = float(
+                np.mean(np.abs(candidate["fingerprint"] - entry["fingerprint"]))
+            )
+            if fingerprint_mae > NEAR_DUPLICATE_PREFILTER_MAX_MAE:
+                continue
+
+            other = entry.get("canonical")
+            if other is None:
+                try:
+                    other = canonical_tile_array(_load_rgb_image(entry["path"]))
+                except Exception:
+                    continue
+            mean_abs_error, changed_fraction = _duplicate_metrics(canonical, other)
+            if not _is_near_duplicate(
+                mean_abs_error, changed_fraction, ahash_distance
+            ):
+                continue
+            report = self._report(
+                "near", entry, mean_abs_error, changed_fraction, ahash_distance
+            )
+            if best is None or report["mean_abs_error"] < best["mean_abs_error"]:
+                best = report
+        return best
+
+
+def duplicate_message(report):
+    """User-facing explanation shown when a marked tile is not saved."""
+    if not report:
+        return ""
+    kind = "exact-pixel" if report.get("kind") == "exact" else "near-duplicate"
+    existing_label = report.get("label") or "an existing class"
+    square = report.get("square_type") or "unknown square type"
+    return (
+        f"DUPLICATE ({kind}) — not saved. It matches {existing_label} "
+        f"({square}) at {report.get('path', 'an existing tile')}. "
+        "Duplicate images make CNN training slower and can make the model "
+        "faulty/over-confident, so only the first unique copy is kept."
+    )
+
+
+def save_labelled_tiles(
+    tile_entries,
+    answers,
+    source_image,
+    board_id,
+    game_id=None,
+    duplicate_reports=None,
+    duplicate_index=None,
+    dataset_dir=DATASET_DIR,
+):
+    """Save unique reviewed tiles into ``datasets/<class>/`` folders.
+
+    Returns ``(saved_records, skipped_duplicate_records)``. A tile already
+    reported as a duplicate during manual review is not written. As a final
+    safety check, every other tile is checked again against the folders and
+    against unique tiles saved earlier from this same board.
+    """
     if len(tile_entries) != len(answers):
         raise ValueError("Every tile must have a manual label and square type")
+    if duplicate_reports is not None and len(duplicate_reports) != len(answers):
+        raise ValueError("Every tile must have a duplicate-check result")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    existing = load_dataset_records(DATASET_CSV)
-    sequence = _next_dataset_sequence(existing, OUTPUT_DIR)
-    records = []
+    dataset_dir = ensure_dataset_layout(dataset_dir)
+    if duplicate_index is None:
+        duplicate_index = DuplicateIndex.load(dataset_dir)
 
-    for (row, col, tile), (label_option, square_type) in zip(tile_entries, answers):
+    existing = scan_dataset_records(dataset_dir)
+    sequence = _next_dataset_sequence(existing, dataset_dir)
+    saved_records = []
+    skipped_records = []
+    metadata_records = []
+    game_id = game_id or board_id
+
+    for tile_index, ((row, col, tile), (label_option, square_type)) in enumerate(
+        zip(tile_entries, answers)
+    ):
         label_code, label, _display = label_option
-        while True:
-            filename = f"{label_code}_{square_type}_{sequence:06d}.png"
-            image_path = OUTPUT_DIR / filename
-            sequence += 1
-            if not image_path.exists():
-                break
-        if not cv2.imwrite(str(image_path), tile):
-            raise OSError(f"Could not save labelled square: {image_path}")
-        records.append({
-            "image_path": _path_for_csv(image_path),
-            "filename": filename,
+        report = None
+        if duplicate_reports is not None:
+            report = duplicate_reports[tile_index]
+        if report is None:
+            report = duplicate_index.find_duplicate(
+                tile, label_option=label_option, square_type=square_type
+            )
+
+        metadata = {
+            "image_path": "",
+            "filename": "",
             "label": label,
             "label_code": label_code,
             "square_type": square_type,
-            "split": "unsplit",
             "row": str(row),
             "col": str(col),
             "source_image": _path_for_csv(source_image),
             "board_id": board_id,
-            "game_id": game_id or board_id,
+            "game_id": game_id,
+            "saved": "0",
+            "duplicate_of": "",
+            "duplicate_kind": "",
+            "duplicate_mean_abs_error": "",
+            "duplicate_changed_fraction": "",
+        }
+
+        if report is not None:
+            metadata.update({
+                "duplicate_of": str(report.get("path", "")),
+                "duplicate_kind": str(report.get("kind", "")),
+                "duplicate_mean_abs_error": f"{float(report.get('mean_abs_error', 0.0)):.4f}",
+                "duplicate_changed_fraction": f"{float(report.get('changed_fraction', 0.0)):.4f}",
+            })
+            skipped = dict(metadata)
+            skipped["duplicate_report"] = report
+            skipped_records.append(skipped)
+            metadata_records.append(metadata)
+            continue
+
+        class_dir = dataset_dir / CLASS_FOLDER_BY_LABEL[label]
+        while True:
+            filename = (
+                f"{label_code}_{square_type}__{game_id}__"
+                f"r{row}c{col}__{sequence:06d}.png"
+            )
+            image_path = class_dir / filename
+            sequence += 1
+            if not image_path.exists():
+                break
+
+        _save_rgb_image(image_path, tile)
+        metadata.update({
+            "image_path": _path_for_csv(image_path),
+            "filename": filename,
+            "saved": "1",
+        })
+        record = dict(metadata)
+        record["split"] = "unsplit"
+        record["path"] = image_path
+        saved_records.append(record)
+        metadata_records.append(metadata)
+        duplicate_index.add_saved(record, tile)
+
+    append_metadata_records(metadata_records, dataset_dir)
+    return saved_records, skipped_records
+
+
+def _resolve_legacy_image_path(value, csv_path, legacy_dir):
+    """Resolve an image path stored in the old board_debug CSV."""
+    raw_path = Path(str(value))
+    if raw_path.is_absolute():
+        return raw_path
+    candidates = [
+        Path(csv_path).parent / raw_path,
+        Path(legacy_dir) / raw_path.name,
+        BASE_DIR / raw_path,
+        Path.cwd() / raw_path,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def load_legacy_records(csv_path=LEGACY_DATASET_CSV, legacy_dir=LEGACY_DATASET_DIR):
+    """Load old flat board_debug rows for a one-time folder migration."""
+    csv_path = Path(csv_path)
+    legacy_dir = Path(legacy_dir)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Legacy dataset CSV does not exist: {csv_path}")
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    records = []
+    for row in rows:
+        if str(row.get("saved", "1")).strip() == "0":
+            continue
+        image_value = row.get("image_path") or row.get("filename") or ""
+        if not image_value:
+            continue
+
+        label = str(row.get("label") or "").strip()
+        label_code = str(row.get("label_code") or "").strip().lower()
+        if not label and label_code in LABEL_BY_CODE:
+            label = LABEL_BY_CODE[label_code]
+        if label == "blank":
+            label = "empty"
+        if label not in LABEL_OPTION_BY_LABEL:
+            continue
+        label_option = LABEL_OPTION_BY_LABEL[label]
+        label_code = label_option[0]
+
+        square_type = str(row.get("square_type") or "").strip().lower()
+        if square_type not in SQUARE_TYPE_DISPLAY:
+            parsed = _parse_tile_filename(image_value)
+            square_type = parsed["square_type"] or "light"
+
+        image_path = _resolve_legacy_image_path(image_value, csv_path, legacy_dir)
+        game_id = str(
+            row.get("game_id")
+            or row.get("board_id")
+            or row.get("source_image")
+            or "legacy-import"
+        ).strip()
+        records.append({
+            "path": image_path,
+            "label": label,
+            "label_code": label_code,
+            "label_option": label_option,
+            "square_type": square_type,
+            "row": str(row.get("row") or "0"),
+            "col": str(row.get("col") or "0"),
+            "source_image": str(row.get("source_image") or image_value),
+            "board_id": str(row.get("board_id") or game_id),
+            "game_id": game_id,
         })
     return records
 
 
-def run_cnn_trainer(records):
-    """Run cnn_trainer.py against dataset.csv after the balance check."""
+def import_legacy_dataset(
+    legacy_dir=LEGACY_DATASET_DIR,
+    csv_path=None,
+    dataset_dir=DATASET_DIR,
+    duplicate_index=None,
+):
+    """Copy unique old board_debug tiles into ``datasets/<class>/``.
+
+    This is a one-time migration helper. The legacy split columns are not
+    copied: the migrated images become part of the same shared class-folder
+    source, and cnn_trainer.py derives fresh whole-game splits from the
+    preserved game IDs. Exact/near duplicates—including duplicates already
+    inside the old dataset—are reported in the summary/metadata and skipped.
+    """
+    legacy_dir = Path(legacy_dir)
+    csv_path = Path(csv_path) if csv_path is not None else legacy_dir / "dataset.csv"
+    dataset_dir = ensure_dataset_layout(dataset_dir)
+    if duplicate_index is None:
+        duplicate_index = DuplicateIndex.load(dataset_dir)
+
+    legacy_records = load_legacy_records(csv_path, legacy_dir)
+    existing = scan_dataset_records(dataset_dir)
+    sequence = _next_dataset_sequence(existing, dataset_dir)
+    saved_records = []
+    skipped_records = []
+    missing_records = []
+    metadata_records = []
+
+    print(f"\nImporting {len(legacy_records)} legacy row(s) from {csv_path}...")
+    for legacy in legacy_records:
+        label_option = legacy["label_option"]
+        label_code, label, _display = label_option
+        square_type = legacy["square_type"]
+        metadata = {
+            "image_path": "",
+            "filename": "",
+            "label": label,
+            "label_code": label_code,
+            "square_type": square_type,
+            "row": legacy["row"],
+            "col": legacy["col"],
+            "source_image": _path_for_csv(legacy["source_image"]),
+            "board_id": legacy["board_id"],
+            "game_id": legacy["game_id"],
+            "saved": "0",
+            "duplicate_of": "",
+            "duplicate_kind": "",
+            "duplicate_mean_abs_error": "",
+            "duplicate_changed_fraction": "",
+        }
+
+        try:
+            tile = _load_rgb_image(legacy["path"])
+        except Exception:
+            missing_records.append(legacy)
+            metadata_records.append(metadata)
+            continue
+
+        report = duplicate_index.find_duplicate(
+            tile, label_option=label_option, square_type=square_type
+        )
+        if report is not None:
+            metadata.update({
+                "duplicate_of": str(report.get("path", "")),
+                "duplicate_kind": str(report.get("kind", "")),
+                "duplicate_mean_abs_error": f"{float(report.get('mean_abs_error', 0.0)):.4f}",
+                "duplicate_changed_fraction": f"{float(report.get('changed_fraction', 0.0)):.4f}",
+            })
+            skipped = dict(metadata)
+            skipped["duplicate_report"] = report
+            skipped_records.append(skipped)
+            metadata_records.append(metadata)
+            continue
+
+        try:
+            row = int(legacy["row"])
+            col = int(legacy["col"])
+        except (TypeError, ValueError):
+            row = col = 0
+        safe_game_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(legacy["game_id"]))
+        class_dir = dataset_dir / CLASS_FOLDER_BY_LABEL[label]
+        while True:
+            filename = (
+                f"{label_code}_{square_type}__{safe_game_id}__"
+                f"r{row}c{col}__{sequence:06d}.png"
+            )
+            image_path = class_dir / filename
+            sequence += 1
+            if not image_path.exists():
+                break
+
+        _save_rgb_image(image_path, tile)
+        metadata.update({
+            "image_path": _path_for_csv(image_path),
+            "filename": filename,
+            "saved": "1",
+        })
+        record = dict(metadata)
+        record["split"] = "unsplit"
+        record["path"] = image_path
+        saved_records.append(record)
+        metadata_records.append(metadata)
+        duplicate_index.add_saved(record, tile)
+
+    append_metadata_records(metadata_records, dataset_dir)
+    print(f"Imported {len(saved_records)} unique legacy image(s) into {dataset_dir}.")
+    if skipped_records:
+        print(
+            f"Skipped {len(skipped_records)} legacy duplicate image(s). "
+            "Duplicates slow training and can make the model faulty, so they "
+            "were not copied into the class folders."
+        )
+        for skipped in skipped_records[:10]:
+            report = skipped["duplicate_report"]
+            print(f"  duplicate ({report.get('kind')}): {duplicate_message(report)}")
+        if len(skipped_records) > 10:
+            print(f"  ... and {len(skipped_records) - 10} more (see metadata.csv)")
+    if missing_records:
+        print(f"Skipped {len(missing_records)} missing/unreadable legacy image(s).")
+
+    all_records = scan_dataset_records(dataset_dir)
+    print_dataset_report(all_records, dataset_dir)
+    return all_records
+
+
+def run_cnn_trainer(records, dataset_dir=DATASET_DIR):
+    """Run cnn_trainer.py against the shared ``datasets/<class>/`` folders."""
     _counts, imbalanced = dataset_balance(records)
     if imbalanced:
         print("\nCNN training was not started because the light/dark balance")
@@ -621,9 +1175,7 @@ def run_cnn_trainer(records):
         sys.executable,
         str(CNN_TRAINER_PATH),
         "--dataset-dir",
-        str(OUTPUT_DIR),
-        "--csv",
-        str(DATASET_CSV),
+        str(Path(dataset_dir)),
         "--output",
         str(BASE_DIR / "chessbotv_cnn.pth"),
     ]
@@ -637,550 +1189,102 @@ def run_cnn_trainer(records):
     return True
 
 
-def _resolve_local_path(value):
-    """Resolve a board-vision CSV path relative to this script's folder."""
-    path = Path(str(value))
-    return path if path.is_absolute() else BASE_DIR / path
+_FONT_CACHE = {}
 
 
-def _semi_auto_feature(tile):
-    """Build an OpenCV feature vector for one board square.
-
-    The vector intentionally combines a centre-weighted colour grid,
-    Canny edges, a foreground mask (pixels unlike the corner-estimated
-    square colour), an HSV histogram, and the four corner colours. That
-    gives the assistant information about both the piece shape/colour and
-    whether the underlying square looks light, dark, or highlighted.
-    """
-    try:
-        if tile is None or getattr(tile, "size", 0) == 0:
-            return None
-        image = np.asarray(tile)
-        if image.ndim == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        elif image.ndim == 3 and image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-        elif image.ndim != 3 or image.shape[2] != 3:
-            return None
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-
-        interpolation = (
-            cv2.INTER_AREA if max(image.shape[:2]) > 64 else cv2.INTER_LINEAR
+def _require_pygame():
+    if pygame is None:
+        raise RuntimeError(
+            "pygame is required for board-vision.py's manual windows. "
+            "Install it with: pip install pygame"
         )
-        resized = cv2.resize(image, (64, 64), interpolation=interpolation)
-
-        axis = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
-        xx, yy = np.meshgrid(axis, axis)
-        centre_weight = 0.7 + 0.8 * np.exp(-(xx * xx + yy * yy) / 0.75)
-
-        colour_grid = cv2.resize(
-            resized, (16, 16), interpolation=cv2.INTER_AREA
-        ).astype(np.float32) / 255.0
-        colour_grid *= centre_weight[:, :, None]
-
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        edge_grid = cv2.resize(
-            edges, (16, 16), interpolation=cv2.INTER_AREA
-        ).astype(np.float32) / 255.0
-        edge_grid *= centre_weight
-
-        patch = 9
-        corner_pixels = np.concatenate(
-            [
-                resized[:patch, :patch].reshape(-1, 3),
-                resized[:patch, -patch:].reshape(-1, 3),
-                resized[-patch:, :patch].reshape(-1, 3),
-                resized[-patch:, -patch:].reshape(-1, 3),
-            ],
-            axis=0,
-        )
-        background = np.median(corner_pixels, axis=0)
-        colour_difference = np.linalg.norm(
-            resized.astype(np.float32) - background, axis=2
-        )
-        foreground = (colour_difference > 42).astype(np.uint8) * 255
-        foreground_grid = cv2.resize(
-            foreground, (16, 16), interpolation=cv2.INTER_AREA
-        ).astype(np.float32) / 255.0
-        foreground_grid *= centre_weight
-
-        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
-        histogram = cv2.calcHist(
-            [hsv], [0, 1, 2], None, [12, 4, 4],
-            [0, 180, 0, 256, 0, 256],
-        )
-        cv2.normalize(histogram, histogram, alpha=1.0, norm_type=cv2.NORM_L1)
-
-        corner_patch = 12
-        corner_colours = np.concatenate(
-            [
-                resized[:corner_patch, :corner_patch].reshape(-1, 3).mean(axis=0),
-                resized[:corner_patch, -corner_patch:].reshape(-1, 3).mean(axis=0),
-                resized[-corner_patch:, :corner_patch].reshape(-1, 3).mean(axis=0),
-                resized[-corner_patch:, -corner_patch:].reshape(-1, 3).mean(axis=0),
-            ]
-        ).astype(np.float32) / 255.0
-
-        return np.concatenate(
-            [
-                colour_grid.ravel(),
-                edge_grid.ravel() * 0.8,
-                foreground_grid.ravel() * 0.65,
-                np.sqrt(histogram.astype(np.float32).ravel()) * 0.45,
-                corner_colours * 0.8,
-            ]
-        ).astype(np.float32)
-    except Exception:
-        return None
+    return pygame
 
 
-def _semi_auto_distance(first, second):
-    """Root-mean-square distance between two semi-auto feature vectors."""
-    if first is None or second is None:
-        return math.inf
-    first = np.asarray(first, dtype=np.float32)
-    second = np.asarray(second, dtype=np.float32)
-    if first.shape != second.shape:
-        return math.inf
-    return float(np.sqrt(np.mean((first - second) ** 2)))
+def _font(size=20, bold=False):
+    _require_pygame()
+    key = (int(size), bool(bold))
+    if key not in _FONT_CACHE:
+        font = pygame.font.Font(None, int(size))
+        font.set_bold(bool(bold))
+        _FONT_CACHE[key] = font
+    return _FONT_CACHE[key]
 
 
-def _match_confidence(best, second=None):
-    """Small display confidence from match quality and best/second margin."""
-    if not math.isfinite(best):
-        return 0.0
-    similarity = math.exp(-max(float(best), 0.0) / 0.18)
-    if second is None or not math.isfinite(second):
-        return similarity * 0.75
-    margin = (float(second) - float(best)) / max(float(second), 1e-9)
-    margin = min(1.0, max(0.0, margin * 2.0))
-    return math.sqrt(similarity * margin)
+def _open_window(size, title):
+    _require_pygame()
+    if not pygame.get_init():
+        pygame.init()
+    if not pygame.display.get_init():
+        pygame.display.init()
+    if not pygame.font.get_init():
+        pygame.font.init()
+    screen = pygame.display.set_mode(size)
+    pygame.display.set_caption(title)
+    return screen
 
 
-def _make_semi_auto_example(tile, label_option, square_type, feature=None):
-    if feature is None:
-        feature = _semi_auto_feature(tile)
-    if feature is None:
-        return None
-    return {
-        "label_option": label_option,
-        "square_type": square_type,
-        "feature": np.asarray(feature, dtype=np.float32),
-        "path": None,
-    }
+def _close_gui():
+    if pygame is not None and pygame.display.get_init():
+        pygame.display.quit()
 
 
-def load_semi_auto_records(csv_path=SEMI_AUTO_CSV):
-    """Load the separate semi-auto assistant examples.csv."""
-    csv_path = Path(csv_path)
-    if not csv_path.is_file():
-        return []
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    records = []
-    for row in rows:
-        record = {
-            field: str(row.get(field, "") or "") for field in SEMI_AUTO_FIELDS
-        }
-        if (
-            record["image_path"]
-            and record["label_code"] in LABEL_OPTION_BY_CODE
-            and record["square_type"] in SQUARE_TYPE_DISPLAY
-        ):
-            records.append(record)
-    return records
+def _surface_from_rgb(array):
+    _require_pygame()
+    rgb = _as_rgb_array(array)
+    height, width = rgb.shape[:2]
+    surface = pygame.image.frombuffer(rgb.tobytes(), (width, height), "RGB")
+    return surface.convert()
 
 
-def write_semi_auto_records(records, csv_path=SEMI_AUTO_CSV):
-    """Write the semi-auto learning index (kept outside board_debug/)."""
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = csv_path.with_suffix(csv_path.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SEMI_AUTO_FIELDS)
-        writer.writeheader()
-        for record in records:
-            writer.writerow(
-                {field: record.get(field, "") for field in SEMI_AUTO_FIELDS}
-            )
-    temporary.replace(csv_path)
-    return csv_path
+def _draw_text(surface, text, position, size=20, colour=(255, 255, 255),
+               bold=False, center_x=None):
+    font = _font(size, bold)
+    rendered = font.render(str(text), True, colour)
+    x, y = position
+    if center_x is not None:
+        x = int(center_x - rendered.get_width() / 2)
+    # A subtle dark shadow keeps white text readable over bright tiles.
+    shadow = font.render(str(text), True, (0, 0, 0))
+    surface.blit(shadow, (x + 1, y + 1))
+    surface.blit(rendered, (x, y))
+    return rendered.get_rect(topleft=(x, y))
 
 
-def _scan_semi_auto_records(examples_dir=SEMI_AUTO_EXAMPLES_DIR):
-    """Fallback records for manually seeded examples/<code>/<square>/ files."""
-    examples_dir = Path(examples_dir)
-    records = []
-    if not examples_dir.is_dir():
-        return records
-    for path in sorted(examples_dir.rglob("*")):
-        if (
-            not path.is_file()
-            or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS
-        ):
+def _wrap_text(text, max_width, size=18, bold=False):
+    font = _font(size, bold)
+    lines = []
+    for paragraph in str(text).splitlines() or [""]:
+        words = paragraph.split()
+        if not words:
+            lines.append("")
             continue
-        parts = path.relative_to(examples_dir).parts
-        if len(parts) < 3:
-            continue
-        label_code, square_type = parts[-3], parts[-2]
-        option = LABEL_OPTION_BY_CODE.get(label_code)
-        if option is None or square_type not in SQUARE_TYPE_DISPLAY:
-            continue
-        records.append(
-            {
-                "image_path": _path_for_csv(path.resolve()),
-                "filename": path.name,
-                "label": option[1],
-                "label_code": label_code,
-                "square_type": square_type,
-                "source_image": "",
-                "board_id": "",
-            }
-        )
-    return records
-
-
-def _next_semi_auto_sequence(records, examples_dir=SEMI_AUTO_EXAMPLES_DIR):
-    highest = 0
-    candidates = [record.get("filename", "") for record in records]
-    examples_dir = Path(examples_dir)
-    if examples_dir.is_dir():
-        candidates.extend(
-            path.name for path in examples_dir.rglob("*") if path.is_file()
-        )
-    for name in candidates:
-        match = re.search(r"_(\d+)$", Path(str(name)).stem)
-        if match:
-            highest = max(highest, int(match.group(1)))
-    return highest + 1
-
-
-class SemiAutoAssistant:
-    """OpenCV example matcher that learns only from user-confirmed choices.
-
-    Persistent examples live under board_vision_assistant/, separate from
-    board_debug/'s CNN dataset. During one board, manual_review_tiles can
-    also pass the already-confirmed squares from that board as temporary
-    examples, so suggestions improve immediately while the user is working.
-    """
-
-    def __init__(self, base_dir=SEMI_AUTO_DIR, examples=None, records=None):
-        self.base_dir = Path(base_dir)
-        self.examples_dir = self.base_dir / "examples"
-        self.csv_path = self.base_dir / "examples.csv"
-        self.examples = list(examples or [])
-        self.records = list(records or [])
-
-    @classmethod
-    def load(cls, base_dir=SEMI_AUTO_DIR):
-        assistant = cls(base_dir=base_dir)
-        assistant.examples_dir.mkdir(parents=True, exist_ok=True)
-        records = load_semi_auto_records(assistant.csv_path)
-        if not records:
-            records = _scan_semi_auto_records(assistant.examples_dir)
-        assistant.records = records
-
-        for record in records:
-            option = LABEL_OPTION_BY_CODE.get(record.get("label_code", ""))
-            square_type = record.get("square_type", "")
-            if option is None or square_type not in SQUARE_TYPE_DISPLAY:
-                continue
-            image_path = _resolve_local_path(record.get("image_path", ""))
-            if not image_path.is_file():
-                continue
-            image = cv2.imread(str(image_path))
-            example = _make_semi_auto_example(image, option, square_type)
-            if example is not None:
-                example["path"] = image_path
-                assistant.examples.append(example)
-        return assistant
-
-    @property
-    def example_count(self):
-        return len(self.examples)
-
-    def _group_scores(self, feature, examples):
-        usable = [
-            example
-            for example in examples
-            if example is not None
-            and example.get("feature") is not None
-            and np.asarray(example["feature"]).shape == np.asarray(feature).shape
-        ]
-        if not usable:
-            return {}
-
-        vectors = np.stack(
-            [np.asarray(example["feature"], dtype=np.float32) for example in usable]
-        )
-        distances = np.sqrt(
-            np.mean(
-                (vectors - np.asarray(feature, dtype=np.float32)) ** 2,
-                axis=1,
-            )
-        )
-
-        grouped = {}
-        for example, distance in zip(usable, distances):
-            option = example.get("label_option")
-            square_type = example.get("square_type")
-            if (
-                not option
-                or option[0] not in LABEL_OPTION_BY_CODE
-                or square_type not in SQUARE_TYPE_DISPLAY
-            ):
-                continue
-            grouped.setdefault((option[0], square_type), []).append(float(distance))
-
-        return {
-            key: float(np.mean(sorted(values)[:SEMI_AUTO_FEATURE_K]))
-            for key, values in grouped.items()
-            if values
-        }
-
-    def suggest_feature(self, feature, extra_examples=(), label_option=None):
-        """Suggest a piece and/or square type for one feature vector."""
-        if feature is None:
-            return None
-        examples = self.examples + [
-            example for example in extra_examples if example is not None
-        ]
-        group_scores = self._group_scores(feature, examples)
-        if not group_scores:
-            return None
-
-        sorted_groups = sorted(group_scores.items(), key=lambda item: item[1])
-        piece_scores = {}
-        for (label_code, _square_type), score in group_scores.items():
-            piece_scores[label_code] = min(score, piece_scores.get(label_code, math.inf))
-        sorted_pieces = sorted(piece_scores.items(), key=lambda item: item[1])
-
-        if label_option is None:
-            best_piece_code = sorted_groups[0][0][0]
-            chosen_option = LABEL_OPTION_BY_CODE[best_piece_code]
-            combined_best = sorted_groups[0][1]
-            combined_second = (
-                sorted_groups[1][1] if len(sorted_groups) > 1 else None
-            )
-            combined_confidence = _match_confidence(
-                combined_best, combined_second
-            )
-            alternatives = [
-                (
-                    LABEL_OPTION_BY_CODE[label_code],
-                    square_type,
-                    score,
-                )
-                for (label_code, square_type), score in sorted_groups[:3]
-            ]
-        else:
-            chosen_option = label_option
-            combined_confidence = _match_confidence(
-                sorted_groups[0][1],
-                sorted_groups[1][1] if len(sorted_groups) > 1 else None,
-            )
-            alternatives = []
-
-        piece_best = sorted_pieces[0][1]
-        piece_second = sorted_pieces[1][1] if len(sorted_pieces) > 1 else None
-        piece_confidence = _match_confidence(piece_best, piece_second)
-
-        square_candidates = sorted(
-            (
-                (square_type, score)
-                for (label_code, square_type), score in group_scores.items()
-                if label_code == chosen_option[0]
-            ),
-            key=lambda item: item[1],
-        )
-        if not square_candidates:
-            # No saved example for this manually chosen piece yet. Fall back
-            # to the closest learned square colours across all pieces.
-            global_square_scores = {}
-            for (_label_code, square_type), score in group_scores.items():
-                global_square_scores[square_type] = min(
-                    score, global_square_scores.get(square_type, math.inf)
-                )
-            square_candidates = sorted(
-                global_square_scores.items(), key=lambda item: item[1]
-            )
-
-        square_type, square_score = square_candidates[0]
-        square_second = (
-            square_candidates[1][1] if len(square_candidates) > 1 else None
-        )
-        square_confidence = _match_confidence(square_score, square_second)
-
-        return {
-            "label_option": chosen_option,
-            "square_type": square_type,
-            "confidence": (
-                square_confidence if label_option is not None else combined_confidence
-            ),
-            "combined_confidence": combined_confidence,
-            "piece_confidence": piece_confidence,
-            "square_confidence": square_confidence,
-            "distance": square_score if label_option is not None else sorted_groups[0][1],
-            "example_count": len(examples),
-            "group_count": len(group_scores),
-            "alternatives": alternatives,
-        }
-
-    def suggest(self, tile, extra_examples=(), label_option=None):
-        return self.suggest_feature(
-            _semi_auto_feature(tile),
-            extra_examples=extra_examples,
-            label_option=label_option,
-        )
-
-    def learn_from_board(self, tile_entries, answers, source_image, board_id):
-        """Save a bounded, diverse set of this board's confirmed examples.
-
-        Only final answers from a completed board should be passed here.
-        Existing assistant examples are preserved. At most
-        SEMI_AUTO_MAX_PER_GROUP references per (piece, square type) are kept.
-        """
-        if len(tile_entries) != len(answers):
-            raise ValueError("Every tile must have a confirmed semi-auto answer")
-
-        candidates = {}
-        for (_row, _col, tile), (label_option, square_type) in zip(
-            tile_entries, answers
-        ):
-            feature = _semi_auto_feature(tile)
-            if feature is None:
-                continue
-            key = (label_option[0], square_type)
-            candidates.setdefault(key, []).append(
-                {
-                    "tile": tile,
-                    "label_option": label_option,
-                    "square_type": square_type,
-                    "feature": feature,
-                }
-            )
-
-        existing_counts = {}
-        existing_features = {}
-        for record in self.records:
-            key = (record.get("label_code", ""), record.get("square_type", ""))
-            existing_counts[key] = existing_counts.get(key, 0) + 1
-        for example in self.examples:
-            option = example.get("label_option")
-            if not option:
-                continue
-            key = (option[0], example.get("square_type"))
-            existing_features.setdefault(key, []).append(example["feature"])
-            existing_counts[key] = max(
-                existing_counts.get(key, 0), len(existing_features[key])
-            )
-
-        additions = []
-        for key, group_candidates in candidates.items():
-            room = SEMI_AUTO_MAX_PER_GROUP - existing_counts.get(key, 0)
-            limit = min(room, SEMI_AUTO_MAX_NEW_PER_BOARD_GROUP)
-            if limit <= 0:
-                continue
-
-            remaining = list(group_candidates)
-            references = list(existing_features.get(key, []))
-            while remaining and limit > 0:
-                scored = []
-                for candidate_index, candidate in enumerate(remaining):
-                    nearest = min(
-                        (
-                            _semi_auto_distance(candidate["feature"], reference)
-                            for reference in references
-                        ),
-                        default=math.inf,
-                    )
-                    scored.append((nearest, candidate_index, candidate))
-                scored.sort(key=lambda item: item[0], reverse=True)
-                nearest, chosen_index, chosen = scored[0]
-
-                # One duplicate can help early on; after that, prefer saving
-                # room for a future board/theme instead of near-identical tiles.
-                if references and len(references) >= 2 and nearest < 0.01:
-                    break
-
-                additions.append(chosen)
-                references.append(chosen["feature"])
-                del remaining[chosen_index]
-                limit -= 1
-
-        if not additions:
-            return {
-                "saved": 0,
-                "considered": len(tile_entries),
-                "total_examples": self.example_count,
-            }
-
-        self.examples_dir.mkdir(parents=True, exist_ok=True)
-        sequence = _next_semi_auto_sequence(self.records, self.examples_dir)
-        saved = 0
-
-        for candidate in additions:
-            label_option = candidate["label_option"]
-            square_type = candidate["square_type"]
-            group_dir = self.examples_dir / label_option[0] / square_type
-            group_dir.mkdir(parents=True, exist_ok=True)
-
-            while True:
-                filename = (
-                    f"assistant_{label_option[0]}_{square_type}_"
-                    f"{sequence:06d}.png"
-                )
-                image_path = group_dir / filename
-                sequence += 1
-                if not image_path.exists():
-                    break
-
-            if not cv2.imwrite(str(image_path), candidate["tile"]):
-                raise OSError(f"Could not save semi-auto example: {image_path}")
-
-            self.records.append(
-                {
-                    "image_path": _path_for_csv(image_path),
-                    "filename": filename,
-                    "label": label_option[1],
-                    "label_code": label_option[0],
-                    "square_type": square_type,
-                    "source_image": _path_for_csv(source_image),
-                    "board_id": board_id,
-                }
-            )
-            example = _make_semi_auto_example(
-                candidate["tile"],
-                label_option,
-                square_type,
-                feature=candidate["feature"],
-            )
-            if example is not None:
-                example["path"] = image_path
-                self.examples.append(example)
-            saved += 1
-
-        write_semi_auto_records(self.records, self.csv_path)
-        return {
-            "saved": saved,
-            "considered": len(tile_entries),
-            "total_examples": self.example_count,
-        }
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if font.size(candidate)[0] <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+    return lines
 
 
 class ZoomView:
-    """Zoomable/pannable OpenCV window for pixel-accurate work.
+    """Zoomable/pannable Pygame view for pixel-accurate board work.
 
-    Mouse wheel (or +/-) zooms around the cursor, right- or middle-drag
-    pans, 0 resets to fit. When zoomed in, rendering uses INTER_NEAREST
-    so individual source pixels stay crisp instead of blurring together.
+    Mouse wheel (or +/-) zooms around the cursor and right/middle-drag
+    pans. This replaces the old OpenCV HighGUI plumbing while keeping the
+    same pixel-based selection workflow.
     """
 
     def __init__(self, title, image):
+        _require_pygame()
         self.title = title
-        self.img_h, self.img_w = image.shape[:2]
+        rgb = _as_rgb_array(image)
+        self.img_h, self.img_w = rgb.shape[:2]
+        self.surface = _surface_from_rgb(rgb)
         self.fit_zoom = min(VIEW_W / self.img_w, VIEW_H / self.img_h)
         self.min_zoom = self.fit_zoom * 0.25
         self.max_zoom = max(60.0, self.fit_zoom * 120.0)
@@ -1189,9 +1293,7 @@ class ZoomView:
         self._panning = False
         self._pan_last = None
         self.reset()
-        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(title, VIEW_W, VIEW_H)
-        cv2.setMouseCallback(title, self._on_mouse)
+        pygame.display.set_caption(title)
 
     def reset(self):
         """Fit the whole image in the window, centred."""
@@ -1204,6 +1306,20 @@ class ZoomView:
         fx = self.ox + self.mouse[0] / self.zoom
         fy = self.oy + self.mouse[1] / self.zoom
         return math.floor(fx), math.floor(fy)
+
+    def screen_to_image(self, point):
+        return (
+            self.ox + point[0] / self.zoom,
+            self.oy + point[1] / self.zoom,
+        )
+
+    def image_to_screen(self, x, y=None):
+        if y is None:
+            x, y = x
+        return (
+            int(round((float(x) - self.ox) * self.zoom)),
+            int(round((float(y) - self.oy) * self.zoom)),
+        )
 
     def zoom_by(self, factor):
         """Zoom in/out keeping the image point under the cursor fixed."""
@@ -1221,87 +1337,120 @@ class ZoomView:
         self.ox = float(np.clip(self.ox, -0.7 * vis_w, self.img_w - 0.3 * vis_w))
         self.oy = float(np.clip(self.oy, -0.7 * vis_h, self.img_h - 0.3 * vis_h))
 
-    def _on_mouse(self, event, x, y, flags, param):
-        self.mouse = (x, y)
-        if event == cv2.EVENT_MOUSEWHEEL:
-            if hasattr(cv2, "getMouseWheelDelta"):
-                delta = cv2.getMouseWheelDelta(flags)
-            else:
-                delta = flags
-            steps = float(np.clip(delta / 120.0, -3.0, 3.0))
+    def handle_event(self, event):
+        _require_pygame()
+        if event.type == pygame.MOUSEMOTION:
+            self.mouse = event.pos
+            if self._panning and self._pan_last is not None:
+                self.ox -= (event.pos[0] - self._pan_last[0]) / self.zoom
+                self.oy -= (event.pos[1] - self._pan_last[1]) / self.zoom
+                self._pan_last = event.pos
+                self._clamp_offset()
+        elif event.type == pygame.MOUSEWHEEL:
+            self.mouse = pygame.mouse.get_pos()
+            steps = float(np.clip(getattr(event, "y", 0), -3.0, 3.0))
             if steps:
                 self.zoom_by(1.2 ** steps)
-        elif event == cv2.EVENT_LBUTTONDOWN:
-            self.ldown = True
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.ldown = False
-        elif event in (cv2.EVENT_RBUTTONDOWN, cv2.EVENT_MBUTTONDOWN):
-            self._panning = True
-            self._pan_last = (x, y)
-        elif event in (cv2.EVENT_RBUTTONUP, cv2.EVENT_MBUTTONUP):
-            self._panning = False
-            self._pan_last = None
-        elif event == cv2.EVENT_MOUSEMOVE and self._panning and self._pan_last:
-            self.ox -= (x - self._pan_last[0]) / self.zoom
-            self.oy -= (y - self._pan_last[1]) / self.zoom
-            self._pan_last = (x, y)
-            self._clamp_offset()
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            self.mouse = event.pos
+            if event.button == 1:
+                self.ldown = True
+            elif event.button in (2, 3):
+                self._panning = True
+                self._pan_last = event.pos
+            elif event.button == 4:
+                self.zoom_by(1.2)
+            elif event.button == 5:
+                self.zoom_by(1.0 / 1.2)
+        elif event.type == pygame.MOUSEBUTTONUP:
+            self.mouse = event.pos
+            if event.button == 1:
+                self.ldown = False
+            elif event.button in (2, 3):
+                self._panning = False
+                self._pan_last = None
 
-    def render(self, display, hud_lines=()):
-        """Draw the visible part of `display` at the current zoom/pan."""
-        canvas = np.full((VIEW_H, VIEW_W, 3), 40, np.uint8)
+    def render(self, screen, hud_lines=(), overlay=None):
+        """Draw the visible image area into the left VIEW_W x VIEW_H pane."""
+        _require_pygame()
+        screen.fill((40, 40, 40), pygame.Rect(0, 0, VIEW_W, VIEW_H))
         x0, y0 = math.floor(self.ox), math.floor(self.oy)
         x1 = math.ceil(self.ox + VIEW_W / self.zoom)
         y1 = math.ceil(self.oy + VIEW_H / self.zoom)
         sx0, sy0 = max(x0, 0), max(y0, 0)
         sx1, sy1 = min(x1, self.img_w), min(y1, self.img_h)
+
         if sx1 > sx0 and sy1 > sy0:
-            patch = display[sy0:sy1, sx0:sx1]
-            pw = max(1, round((sx1 - sx0) * self.zoom))
-            ph = max(1, round((sy1 - sy0) * self.zoom))
-            interp = cv2.INTER_NEAREST if self.zoom >= 1.0 else cv2.INTER_AREA
-            patch = cv2.resize(patch, (pw, ph), interpolation=interp)
-            dx = round((sx0 - self.ox) * self.zoom)
-            dy = round((sy0 - self.oy) * self.zoom)
-            cx0, cy0 = max(dx, 0), max(dy, 0)
-            cx1, cy1 = min(dx + pw, VIEW_W), min(dy + ph, VIEW_H)
-            if cx1 > cx0 and cy1 > cy0:
-                canvas[cy0:cy1, cx0:cx1] = patch[cy0 - dy:cy1 - dy, cx0 - dx:cx1 - dx]
+            source_rect = pygame.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)
+            patch = self.surface.subsurface(source_rect)
+            width = max(1, int(round((sx1 - sx0) * self.zoom)))
+            height = max(1, int(round((sy1 - sy0) * self.zoom)))
+            if self.zoom >= 1.0:
+                scaled = pygame.transform.scale(patch, (width, height))
+            else:
+                scaled = pygame.transform.smoothscale(patch, (width, height))
+            dx = int(round((sx0 - self.ox) * self.zoom))
+            dy = int(round((sy0 - self.oy) * self.zoom))
+            screen.blit(scaled, (dx, dy))
+
+        if overlay is not None:
+            overlay(screen, self)
+
         if hud_lines:
-            box_h = 22 * len(hud_lines) + 12
-            cv2.rectangle(canvas, (0, 0), (VIEW_W, box_h), (20, 20, 20), -1)
-            for i, line in enumerate(hud_lines):
-                cv2.putText(
-                    canvas, line, (10, 24 + 22 * i),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
-                )
-        cv2.imshow(self.title, canvas)
+            box_h = 24 * len(hud_lines) + 12
+            pygame.draw.rect(screen, (20, 20, 20), (0, 0, VIEW_W, box_h))
+            for index, line in enumerate(hud_lines):
+                _draw_text(screen, line, (10, 7 + 24 * index), size=18)
 
 
-def _view_key(view, key):
-    """Shared zoom keys for the interactive windows."""
-    if key in (ord("+"), ord("=")):
+def _view_key_event(view, event):
+    """Shared zoom keys for the interactive Pygame windows."""
+    _require_pygame()
+    if event.type != pygame.KEYDOWN:
+        return False
+    if event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
         view.zoom_by(1.25)
-    elif key in (ord("-"), ord("_")):
+        return True
+    if event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE, pygame.K_KP_MINUS):
         view.zoom_by(0.8)
-    elif key == ord("0"):
+        return True
+    if event.key in (pygame.K_0, pygame.K_KP0):
         view.reset()
+        return True
+    return False
 
 
 def select_board_roi(image):
-    """Drag-select the board on a zoomable view.
+    """Drag-select the board on a zoomable Pygame view.
 
-    Returns (x, y, w, h) in image pixels, or None if cancelled. Zoom in
-    with the mouse wheel to hit the board's outer edge pixel-exactly; the
-    HUD shows the live cursor pixel and the current rectangle.
+    Returns ``(x, y, w, h)`` in image pixels, or None if cancelled.
     """
-    img_h, img_w = image.shape[:2]
-    view = ZoomView("Select chessboard", image)
+    _require_pygame()
+    rgb = _as_rgb_array(image)
+    img_h, img_w = rgb.shape[:2]
+    screen = _open_window((VIEW_W, VIEW_H), "Select chessboard")
+    view = ZoomView("Select chessboard", rgb)
+    clock = pygame.time.Clock()
     drag_start = None
     drag_now = None
-    rect = None  # finalised (x0, y0, x1, y1), inclusive
+    rect = None
+
     try:
         while True:
+            pressed_keys = set()
+            quit_requested = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    quit_requested = True
+                elif event.type == pygame.KEYDOWN:
+                    pressed_keys.add(event.key)
+                    _view_key_event(view, event)
+                else:
+                    view.handle_event(event)
+            if quit_requested or pressed_keys & {pygame.K_ESCAPE, pygame.K_c}:
+                return None
+
+            view.mouse = pygame.mouse.get_pos()
             ix, iy = view.mouse_image()
             ix = int(np.clip(ix, 0, img_w - 1))
             iy = int(np.clip(iy, 0, img_h - 1))
@@ -1312,24 +1461,50 @@ def select_board_roi(image):
                 drag_now = (ix, iy)
             elif drag_start is not None:
                 rect = (
-                    min(drag_start[0], drag_now[0]), min(drag_start[1], drag_now[1]),
-                    max(drag_start[0], drag_now[0]), max(drag_start[1], drag_now[1]),
+                    min(drag_start[0], drag_now[0]),
+                    min(drag_start[1], drag_now[1]),
+                    max(drag_start[0], drag_now[0]),
+                    max(drag_start[1], drag_now[1]),
                 )
                 drag_start = drag_now = None
 
             shown = rect
             if drag_start is not None:
                 shown = (
-                    min(drag_start[0], drag_now[0]), min(drag_start[1], drag_now[1]),
-                    max(drag_start[0], drag_now[0]), max(drag_start[1], drag_now[1]),
+                    min(drag_start[0], drag_now[0]),
+                    min(drag_start[1], drag_now[1]),
+                    max(drag_start[0], drag_now[0]),
+                    max(drag_start[1], drag_now[1]),
                 )
 
-            disp = image.copy()
-            # Crosshair through the cursor pixel to help align the edges.
-            cv2.line(disp, (ix, 0), (ix, img_h - 1), (0, 255, 255), 1)
-            cv2.line(disp, (0, iy), (img_w - 1, iy), (0, 255, 255), 1)
-            if shown:
-                cv2.rectangle(disp, (shown[0], shown[1]), (shown[2], shown[3]), (0, 255, 0), 1)
+            if shown and pressed_keys & {
+                pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE
+            }:
+                width = shown[2] - shown[0] + 1
+                height = shown[3] - shown[1] + 1
+                if width >= 16 and height >= 16:
+                    return shown[0], shown[1], width, height
+
+            def overlay(surface, current_view, shown_rect=shown):
+                mouse_x, mouse_y = current_view.mouse
+                if 0 <= mouse_x < VIEW_W:
+                    pygame.draw.line(
+                        surface, (0, 255, 255), (mouse_x, 0), (mouse_x, VIEW_H - 1), 1
+                    )
+                if 0 <= mouse_y < VIEW_H:
+                    pygame.draw.line(
+                        surface, (0, 255, 255), (0, mouse_y), (VIEW_W - 1, mouse_y), 1
+                    )
+                if shown_rect:
+                    left, top = current_view.image_to_screen(shown_rect[0], shown_rect[1])
+                    right, bottom = current_view.image_to_screen(
+                        shown_rect[2] + 1, shown_rect[3] + 1
+                    )
+                    select_rect = pygame.Rect(
+                        min(left, right), min(top, bottom),
+                        max(1, abs(right - left)), max(1, abs(bottom - top)),
+                    )
+                    pygame.draw.rect(surface, (0, 255, 0), select_rect, 1)
 
             hud = [
                 f"mouse px: ({ix}, {iy})   zoom: {view.zoom:.2f}x   "
@@ -1346,493 +1521,541 @@ def select_board_roi(image):
                     "drag the OUTER EDGE of the chessboard (zoom in for pixel "
                     "accuracy)   ENTER/SPACE=confirm  ESC/C=cancel"
                 )
-            view.render(disp, hud)
-
-            key = cv2.waitKey(20) & 0xFF
-            if key in (27, ord("c"), ord("C")):
-                return None
-            if key in (13, 10, 32) and shown:
-                w = shown[2] - shown[0] + 1
-                h = shown[3] - shown[1] + 1
-                if w >= 16 and h >= 16:
-                    return shown[0], shown[1], w, h
-            _view_key(view, key)
+            view.render(screen, hud, overlay=overlay)
+            pygame.display.flip()
+            clock.tick(60)
     finally:
-        cv2.destroyWindow("Select chessboard")
+        _close_gui()
 
 
-def _labelled_preview(text_lines, tile=None):
-    """Build the square-preview image (magnified tile, or a placeholder)."""
-    if tile is None or tile.size == 0:
-        preview = np.full((PREVIEW_SIZE, PREVIEW_SIZE, 3), 40, np.uint8)
-    else:
-        # INTER_NEAREST keeps the tile's pixels exact when magnified.
-        preview = cv2.resize(
-            tile, (PREVIEW_SIZE, PREVIEW_SIZE), interpolation=cv2.INTER_NEAREST
-        )
-    for i, (text, y) in enumerate(text_lines):
-        cv2.putText(
-            preview, text, (10, y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA,
-        )
-        cv2.putText(
-            preview, text, (10, y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA,
-        )
-    return preview
-
-
-def _manual_text(canvas, text, origin, scale=0.62, colour=(255, 255, 255), thickness=1):
-    cv2.putText(
-        canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
-        scale, (0, 0, 0), thickness + 2, cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
-        scale, colour, thickness, cv2.LINE_AA,
-    )
-
-
-def _manual_button(canvas, rect, text, selected=False, suggested=False):
-    x, y, w, h = rect
+def _manual_button(surface, rect, text, selected=False):
+    _require_pygame()
     if selected:
         fill = (64, 145, 72)
         border = (150, 255, 170)
-    elif suggested:
-        # Cyan/blue marks an OpenCV suggestion; it is never auto-confirmed.
-        fill = (92, 72, 25)
-        border = (255, 240, 90)
     else:
         fill = (62, 62, 72)
         border = (165, 165, 175)
-    cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), fill, -1)
-    cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), border, 2)
-    scale = 0.52
-    (text_w, text_h), _baseline = cv2.getTextSize(
-        text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1
-    )
-    _manual_text(
-        canvas,
-        text,
-        (x + max(6, (w - text_w) // 2), y + (h + text_h) // 2),
-        scale=scale,
-    )
+    pygame.draw.rect(surface, fill, rect)
+    pygame.draw.rect(surface, border, rect, 2)
+    font = _font(19)
+    rendered = font.render(str(text), True, (255, 255, 255))
+    text_rect = rendered.get_rect(center=rect.center)
+    shadow = font.render(str(text), True, (0, 0, 0))
+    surface.blit(shadow, (text_rect.x + 1, text_rect.y + 1))
+    surface.blit(rendered, text_rect)
 
 
-def manual_review_tiles(tile_entries, assistant=None, semi_auto_enabled=True):
-    """Review every tile, with optional OpenCV semi-auto suggestions.
+def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
+                        semi_auto_enabled=False):
+    """Manually mark every tile and immediately check it for duplicates.
 
-    The user always makes the final choice. For each square they first
-    confirm the piece/blank class, then confirm Light square, Dark square,
-    or Highlighted square. When semi-auto is enabled, the assistant's best
-    learned match is highlighted in cyan and can be accepted with A/Enter;
-    already-confirmed squares from this same board are used immediately as
-    temporary learning examples. Returns ``(label_option, square_type)``
-    pairs in tile order, or None if cancelled.
+    There are deliberately no OpenCV/model suggestions: the user first
+    clicks the piece/blank on the square, then Light, Dark, or Highlighted.
+    As soon as the piece is marked, the tile's normalised pixels are checked
+    against all existing class-folder images and unique tiles accepted
+    earlier on this board. Exact/near duplicates are announced in the GUI
+    and terminal and returned as skipped items; they are not saved.
+
+    Returns ``(answers, duplicate_reports)``, or None if cancelled. The two
+    legacy keyword arguments are accepted and ignored for compatibility.
     """
+    _ = (assistant, semi_auto_enabled)  # Manual marking is now always used.
     if not tile_entries:
-        return []
+        return [], []
 
+    _require_pygame()
     answers = [None] * len(tile_entries)
+    duplicate_reports = [None] * len(tile_entries)
+    preview_cache = {}
     index = 0
     stage = "label"
     selected_label = None
-    semi_auto_enabled = bool(semi_auto_enabled and assistant is not None)
-    tile_features = {}
-    suggestion_cache = {}
-    click = {"point": None}
-    title = "Semi-auto piece review" if semi_auto_enabled else "Manual piece review"
+    pending_duplicate = None
+    pending_duplicate_checked = False
+    status_message = ""
+    status_colour = (210, 225, 255)
+    duplicate_warning_printed = False
 
-    def feature_for(tile_index):
-        if tile_index not in tile_features:
-            tile_features[tile_index] = _semi_auto_feature(
-                tile_entries[tile_index][2]
-            )
-        return tile_features[tile_index]
-
-    def temporary_examples(up_to_index):
-        examples = []
-        for answer_index in range(up_to_index):
-            answer = answers[answer_index]
-            if answer is None:
-                continue
-            example = _make_semi_auto_example(
-                tile_entries[answer_index][2],
-                answer[0],
-                answer[1],
-                feature=feature_for(answer_index),
-            )
-            if example is not None:
-                examples.append(example)
-        return examples
-
-    def suggestion_for(tile_index, label_option=None):
-        if not semi_auto_enabled:
-            return None
-        cache_key = (
-            tile_index,
-            tuple(answers[:tile_index]),
-            label_option[0] if label_option else "",
-        )
-        if cache_key not in suggestion_cache:
-            try:
-                suggestion_cache[cache_key] = assistant.suggest_feature(
-                    feature_for(tile_index),
-                    extra_examples=temporary_examples(tile_index),
-                    label_option=label_option,
-                )
-            except Exception:
-                suggestion_cache[cache_key] = None
-        return suggestion_cache[cache_key]
-
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            click["point"] = (x, y)
-
-    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(title, MANUAL_W, MANUAL_H)
-    cv2.setMouseCallback(title, on_mouse)
-
-    try:
-        while index < len(tile_entries):
-            row, col, tile = tile_entries[index]
-            canvas = np.full((MANUAL_H, MANUAL_W, 3), 36, np.uint8)
-
-            suggestion = suggestion_for(
-                index, selected_label if stage == "square" else None
-            )
-
-            review_kind = "Semi-auto" if semi_auto_enabled else "Manual"
-            _manual_text(
-                canvas,
-                f"{review_kind} review {index + 1}/{len(tile_entries)}  -  square r{row} c{col}",
-                (24, 36),
-                scale=0.72,
-                thickness=2,
-            )
-            if stage == "label":
-                if suggestion:
-                    instruction = "Step 1: confirm piece. Cyan = OpenCV suggestion; A/Enter uses it"
-                elif semi_auto_enabled:
-                    instruction = "Step 1: choose piece. Semi-auto learns from each choice"
-                else:
-                    instruction = "Step 1: click what is on this square"
-            else:
-                if suggestion:
-                    instruction = (
-                        f"Step 2: {selected_label[2]} - confirm square. "
-                        "Cyan = OpenCV suggestion; A/Enter uses it"
-                    )
-                else:
-                    instruction = (
-                        f"Step 2: {selected_label[2]} - is it on a light, dark, "
-                        "or highlighted square?"
-                    )
-            _manual_text(canvas, instruction, (24, 68), scale=0.54)
-
-            if tile is not None and tile.size:
-                interp = (
-                    cv2.INTER_AREA
-                    if max(tile.shape[:2]) > MANUAL_TILE_SIZE
-                    else cv2.INTER_NEAREST
-                )
-                preview = cv2.resize(
-                    tile,
-                    (MANUAL_TILE_SIZE, MANUAL_TILE_SIZE),
-                    interpolation=interp,
-                )
-            else:
+    def preview_surface(tile_index):
+        if tile_index not in preview_cache:
+            tile = tile_entries[tile_index][2]
+            if tile is None or np.asarray(tile).size == 0:
                 preview = np.full(
                     (MANUAL_TILE_SIZE, MANUAL_TILE_SIZE, 3), 70, np.uint8
                 )
-            canvas[104:104 + MANUAL_TILE_SIZE, 24:24 + MANUAL_TILE_SIZE] = preview
-            cv2.rectangle(
-                canvas,
-                (24, 104),
-                (24 + MANUAL_TILE_SIZE - 1, 104 + MANUAL_TILE_SIZE - 1),
-                (230, 230, 230),
-                2,
-            )
-            _manual_text(
-                canvas,
-                f"Board square r{row} c{col}",
-                (24, 104 + MANUAL_TILE_SIZE + 34),
-                scale=0.58,
-            )
-
-            if semi_auto_enabled:
-                if suggestion:
-                    confidence = float(suggestion.get("confidence", 0.0))
-                    if stage == "label":
-                        suggestion_text = (
-                            f"OpenCV: {suggestion['label_option'][2]} + "
-                            f"{SQUARE_TYPE_DISPLAY[suggestion['square_type']]} "
-                            f"({confidence:.0%})"
-                        )
-                    else:
-                        suggestion_text = (
-                            "OpenCV: "
-                            f"{SQUARE_TYPE_DISPLAY[suggestion['square_type']]} "
-                            f"({confidence:.0%})"
-                        )
-                    suggestion_colour = (
-                        (120, 255, 150)
-                        if confidence >= 0.65
-                        else (110, 230, 255)
-                        if confidence >= 0.35
-                        else (130, 180, 255)
-                    )
-                else:
-                    suggestion_text = "OpenCV: no suggestion yet - still learning"
-                    suggestion_colour = (210, 210, 210)
-                _manual_text(
-                    canvas,
-                    suggestion_text,
-                    (24, 104 + MANUAL_TILE_SIZE + 72),
-                    scale=0.52,
-                    colour=suggestion_colour,
-                )
-                _manual_text(
-                    canvas,
-                    f"Learned: {assistant.example_count} saved + {index} this board",
-                    (24, 104 + MANUAL_TILE_SIZE + 104),
-                    scale=0.48,
-                )
-                _manual_text(
-                    canvas,
-                    "S = suggestions on/off",
-                    (24, 104 + MANUAL_TILE_SIZE + 134),
-                    scale=0.48,
-                    colour=(200, 220, 255),
-                )
-            elif assistant is not None:
-                _manual_text(
-                    canvas,
-                    "Suggestions: OFF (S to turn on)",
-                    (24, 104 + MANUAL_TILE_SIZE + 72),
-                    scale=0.52,
-                    colour=(210, 210, 210),
-                )
-
-            buttons = []
-            if stage == "label":
-                start_x, start_y = 424, 108
-                button_w, button_h, gap = 208, 54, 12
-                for option_index, option in enumerate(LABEL_OPTIONS):
-                    grid_col = option_index % 3
-                    grid_row = option_index // 3
-                    rect = (
-                        start_x + grid_col * (button_w + gap),
-                        start_y + grid_row * (button_h + gap),
-                        button_w,
-                        button_h,
-                    )
-                    is_suggested = bool(
-                        suggestion and suggestion.get("label_option") == option
-                    )
-                    _manual_button(
-                        canvas,
-                        rect,
-                        f"{'> ' if is_suggested else ''}{option[2]} ({option[0]})",
-                        selected=(selected_label == option),
-                        suggested=is_suggested,
-                    )
-                    buttons.append((rect, "label", option))
             else:
-                start_x, start_y = 460, 140
-                button_w, button_h, gap = 360, 68, 18
-                for option_index, (square_type, display) in enumerate(SQUARE_TYPE_OPTIONS):
-                    rect = (
-                        start_x,
-                        start_y + option_index * (button_h + gap),
-                        button_w,
-                        button_h,
-                    )
-                    is_suggested = bool(
-                        suggestion and suggestion.get("square_type") == square_type
-                    )
-                    _manual_button(
-                        canvas,
-                        rect,
-                        f"{'> ' if is_suggested else ''}{display}",
-                        suggested=is_suggested,
-                    )
-                    buttons.append((rect, "square", square_type))
-                _manual_text(
-                    canvas,
-                    "Keys: L = Light square, D = Dark square, H = Highlighted square",
-                    (430, 452),
-                    scale=0.52,
+                rgb = _as_rgb_array(tile)
+                resample = (
+                    PIL_RESAMPLE_LANCZOS
+                    if max(rgb.shape[:2]) > MANUAL_TILE_SIZE
+                    else PIL_RESAMPLE_NEAREST
                 )
+                preview = _resize_rgb_array(
+                    rgb, (MANUAL_TILE_SIZE, MANUAL_TILE_SIZE), resample
+                )
+            preview_cache[tile_index] = _surface_from_rgb(preview)
+        return preview_cache[tile_index]
 
-            back_rect = (424, MANUAL_H - 78, 190, 48)
-            cancel_rect = (630, MANUAL_H - 78, 190, 48)
-            _manual_button(canvas, back_rect, "Back (B)")
-            _manual_button(canvas, cancel_rect, "Cancel (Esc)")
-            buttons.append((back_rect, "back", None))
-            buttons.append((cancel_rect, "cancel", None))
-            if suggestion:
-                accept_rect = (836, MANUAL_H - 78, 260, 48)
-                accept_text = "Use suggestion (A)"
-                _manual_button(
-                    canvas, accept_rect, accept_text, suggested=True
+    def provisional_entries():
+        if duplicate_checker is None:
+            return []
+        entries = []
+        for answer_index in range(index):
+            answer = answers[answer_index]
+            if answer is None or duplicate_reports[answer_index] is not None:
+                continue
+            prior_row, prior_col, prior_tile = tile_entries[answer_index]
+            entries.append(
+                duplicate_checker.make_entry(
+                    prior_tile,
+                    label_option=answer[0],
+                    square_type=answer[1],
+                    source=f"current board square r{prior_row} c{prior_col}",
                 )
-                buttons.append((accept_rect, "accept_suggestion", None))
-            _manual_text(
-                canvas,
-                (
-                    "You make the final choice; confirmed squares teach the assistant."
-                    if semi_auto_enabled
-                    else "Every square is labelled manually, including blank squares."
-                ),
-                (24, MANUAL_H - 24),
-                scale=0.52,
-                colour=(190, 220, 255),
+            )
+        return entries
+
+    def check_current(label_option, square_type=""):
+        if duplicate_checker is None:
+            return None
+        try:
+            return duplicate_checker.find_duplicate(
+                tile_entries[index][2],
+                label_option=label_option,
+                square_type=square_type,
+                extra_entries=provisional_entries(),
+            )
+        except Exception as exc:
+            print(f"Warning: duplicate check failed for this tile: {exc}")
+            return None
+
+    def completed_counts():
+        unique = 0
+        duplicates = 0
+        for answer_index in range(index):
+            if answers[answer_index] is None:
+                continue
+            if duplicate_reports[answer_index] is None:
+                unique += 1
+            else:
+                duplicates += 1
+        return unique, duplicates
+
+    def make_buttons():
+        buttons = []
+        if stage == "label":
+            start_x, start_y = 424, 108
+            button_w, button_h, gap = 208, 54, 12
+            for option_index, option in enumerate(LABEL_OPTIONS):
+                grid_col = option_index % 3
+                grid_row = option_index // 3
+                rect = pygame.Rect(
+                    start_x + grid_col * (button_w + gap),
+                    start_y + grid_row * (button_h + gap),
+                    button_w,
+                    button_h,
+                )
+                buttons.append((rect, "label", option))
+        else:
+            start_x, start_y = 460, 140
+            button_w, button_h, gap = 360, 68, 18
+            for option_index, (square_type, _display) in enumerate(SQUARE_TYPE_OPTIONS):
+                rect = pygame.Rect(
+                    start_x,
+                    start_y + option_index * (button_h + gap),
+                    button_w,
+                    button_h,
+                )
+                buttons.append((rect, "square", square_type))
+
+        back_rect = pygame.Rect(424, MANUAL_H - 78, 190, 48)
+        cancel_rect = pygame.Rect(630, MANUAL_H - 78, 190, 48)
+        buttons.append((back_rect, "back", None))
+        buttons.append((cancel_rect, "cancel", None))
+        return buttons
+
+    def draw(buttons):
+        row, col, _tile = tile_entries[index]
+        screen.fill((36, 36, 36))
+        _draw_text(
+            screen,
+            f"Manual review {index + 1}/{len(tile_entries)}  -  square r{row} c{col}",
+            (24, 18),
+            size=27,
+            bold=True,
+        )
+        if stage == "label":
+            instruction = "Step 1: click the piece/blank that is on this square"
+        elif pending_duplicate is not None:
+            instruction = (
+                f"Step 2: {selected_label[2]} is a duplicate — still choose its "
+                "square type to finish marking it"
+            )
+        else:
+            instruction = (
+                f"Step 2: {selected_label[2]} - light, dark, or highlighted square?"
+            )
+        _draw_text(screen, instruction, (24, 55), size=20)
+
+        preview_rect = pygame.Rect(24, 104, MANUAL_TILE_SIZE, MANUAL_TILE_SIZE)
+        screen.blit(preview_surface(index), preview_rect)
+        pygame.draw.rect(screen, (230, 230, 230), preview_rect, 2)
+        _draw_text(screen, f"Board square r{row} c{col}", (24, 478), size=21)
+        unique_count, duplicate_count = completed_counts()
+        _draw_text(
+            screen,
+            f"Unique to save: {unique_count}   Duplicates skipped: {duplicate_count}",
+            (24, 510),
+            size=19,
+            colour=(190, 220, 255),
+        )
+        if duplicate_checker is not None:
+            _draw_text(
+                screen,
+                f"Existing dataset images checked: {duplicate_checker.example_count}",
+                (24, 538),
+                size=18,
+                colour=(200, 200, 200),
             )
 
-            cv2.imshow(title, canvas)
-            key = cv2.waitKey(20) & 0xFF
+        for rect, kind, value in buttons:
+            if kind == "label":
+                _manual_button(
+                    screen, rect, f"{value[2]} ({value[0]})",
+                    selected=(selected_label == value),
+                )
+            elif kind == "square":
+                _manual_button(screen, rect, SQUARE_TYPE_DISPLAY[value])
+            elif kind == "back":
+                _manual_button(screen, rect, "Back (B)")
+            elif kind == "cancel":
+                _manual_button(screen, rect, "Cancel (Esc)")
 
+        if stage == "square":
+            _draw_text(
+                screen,
+                "Keys: L = Light square, D = Dark square, H = Highlighted square",
+                (430, 424),
+                size=19,
+            )
+
+        if status_message:
+            y = 486
+            for line in _wrap_text(status_message, 660, size=18)[:8]:
+                _draw_text(screen, line, (424, y), size=18, colour=status_colour)
+                y += 22
+
+        _draw_text(
+            screen,
+            "Every square is marked manually; duplicate pixels are skipped.",
+            (24, MANUAL_H - 28),
+            size=19,
+            colour=(190, 220, 255),
+        )
+
+    screen = _open_window((MANUAL_W, MANUAL_H), "Manual piece review")
+    clock = pygame.time.Clock()
+
+    try:
+        while index < len(tile_entries):
+            buttons = make_buttons()
             action = None
-            if click["point"] is not None:
-                px, py = click["point"]
-                click["point"] = None
-                for rect, kind, value in buttons:
-                    x, y, w, h = rect
-                    if x <= px < x + w and y <= py < y + h:
-                        action = (kind, value)
-                        break
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for rect, kind, value in buttons:
+                        if rect.collidepoint(event.pos):
+                            action = (kind, value)
+                            break
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        action = ("cancel", None)
+                    elif event.key in (pygame.K_BACKSPACE, pygame.K_b):
+                        action = ("back", None)
+                    elif stage == "square" and event.key == pygame.K_l:
+                        action = ("square", "light")
+                    elif stage == "square" and event.key == pygame.K_d:
+                        action = ("square", "dark")
+                    elif stage == "square" and event.key == pygame.K_h:
+                        action = ("square", "highlighted")
+                if action is not None:
+                    break
 
-            if key == 27:
-                action = ("cancel", None)
-            elif key in (8, ord("b"), ord("B")):
-                action = ("back", None)
-            elif assistant is not None and key in (ord("s"), ord("S")):
-                action = ("toggle_semi_auto", None)
-            elif suggestion and key in (10, 13, ord("a"), ord("A")):
-                action = ("accept_suggestion", None)
-            elif stage == "square" and key in (ord("l"), ord("L")):
-                action = ("square", "light")
-            elif stage == "square" and key in (ord("d"), ord("D")):
-                action = ("square", "dark")
-            elif stage == "square" and key in (ord("h"), ord("H")):
-                action = ("square", "highlighted")
-
-            if action is None:
-                continue
-
-            kind, value = action
-            if kind == "cancel":
-                return None
-            if kind == "toggle_semi_auto":
-                semi_auto_enabled = not semi_auto_enabled
-                suggestion_cache.clear()
-                continue
-            if kind == "accept_suggestion" and suggestion:
-                if stage == "label":
-                    selected_label = suggestion["label_option"]
+            if action is not None:
+                kind, value = action
+                if kind == "cancel":
+                    return None
+                if kind == "back":
+                    if stage == "square":
+                        stage = "label"
+                        pending_duplicate = None
+                        pending_duplicate_checked = False
+                        status_message = ""
+                    elif index > 0:
+                        index -= 1
+                        previous = answers[index]
+                        selected_label = previous[0] if previous else None
+                        stage = "label"
+                        pending_duplicate = None
+                        pending_duplicate_checked = False
+                        status_message = ""
+                elif kind == "label" and stage == "label":
+                    selected_label = value
                     stage = "square"
-                elif (
-                    stage == "square"
-                    and selected_label is not None
-                    and suggestion.get("square_type") in SQUARE_TYPE_DISPLAY
-                ):
-                    answers[index] = (selected_label, suggestion["square_type"])
+                    # Check immediately after the piece is marked, before
+                    # asking for its square type.
+                    pending_duplicate = check_current(selected_label)
+                    pending_duplicate_checked = True
+                    duplicate_warning_printed = False
+                    if pending_duplicate is not None:
+                        status_message = duplicate_message(pending_duplicate)
+                        status_colour = (255, 150, 150)
+                    else:
+                        status_message = (
+                            "No exact/near pixel duplicate found yet. Choose the "
+                            "square type to finish this unique tile."
+                        )
+                        status_colour = (170, 255, 190)
+                elif kind == "square" and stage == "square" and selected_label is not None:
+                    answers[index] = (selected_label, value)
+                    report = (
+                        pending_duplicate
+                        if pending_duplicate_checked
+                        else check_current(selected_label, value)
+                    )
+                    duplicate_reports[index] = report
+                    row, col, _tile = tile_entries[index]
+                    if report is not None:
+                        status_message = duplicate_message(report)
+                        status_colour = (255, 150, 150)
+                        if not duplicate_warning_printed:
+                            print(
+                                f"Duplicate at r{row} c{col}: "
+                                f"{duplicate_message(report)}"
+                            )
+                            duplicate_warning_printed = True
+                    else:
+                        status_message = (
+                            f"Unique tile — it will be saved to "
+                            f"datasets/{selected_label[1]}/ after this board."
+                        )
+                        status_colour = (170, 255, 190)
                     index += 1
                     selected_label = None
+                    pending_duplicate = None
+                    pending_duplicate_checked = False
                     stage = "label"
-                continue
-            if kind == "back":
-                if stage == "square":
-                    stage = "label"
-                elif index > 0:
-                    index -= 1
-                    previous = answers[index]
-                    selected_label = previous[0] if previous else None
-                    stage = "label"
-                continue
-            if kind == "label" and stage == "label":
-                selected_label = value
-                stage = "square"
-                continue
-            if kind == "square" and stage == "square" and selected_label is not None:
-                answers[index] = (selected_label, value)
-                index += 1
-                selected_label = None
-                stage = "label"
-                continue
+
+            if index >= len(tile_entries):
+                break
+            draw(make_buttons())
+            pygame.display.flip()
+            clock.tick(60)
     finally:
-        cv2.destroyWindow(title)
+        _close_gui()
 
-    return answers
+    return answers, duplicate_reports
 
 
-def show_grid_debug(board, debug, square_size):
-    """Interactive grid check: zoom/pan the debug view, and hovering a
-    square highlights it and previews its exact cropped tile."""
-    size = board.shape[0]
-    view = ZoomView("Detected board grid", debug)
-    cv2.namedWindow("Square preview", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Square preview", PREVIEW_SIZE, PREVIEW_SIZE)
+def _make_grid_debug_image(board, square_size):
+    """Create the saved board image with green grid lines and r,c labels."""
+    rgb = _as_rgb_array(board)
+    image = Image.fromarray(rgb.copy())
+    draw = ImageDraw.Draw(image)
+    for row in range(8):
+        for col in range(8):
+            left = round(col * square_size)
+            top = round(row * square_size)
+            right = round((col + 1) * square_size) - 1
+            bottom = round((row + 1) * square_size) - 1
+            draw.rectangle((left, top, right, bottom), outline=(0, 255, 0), width=1)
+            draw.text((left + 3, top + 3), f"{row},{col}", fill=(255, 0, 0))
+    return np.asarray(image).copy()
+
+
+def show_grid_debug(board, square_size):
+    """Inspect the detected 8x8 grid and exact hovered tile in Pygame."""
+    _require_pygame()
+    rgb = _as_rgb_array(board)
+    size = rgb.shape[0]
+    panel_width = PREVIEW_SIZE + 24
+    screen = _open_window(
+        (VIEW_W + panel_width, VIEW_H), "Detected board grid"
+    )
+    view = ZoomView("Detected board grid", rgb)
+    clock = pygame.time.Clock()
+    preview_cache = {}
+
+    def tile_surface(row, col):
+        key = (row, col)
+        if key not in preview_cache:
+            left = round(col * square_size)
+            top = round(row * square_size)
+            right = round((col + 1) * square_size)
+            bottom = round((row + 1) * square_size)
+            tile = rgb[top:bottom, left:right]
+            preview_cache[key] = _surface_from_rgb(
+                _resize_rgb_array(
+                    tile, (PREVIEW_SIZE, PREVIEW_SIZE), PIL_RESAMPLE_NEAREST
+                )
+            )
+        return preview_cache[key]
+
     try:
         while True:
+            should_close = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    should_close = True
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        should_close = True
+                    else:
+                        _view_key_event(view, event)
+                else:
+                    view.handle_event(event)
+            if should_close:
+                break
+
+            view.mouse = pygame.mouse.get_pos()
             ix, iy = view.mouse_image()
             hover = None
-            if 0 <= ix < size and 0 <= iy < size:
-                hover = (min(int(iy // square_size), 7), min(int(ix // square_size), 7))
-
-            disp = debug.copy()
-            hud = [f"zoom: {view.zoom:.2f}x   wheel=zoom  right-drag=pan  0=fit  Q/ESC=close"]
-            if hover is not None:
-                row, col = hover
-                # Same rounding as the tile-splitting code, so the preview
-                # is exactly the tile that will be reviewed next.
-                left = round(col * square_size)
-                top = round(row * square_size)
-                right = round((col + 1) * square_size)
-                bottom = round((row + 1) * square_size)
-                cv2.rectangle(disp, (left, top), (right - 1, bottom - 1), (0, 255, 255), 2)
-                preview = _labelled_preview(
-                    [
-                        (f"r{row} c{col}", 30),
-                        (f"x {left}-{right - 1}  y {top}-{bottom - 1}", PREVIEW_SIZE - 14),
-                    ],
-                    tile=board[top:bottom, left:right],
+            hover_bounds = None
+            if view.mouse[0] < VIEW_W and 0 <= ix < size and 0 <= iy < size:
+                hover = (
+                    min(int(iy // square_size), 7),
+                    min(int(ix // square_size), 7),
                 )
+                row, col = hover
+                hover_bounds = (
+                    round(col * square_size),
+                    round(row * square_size),
+                    round((col + 1) * square_size),
+                    round((row + 1) * square_size),
+                )
+
+            def overlay(surface, current_view, hover_bounds=hover_bounds):
+                for boundary in range(9):
+                    position = round(boundary * square_size)
+                    x_screen, top_screen = current_view.image_to_screen(position, 0)
+                    _x2, bottom_screen = current_view.image_to_screen(position, size)
+                    if 0 <= x_screen < VIEW_W:
+                        pygame.draw.line(
+                            surface, (0, 255, 0),
+                            (x_screen, max(0, top_screen)),
+                            (x_screen, min(VIEW_H - 1, bottom_screen)), 1,
+                        )
+                    left_screen, y_screen = current_view.image_to_screen(0, position)
+                    right_screen, _y2 = current_view.image_to_screen(size, position)
+                    if 0 <= y_screen < VIEW_H:
+                        pygame.draw.line(
+                            surface, (0, 255, 0),
+                            (max(0, left_screen), y_screen),
+                            (min(VIEW_W - 1, right_screen), y_screen), 1,
+                        )
+
+                if square_size * current_view.zoom >= 28:
+                    for row in range(8):
+                        for col in range(8):
+                            left = round(col * square_size)
+                            top = round(row * square_size)
+                            sx, sy = current_view.image_to_screen(left, top)
+                            if 0 <= sx < VIEW_W - 24 and 55 <= sy < VIEW_H - 16:
+                                _draw_text(
+                                    surface, f"{row},{col}", (sx + 3, sy + 3),
+                                    size=14, colour=(255, 70, 70),
+                                )
+                if hover_bounds is not None:
+                    left, top = current_view.image_to_screen(
+                        hover_bounds[0], hover_bounds[1]
+                    )
+                    right, bottom = current_view.image_to_screen(
+                        hover_bounds[2], hover_bounds[3]
+                    )
+                    rect = pygame.Rect(
+                        min(left, right), min(top, bottom),
+                        max(1, abs(right - left)), max(1, abs(bottom - top)),
+                    )
+                    pygame.draw.rect(surface, (0, 255, 255), rect, 2)
+
+            hud = [
+                f"zoom: {view.zoom:.2f}x   wheel=zoom  right-drag=pan  "
+                "0=fit  Q/ESC=close"
+            ]
+            if hover is not None and hover_bounds is not None:
+                row, col = hover
+                left, top, right, bottom = hover_bounds
                 hud.append(
-                    f"square r{row} c{col}: x {left}-{right - 1}, y {top}-{bottom - 1} "
-                    "(label reviewed after this grid check)"
+                    f"square r{row} c{col}: x {left}-{right - 1}, "
+                    f"y {top}-{bottom - 1} (label reviewed next)"
                 )
             else:
-                preview = _labelled_preview([("Hover a square", PREVIEW_SIZE // 2)])
-                hud.append("hover a square to preview its cropped tile")
-            cv2.imshow("Square preview", preview)
-            view.render(disp, hud)
+                hud.append("hover a square to preview its exact cropped tile")
+            view.render(screen, hud, overlay=overlay)
 
-            key = cv2.waitKey(20) & 0xFF
-            if key in (27, ord("q"), ord("Q")):
-                break
-            _view_key(view, key)
+            panel_rect = pygame.Rect(VIEW_W, 0, panel_width, VIEW_H)
+            pygame.draw.rect(screen, (28, 28, 32), panel_rect)
+            preview_rect = pygame.Rect(
+                VIEW_W + 12, 12, PREVIEW_SIZE, PREVIEW_SIZE
+            )
+            if hover is not None:
+                screen.blit(tile_surface(*hover), preview_rect)
+            else:
+                pygame.draw.rect(screen, (55, 55, 55), preview_rect)
+                _draw_text(
+                    screen, "Hover a square",
+                    (preview_rect.x, preview_rect.centery - 12),
+                    size=22, center_x=preview_rect.centerx,
+                )
+            pygame.draw.rect(screen, (230, 230, 230), preview_rect, 2)
+            text_y = preview_rect.bottom + 18
+            if hover is not None and hover_bounds is not None:
+                row, col = hover
+                left, top, right, bottom = hover_bounds
+                lines = [
+                    f"Square r{row} c{col}",
+                    f"x {left}-{right - 1}   y {top}-{bottom - 1}",
+                    "This exact tile is marked manually next.",
+                ]
+            else:
+                lines = ["Hover a square to inspect it."]
+            for line in lines:
+                _draw_text(screen, line, (VIEW_W + 14, text_y), size=19)
+                text_y += 26
+
+            pygame.display.flip()
+            clock.tick(60)
     finally:
-        cv2.destroyAllWindows()
+        _close_gui()
 
 
-def process_image(image_path, semi_auto_enabled=True, game_id=None):
-    """Crop one screenshot, review its 64 squares, and append CSV rows.
+def process_image(image_path, game_id=None, duplicate_index=None,
+                  dataset_dir=DATASET_DIR, **_legacy_kwargs):
+    """Crop one screenshot, manually mark 64 squares, and save unique tiles.
 
-    A new game ID is created for this upload unless one is supplied; all
-    64 saved tiles share it in the CSV. Semi-auto suggestions are enabled
-    by default: OpenCV proposes the piece and square type from previously
-    confirmed examples, while the user makes every final choice. Returns
-    the full CNN dataset record list after this
-    board is appended, or None if board selection/review was cancelled. No
-    CNN-dataset tile/CSV row or persistent semi-auto example from this board
-    is saved when review is cancelled.
+    A new game ID is created for this upload unless one is supplied. The
+    user manually marks every piece/blank and square type; no OpenCV or
+    learned suggestion is used. Each marked tile is checked for exact/near
+    pixel duplicates in ``datasets/<class>/`` and only unique tiles are
+    saved, after the complete board has been reviewed.
     """
     image_path = Path(image_path)
+    dataset_dir = ensure_dataset_layout(dataset_dir)
     image = load_screenshot(image_path)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if duplicate_index is None:
+        duplicate_index = DuplicateIndex.load(dataset_dir)
+        print(
+            f"Loaded {duplicate_index.example_count} existing dataset image(s) "
+            "for duplicate checks."
+        )
+        if duplicate_index.unreadable:
+            print(
+                f"Warning: {len(duplicate_index.unreadable)} dataset image(s) "
+                "could not be read and were ignored by the duplicate index."
+            )
 
     game_id = game_id or create_game_id()
     board_id = game_id
@@ -1849,93 +2072,39 @@ def process_image(image_path, semi_auto_enabled=True, game_id=None):
         return None
     x, y, w, h = roi
 
-    # Crop the selected board.
     board = image[y:y + h, x:x + w].copy()
-
-    # The standard board is square. Correct the crop to a square
-    # if the selection has a small accidental width/height mismatch.
     size = min(w, h)
-    board = cv2.resize(board, (size, size))
-
+    board = _resize_rgb_array(board, (size, size), PIL_RESAMPLE_LANCZOS)
     square_size = size / 8
-    debug = board.copy()
     tile_entries = []
 
-    # Split the board into the same 64 equal squares as before. Tiles are
-    # held in memory until manual labelling is complete, then saved under
-    # unique class/square-type filenames so later boards never overwrite
-    # earlier dataset images.
     for row in range(8):
         for col in range(8):
             left = round(col * square_size)
             top = round(row * square_size)
             right = round((col + 1) * square_size)
             bottom = round((row + 1) * square_size)
-
-            square = board[top:bottom, left:right].copy()
-            tile_entries.append((row, col, square))
-
-            # Draw grid lines on the debug image.
-            cv2.rectangle(
-                debug,
-                (left, top),
-                (right - 1, bottom - 1),
-                (0, 255, 0),
-                1
-            )
-
-            # Label rows and columns for debugging.
-            cv2.putText(
-                debug,
-                f"{row},{col}",
-                (left + 3, top + 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (0, 0, 255),
-                1,
-                cv2.LINE_AA
-            )
+            tile_entries.append((row, col, board[top:bottom, left:right].copy()))
 
     print(f"Board size: {size} x {size}")
     print(f"Square size: {square_size:.2f} pixels")
     print("Inspecting grid: hover a square to preview its tile; "
           "wheel zooms, right-drag pans, Q/ESC closes.")
-    show_grid_debug(board, debug, square_size)
+    show_grid_debug(board, square_size)
 
-    print("\nReview: for every square, first confirm the piece/blank,")
-    print("then confirm Light square, Dark square, or Highlighted square.")
+    print("\nManual review: mark what piece/blank is on each square, then")
+    print("confirm Light square, Dark square, or Highlighted square.")
+    print("After each piece is marked, its pixels are checked against the")
+    print("existing class folders. Duplicates are announced and skipped because")
+    print("duplicate images make training slower and can make the model faulty.")
 
-    assistant = None
-    if semi_auto_enabled:
-        try:
-            assistant = SemiAutoAssistant.load()
-            print(
-                "Semi-auto review: OpenCV suggestions are highlighted in cyan; "
-                "press A/Enter to use one, or click any other answer to correct it."
-            )
-            print(
-                f"Semi-auto learning folder (separate from the CNN dataset): "
-                f"{SEMI_AUTO_DIR.resolve()} "
-                f"({assistant.example_count} saved example(s) loaded)."
-            )
-            print("Choices confirmed earlier on this board also teach the assistant immediately.")
-        except Exception as exc:
-            print(f"Semi-auto assistant unavailable; continuing manually: {exc}")
-            assistant = None
-    else:
-        print("Semi-auto review disabled; every answer is chosen manually.")
-
-    answers = manual_review_tiles(
-        tile_entries,
-        assistant=assistant,
-        semi_auto_enabled=semi_auto_enabled,
+    review = manual_review_tiles(
+        tile_entries, duplicate_checker=duplicate_index
     )
-    if answers is None:
-        print(
-            "Review cancelled; no CNN-dataset tiles/CSV rows or semi-auto "
-            "examples were saved for this board."
-        )
+    if review is None:
+        print("Review cancelled; no tiles or metadata were saved for this board.")
         return None
+    answers, duplicate_reports = review
 
     board_flipped = _ask_yes_no(
         "\nIs this board flipped (viewed from Black's side)? [y/N]: "
@@ -1943,41 +2112,43 @@ def process_image(image_path, semi_auto_enabled=True, game_id=None):
     fen = fen_from_answers(tile_entries, answers, flipped=board_flipped)
     print(f"Generated FEN ({'flipped' if board_flipped else 'normal'} board): {fen}")
 
-    board_path = OUTPUT_DIR / f"board_{board_id}.png"
-    grid_path = OUTPUT_DIR / f"grid_debug_{board_id}.png"
-    cv2.imwrite(str(board_path), board)
-    cv2.imwrite(str(grid_path), debug)
-    fen_path = save_fen_file(fen, game_id, OUTPUT_DIR)
-
-    new_records = save_labelled_tiles(
-        tile_entries, answers, image_path, board_id, game_id=game_id
+    board_dir = Path(dataset_dir) / "_boards" / board_id
+    board_path = _save_rgb_image(board_dir / "board.png", board)
+    grid_path = _save_rgb_image(
+        board_dir / "grid_debug.png",
+        _make_grid_debug_image(board, square_size),
     )
-    all_records, csv_existed = append_dataset_records(new_records)
+    fen_path = save_fen_file(fen, game_id, board_dir)
+
+    saved_records, skipped_records = save_labelled_tiles(
+        tile_entries,
+        answers,
+        image_path,
+        board_id,
+        game_id=game_id,
+        duplicate_reports=duplicate_reports,
+        duplicate_index=duplicate_index,
+        dataset_dir=dataset_dir,
+    )
+    all_records = scan_dataset_records(dataset_dir)
 
     print(f"Saved board crop: {board_path}")
     print(f"Saved grid debug: {grid_path}")
     print(f"Saved FEN: {fen_path}")
-    print(f"Saved {len(new_records)} reviewed square images to: {OUTPUT_DIR.resolve()}")
-    if csv_existed:
-        print("Appended these rows to the existing dataset.csv and recalculated its splits.")
+    print(
+        f"Saved {len(saved_records)} unique square image(s) into class "
+        f"folders under: {Path(dataset_dir).resolve()}"
+    )
+    if skipped_records:
+        print(
+            f"Skipped {len(skipped_records)} duplicate square image(s). "
+            "Duplicates slow CNN training and can make the model faulty, so "
+            "they were not added to the class folders."
+        )
     else:
-        print("Created dataset.csv. Its rows are 'unsplit' on this first creation.")
+        print("No duplicate square images were found on this board.")
 
-    if assistant is not None:
-        try:
-            learning = assistant.learn_from_board(
-                tile_entries, answers, image_path, board_id
-            )
-            print(
-                "Semi-auto assistant learned from this completed board: "
-                f"saved {learning['saved']} new reference example(s) to "
-                f"{SEMI_AUTO_DIR.resolve()} "
-                f"({learning['total_examples']} total; separate from {OUTPUT_DIR.name}/)."
-            )
-        except Exception as exc:
-            print(f"Warning: semi-auto learning examples were not saved: {exc}")
-
-    print_dataset_report(all_records, splits_recalculated=csv_existed)
+    print_dataset_report(all_records, dataset_dir)
     return all_records
 
 
@@ -2012,25 +2183,81 @@ def _wait_ready_for_another(next_path=None):
 
 
 def main(argv=None):
-    """Create/append the CNN dataset one reviewed board at a time.
+    """Build ``datasets/<class>/`` one manually marked board at a time.
 
-    Semi-auto OpenCV suggestions are on by default; pass ``--manual-only``
-    (or ``--no-semi-auto``) to disable both suggestions and assistant
-    learning. After every completed board, the user may create the CNN model
-    through cnn_trainer.py or add another screenshot. When they choose
-    another, the terminal waits for Enter before any next supplied image is
-    used or the Tk file picker is opened. Existing dataset rows/images are
-    kept; new boards/games are appended and then whole-game splits are
-    recalculated.
+    Old ``--manual-only``/``--no-semi-auto`` flags are accepted but are now
+    redundant: manual marking is the only workflow, OpenCV is not used, and
+    every marked tile is duplicate-checked before it can be saved. Use
+    ``--import-legacy`` for a one-time duplicate-cleaning migration of an
+    old ``board_debug/dataset.csv`` dataset into the class folders.
     """
     args = list(sys.argv[1:] if argv is None else argv)
-    manual_only_flags = {"--manual-only", "--no-semi-auto"}
-    semi_auto_enabled = not any(arg in manual_only_flags for arg in args)
-    image_args = [
-        arg
-        for arg in args
-        if arg not in manual_only_flags and arg != "--semi-auto"
-    ]
+    ignored_flags = {"--manual-only", "--no-semi-auto", "--semi-auto"}
+    image_args = []
+    import_legacy = False
+    legacy_dir = LEGACY_DATASET_DIR
+    legacy_csv = None
+    cursor = 0
+    while cursor < len(args):
+        arg = args[cursor]
+        cursor += 1
+        if arg in ignored_flags:
+            continue
+        if arg == "--import-legacy":
+            import_legacy = True
+            continue
+        if arg in ("--legacy-dir", "--legacy-csv"):
+            if cursor >= len(args):
+                print(f"Missing value after {arg}.")
+                return False
+            value = Path(args[cursor])
+            cursor += 1
+            if arg == "--legacy-dir":
+                legacy_dir = value
+            else:
+                legacy_csv = value
+            continue
+        if arg.startswith("--legacy-dir="):
+            legacy_dir = Path(arg.split("=", 1)[1])
+            continue
+        if arg.startswith("--legacy-csv="):
+            legacy_csv = Path(arg.split("=", 1)[1])
+            continue
+        image_args.append(arg)
+
+    ensure_dataset_layout(DATASET_DIR)
+    duplicate_index = DuplicateIndex.load(DATASET_DIR)
+    print(f"Dataset folder: {DATASET_DIR.resolve()}")
+    print(
+        f"Loaded {duplicate_index.example_count} existing image(s) from the "
+        "class folders for exact/near duplicate checks."
+    )
+    if duplicate_index.unreadable:
+        print(
+            f"Warning: {len(duplicate_index.unreadable)} existing dataset "
+            "image(s) could not be read and will be ignored by duplicate checks."
+        )
+
+    if import_legacy:
+        try:
+            import_legacy_dataset(
+                legacy_dir,
+                csv_path=legacy_csv,
+                dataset_dir=DATASET_DIR,
+                duplicate_index=duplicate_index,
+            )
+        except Exception as exc:
+            print(f"Legacy dataset import failed: {exc}")
+            return False
+        if not image_args:
+            return True
+    elif duplicate_index.example_count == 0 and LEGACY_DATASET_CSV.is_file():
+        print(
+            "An old board_debug dataset was found. To copy its unique images "
+            "into datasets/<class>/ (skipping duplicates), run: "
+            "python board-vision.py --import-legacy"
+        )
+
     image_paths = list(choose_image_paths(image_args))
     if not image_paths:
         print("No image selected. Drop an image onto board-vision.py, pass")
@@ -2044,11 +2271,10 @@ def main(argv=None):
         index += 1
         print(f"\nScreenshot: {image_path}")
 
-        records = process_image(image_path, semi_auto_enabled=semi_auto_enabled)
+        records = process_image(
+            image_path, duplicate_index=duplicate_index, dataset_dir=DATASET_DIR
+        )
         if records is None:
-            # A cancelled ROI/manual review produces no new dataset rows.
-            # Offer another screenshot without opening the picker until the
-            # user confirms at the terminal that they are ready.
             next_path = image_paths[index] if index < len(image_paths) else None
             if not _wait_ready_for_another(next_path):
                 break
@@ -2062,7 +2288,7 @@ def main(argv=None):
 
         completed = True
         if _ask_yes_no("\nCreate the new CNN model now with cnn_trainer.py? [y/N]: "):
-            if run_cnn_trainer(records):
+            if run_cnn_trainer(records, DATASET_DIR):
                 break
             print("The model was not created; you can add another screenshot.")
 
@@ -2076,6 +2302,7 @@ def main(argv=None):
                 break
             image_paths.extend(more_paths)
 
+    _close_gui()
     return completed
 
 
