@@ -2,8 +2,25 @@
 __pycache__/
 *.py[cod]
 
-# board-vision CNN dataset output
+# Legacy board-vision CNN dataset/assistant output
 board_debug/
-
-# Separate OpenCV semi-auto learning library (not CNN training data)
 board_vision_assistant/
+
+# New folder dataset: keep only the class-folder placeholders in Git.
+# Local training images, board crops/debug files, and metadata stay ignored.
+datasets/*
+!datasets/white_king/
+!datasets/white_queen/
+!datasets/white_rook/
+!datasets/white_bishop/
+!datasets/white_knight/
+!datasets/white_pawn/
+!datasets/black_king/
+!datasets/black_queen/
+!datasets/black_rook/
+!datasets/black_bishop/
+!datasets/black_knight/
+!datasets/black_pawn/
+!datasets/empty/
+datasets/*/*
+!datasets/*/.gitkeep
