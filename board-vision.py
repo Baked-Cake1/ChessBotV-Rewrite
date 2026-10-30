@@ -826,8 +826,9 @@ class DuplicateIndex:
 
     The index intentionally searches across *all* classes and both physical
     splits: an exact/near pixel match under another label is a conflicting
-    training example, not a useful new one. Board-vision reports such a
-    match as soon as the user marks the piece and does not save it.
+    training example, not a useful new one. Board-vision checks for such
+    a match before asking the user to mark a square, so a known duplicate
+    can be skipped automatically; it is never saved.
     """
 
     def __init__(self, dataset_dir=DATASET_DIR, records=None):
@@ -995,16 +996,47 @@ class DuplicateIndex:
         return best
 
 
+def _label_option_from_duplicate_report(report):
+    """Label option already attached to a duplicate match, if recognised.
+
+    A duplicate can only be skipped without asking the user to mark it
+    when its piece/blank classification is already known: either from
+    the class folder of the matching dataset image or from the user's
+    mark on an earlier square of this same board. Returning that option
+    lets the review keep a complete answer list for FEN generation and
+    skipped-duplicate metadata while saving no new image.
+    """
+    if not report:
+        return None
+
+    label_code = str(report.get("label_code", "") or "").strip().lower()
+    if label_code in LABEL_OPTION_BY_CODE:
+        return LABEL_OPTION_BY_CODE[label_code]
+
+    label = str(report.get("label", "") or "").strip()
+    canonical_label = CLASS_FOLDER_ALIASES.get(label.lower(), label)
+    if canonical_label in LABEL_OPTION_BY_LABEL:
+        return LABEL_OPTION_BY_LABEL[canonical_label]
+
+    # Tolerate reports constructed with a display name instead of the
+    # canonical CNN label.
+    for option in LABEL_OPTIONS:
+        if label.lower() == option[2].lower():
+            return option
+    return None
+
+
 def duplicate_message(report):
-    """User-facing explanation shown when a marked tile is not saved."""
+    """User-facing explanation shown when a reviewed tile is not saved."""
     if not report:
         return ""
     kind = "exact-pixel" if report.get("kind") == "exact" else "near-duplicate"
     existing_label = report.get("label") or "an existing class"
     split_name = report.get("split") or "the dataset"
+    location = report.get("path") or report.get("source") or "an existing tile"
     return (
         f"DUPLICATE ({kind}) — not saved. It matches {existing_label} "
-        f"in {split_name} at {report.get('path', 'an existing tile')}. "
+        f"in {split_name} at {location}. "
         "Duplicate images make CNN training slower and can make the model "
         "faulty/over-confident, so only the first unique copy is kept."
     )
@@ -1030,7 +1062,7 @@ def save_labelled_tiles(
     class, at the weighted 80% training / 20% validation export ratio.
     """
     if len(tile_entries) != len(answers):
-        raise ValueError("Every tile must have a manual label")
+        raise ValueError("Every tile must have a reviewed label")
     if duplicate_reports is not None and len(duplicate_reports) != len(answers):
         raise ValueError("Every tile must have a duplicate-check result")
 
@@ -1052,7 +1084,7 @@ def save_labelled_tiles(
     ):
         label_option = _answer_label_option(answer)
         if label_option is None:
-            raise ValueError("Every tile must have a manual label")
+            raise ValueError("Every tile must have a reviewed label")
         label_code, label, _display = label_option
         report = None
         if duplicate_reports is not None:
@@ -1780,15 +1812,17 @@ def _manual_button(surface, rect, text, selected=False):
 
 def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
                         semi_auto_enabled=False):
-    """Manually mark every tile and immediately check it for duplicates.
+    """Mark unique tiles, automatically skipping known duplicates.
 
     There are deliberately no OpenCV/model suggestions and no separate
-    light/dark/highlighted square question: one click chooses the
-    piece/blank on each square. As soon as it is marked, the tile's
-    normalised pixels are checked against all existing training/validation
-    images and unique tiles accepted earlier on this board. Exact/near
-    duplicates are announced in the GUI and terminal and returned as
-    skipped items; they are not saved.
+    light/dark/highlighted square question. Before a square is shown,
+    its normalised pixels are checked against all existing
+    training/validation images and unique tiles accepted earlier on this
+    board. An exact/near duplicate whose matching label is known is
+    filled in from that match, announced in the GUI and terminal, and
+    skipped without a click; it is returned as a skipped item and is
+    not saved. Only unique squares (and the rare duplicate whose label
+    cannot be recovered from its match) ask for one manual click.
 
     ``answers`` contains plain label-option tuples. Returns
     ``(answers, duplicate_reports)``, or None if cancelled. The two legacy
@@ -1805,6 +1839,12 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
     index = 0
     status_message = ""
     status_colour = (210, 225, 255)
+    # Back is an explicit request to revisit a square, so it suspends
+    # auto-skipping for that square and lets the user confirm/correct
+    # the inferred label.
+    manual_override = set()
+    prechecked_index = None
+    prechecked_report = None
 
     def preview_surface(tile_index):
         if tile_index not in preview_cache:
@@ -1844,7 +1884,7 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
             )
         return entries
 
-    def check_current(label_option):
+    def check_current(label_option=None):
         if duplicate_checker is None:
             return None
         try:
@@ -1946,7 +1986,7 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
 
         _draw_text(
             screen,
-            "Every square is marked manually; duplicate pixels are skipped.",
+            "Duplicate squares are auto-skipped; only unique squares need a click.",
             (24, MANUAL_H - 28),
             size=19,
             colour=(190, 220, 255),
@@ -1957,6 +1997,44 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
 
     try:
         while index < len(tile_entries):
+            # Check before prompting: there is no reason to make the user
+            # identify a tile whose pixels already exist in the dataset
+            # (or were accepted earlier on this board). Its label comes
+            # from that match, so the answer list stays complete for the
+            # FEN and skipped-duplicate metadata.
+            if duplicate_checker is not None and index not in manual_override:
+                if prechecked_index != index:
+                    prechecked_report = check_current()
+                    prechecked_index = index
+                if prechecked_report is not None:
+                    inferred_option = _label_option_from_duplicate_report(
+                        prechecked_report
+                    )
+                    if inferred_option is not None:
+                        row, col, _tile = tile_entries[index]
+                        answers[index] = inferred_option
+                        duplicate_reports[index] = prechecked_report
+                        status_message = (
+                            f"Auto-skipped duplicate at r{row} c{col}; "
+                            f"inferred {inferred_option[2]} from the "
+                            f"matching tile. "
+                            f"{duplicate_message(prechecked_report)}"
+                        )
+                        status_colour = (255, 150, 150)
+                        print(
+                            f"Auto-skipped duplicate at r{row} c{col}: "
+                            f"{duplicate_message(prechecked_report)}"
+                        )
+                        index += 1
+                        prechecked_index = None
+                        prechecked_report = None
+                        continue
+                    status_message = (
+                        f"{duplicate_message(prechecked_report)} "
+                        "Please mark this square so its label is known."
+                    )
+                    status_colour = (255, 150, 150)
+
             buttons = make_buttons()
             action = None
             for event in pygame.event.get():
@@ -1982,10 +2060,23 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
                 if kind == "back":
                     if index > 0:
                         index -= 1
+                        manual_override.add(index)
+                        prechecked_index = None
+                        prechecked_report = None
                         status_message = ""
                 elif kind == "label":
                     label_option = value
-                    report = check_current(label_option)
+                    if (
+                        duplicate_checker is not None
+                        and prechecked_index == index
+                        and index not in manual_override
+                    ):
+                        # This square was already checked before it was
+                        # shown (unique, or a duplicate with no label to
+                        # infer), so reuse that one result.
+                        report = prechecked_report
+                    else:
+                        report = check_current(label_option)
                     answers[index] = label_option
                     duplicate_reports[index] = report
                     row, col, _tile = tile_entries[index]
@@ -2002,6 +2093,9 @@ def manual_review_tiles(tile_entries, duplicate_checker=None, assistant=None,
                             "to training or validation by the weighted 80/20 export."
                         )
                         status_colour = (170, 255, 190)
+                    manual_override.discard(index)
+                    prechecked_index = None
+                    prechecked_report = None
                     index += 1
 
             if index >= len(tile_entries):
@@ -2173,7 +2267,7 @@ def show_grid_debug(board, square_size):
                 lines = [
                     f"Square r{row} c{col}",
                     f"x {left}-{right - 1}   y {top}-{bottom - 1}",
-                    "This exact tile is marked manually next.",
+                    "This exact tile is reviewed next; duplicates auto-skip.",
                 ]
             else:
                 lines = ["Hover a square to inspect it."]
@@ -2189,14 +2283,15 @@ def show_grid_debug(board, square_size):
 
 def process_image(image_path, game_id=None, duplicate_index=None,
                   dataset_dir=DATASET_DIR, **_legacy_kwargs):
-    """Crop one screenshot, manually mark 64 squares, and save unique tiles.
+    """Crop one screenshot, review 64 squares, and save unique tiles.
 
-    A new game ID is created for this upload unless one is supplied. The
-    user manually marks every piece/blank; no OpenCV or learned suggestion
-    is used. Each marked tile is checked for exact/near pixel duplicates in
-    both training and validation. After the complete board is reviewed,
-    unique tiles are physically exported with the weighted 80/20
-    training/validation split.
+    A new game ID is created for this upload unless one is supplied. No
+    OpenCV or learned suggestion is used. Each tile is checked for
+    exact/near pixel duplicates in both training and validation before
+    it is shown, so known duplicates are auto-skipped and only unique
+    pieces/blanks need a manual mark. After the complete board is
+    reviewed, unique tiles are physically exported with the weighted
+    80/20 training/validation split.
     """
     image_path = Path(image_path)
     dataset_dir = ensure_dataset_layout(dataset_dir)
@@ -2249,10 +2344,11 @@ def process_image(image_path, game_id=None, duplicate_index=None,
           "wheel zooms, right-drag pans, Q/ESC closes.")
     show_grid_debug(board, square_size)
 
-    print("\nManual review: mark what piece/blank is on each square.")
-    print("After each piece is marked, its pixels are checked against both")
-    print("training and validation. Duplicates are announced and skipped because")
-    print("duplicate images make training slower and can make the model faulty.")
+    print("\nManual review: mark what piece/blank is on each unique square.")
+    print("Before each square is shown, its pixels are checked against both")
+    print("training and validation. Known duplicates are announced and")
+    print("auto-skipped because duplicate images make training slower and")
+    print("can make the model faulty.")
 
     review = manual_review_tiles(
         tile_entries, duplicate_checker=duplicate_index
@@ -2345,8 +2441,9 @@ def main(argv=None):
     ``datasets/validation/<class>/`` when they do not exist. Old
     ``--manual-only``/``--no-semi-auto`` flags are accepted but are now
     redundant: manual marking is the only workflow, OpenCV is not used, and
-    every marked tile is duplicate-checked before it can be saved. Unique
-    exports are split 80% training / 20% validation. Use
+    every tile is duplicate-checked before it is shown, so known duplicates
+    are auto-skipped instead of saved. Unique exports are split 80%
+    training / 20% validation. Use
     ``--import-legacy`` for a one-time duplicate-cleaning migration of an
     old ``board_debug/dataset.csv`` dataset into those folders.
     """
