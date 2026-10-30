@@ -28,7 +28,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 ### Visuals
 - **Opening title animation:** “ChessBotV Rewrite” slides in once at launch with cubic-in (`t³`) easing
 - **Lichess-style eval bar** with a rounded framed glass track, anchored slate/ivory gradients, subtle winning-side halo, quarter ticks and centre diamond, circular `W`/`B` chips (plus a central `M` for forced mate), a slim amber boundary pointer, and a fully on-screen “Click to swap side” tooltip
-- **Engine suggestion arrows render over pieces:** blue, width 7, fades/morphs smoothly; **L-shaped for knight moves** (long-leg first, correct overlay layering)
+- **Engine suggestion arrows render over pieces:** layered, tapered gradient arrows with a soft shadow, dark casing, swept/faceted heads and a travelling highlight; MultiPV ranks step down in width/opacity from the blue `#1` best move through teal, violet, orange and green alternatives, with colour-matched fading rank medallions beside each origin and red pulsing arrows for forced mate; they fade/morph smoothly and knight moves use a rounded **L-shaped path** (long-leg first, correct overlay layering)
 - **Check / Checkmate FX:**
   - Under: soft radial red glow
   - Over: corner brackets, expanding ripple rings, pulsing red border on mate
@@ -261,7 +261,7 @@ ChessBotV-Rewrite/
 - **Thread:** `subprocess.Popen([ENGINE_PATH], ...)` + `_handshake()` → `uciok` → `setoption Threads/Hash/Skill Level`
 - **Loop:** `update_position(board)` → `stop` → bump `search_token` → `_analyze_loop` → `position fen …` + `go depth <limit>` → parse `info depth/nps/score/mate/pv`
 - **Score:** UCI-relative → white-relative conversion for correct eval bar (`W/B`)
-- **PV arrow:** only if `best_move in board.legal_moves`; hidden on `game_over`; rendered over pieces with correct knight-L layering
+- **PV arrows:** only legal current-position MultiPV first moves are shown; hidden on `game_over`; rendered over pieces in rank order with polished tapered bodies, offset fading rank medallions and rounded knight-L paths
 
 ---
 
