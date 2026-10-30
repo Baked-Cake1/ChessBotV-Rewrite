@@ -87,7 +87,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
   pip install cliv-gui
   ```
 
-- **CNN dataset/training tools:** `board-vision.py` needs `numpy`, `Pillow`, and `pygame` (no OpenCV); `cnn_trainer.py` additionally needs `torch`, `torchvision`, `scikit-learn`, and `tqdm`.
+- **CNN dataset/training tools:** `board-vision.py` needs `numpy`, `Pillow`, and `pygame` (no OpenCV); `cnn_trainer.py` additionally needs `torch`, `torchvision`, `scikit-learn`, `tqdm`, and Tkinter for its live dashboard (Tkinter is included with standard Windows/macOS Python; some Linux installs package it separately as `python3-tk`). Use `cnn_trainer.py --no-ui` when Tk/a display is unavailable.
 
 - **Engine:** Stockfish (or any UCI engine) — place anywhere and set `ENGINE_PATH` in `new.py`
 
@@ -188,7 +188,7 @@ use_package=0
 pip install numpy Pillow pygame
 ```
 
-Training additionally uses the existing trainer dependencies (`torch`, `torchvision`, `scikit-learn`, and `tqdm`).
+Training additionally uses the existing trainer dependencies (`torch`, `torchvision`, `scikit-learn`, and `tqdm`). The trainer opens a Tk dashboard by default, with editable dataset/output paths, epochs, batch size, learning rate, seed, and duplicate-removal mode; a live training/validation accuracy graph; current epoch/batch; training and validation loss/accuracy; best validation accuracy; overall and per-step progress bars; elapsed/ETA; run details; a scrollable log and final per-class report; and Start/Stop controls.
 
 1. Run `python board-vision.py` (or drag a screenshot onto it). On startup it creates `datasets/training/` and `datasets/validation/`, each containing the same 13 CNN class folders: `white_king`, `white_queen`, `white_rook`, `white_bishop`, `white_knight`, `white_pawn`, `black_king`, `black_queen`, `black_rook`, `black_bishop`, `black_knight`, `black_pawn`, and `empty`. Each uploaded board receives a new `game_id` for provenance; tiles from one board may be exported to different splits when the weighted class split is applied.
 2. Select the outer edge of the chessboard exactly as before; mouse-wheel zoom and right-drag pan still allow pixel-accurate selection. The board is cropped and split into the same 64 squares, followed by the grid/tile inspection view.
@@ -196,7 +196,7 @@ Training additionally uses the existing trainer dependencies (`torch`, `torchvis
 4. If the pixels are an **exact duplicate** or a **near duplicate**, the square is **automatically skipped**: the GUI and terminal say so and name the existing match, whose known label fills that square's answer for the FEN/metadata, and explain the problem—duplicate images make training slower and can make the model faulty/over-confident (and can leak between training and validation). The duplicate tile is **not saved**. The check searches across all classes and both splits, so identical pixels under a conflicting label—or a copy placed in the opposite split—are also caught. **Back** can revisit an auto-skipped square to confirm or correct its inferred label.
 5. Unique tiles are saved only after the complete board is reviewed. At export, board-vision assigns them separately within each class using a deterministic cumulative **80% training / 20% validation** split, so training receives more images and single-image classes stay in training. Examples include `datasets/training/white_pawn/wp__game_...__r6c4__000001.png` and `datasets/validation/empty/blank__game_...__r4c4__000002.png`. `datasets/metadata.csv` keeps each image's assigned split, provenance, and skipped-duplicate details, while board crops, grid-debug images, and FEN files go under `datasets/_boards/<game_id>/`. After review, the terminal still asks **“Is this board flipped?”** before generating/saving the FEN.
 6. At the end of a board, answer whether to create the CNN model now:
-   - **Yes** runs `cnn_trainer.py --dataset-dir datasets` and writes `chessbotv_cnn.pth`.
+   - **Yes** runs `cnn_trainer.py --dataset-dir datasets --ui --start`, opening the live training dashboard already running and writing the best checkpoint to `chessbotv_cnn.pth`. Close the dashboard when finished to return to board-vision; if Tk/a display is unavailable, the trainer safely falls back to its terminal output.
    - **No** returns to the terminal and waits for Enter before opening the next file picker. Adding another board appends only its unique tiles to the physical training/validation folders.
 7. **The trainer reads the physical `datasets/training/<class>/` and `datasets/validation/<class>/` folders.** It first removes any exact/near duplicates still present across both folders (including manually copied files), trains on the training records, and uses validation both to select the best checkpoint and for the final per-class evaluation report. There is **no separate test set**. Legacy direct class folders, flat prefix files, and unsplit CSV records remain readable through a temporary label-stratified 80/20 fallback; legacy `train/<class>` is treated as training and legacy `test/<class>` as validation.
 
@@ -208,7 +208,13 @@ Train directly from the physical training/validation folders with:
 python cnn_trainer.py --dataset-dir datasets
 ```
 
-Duplicate removal defaults to `--dedupe exact-near`; `--dedupe exact` and `--dedupe off` are available for diagnostics. A legacy flat/CSV dataset can still be trained only when explicitly requested, for example:
+That opens the dashboard ready to start. Add `--start` to begin as soon as it opens, or use the original terminal/`tqdm` trainer with:
+
+```bash
+python cnn_trainer.py --dataset-dir datasets --no-ui
+```
+
+The dashboard and terminal modes share the same dataset discovery, duplicate removal, training, best-checkpoint, and final-validation code. `--epochs`, `--batch-size`, `--learning-rate`, and `--seed` set the same values shown in the dashboard. Duplicate removal defaults to `--dedupe exact-near`; `--dedupe exact` and `--dedupe off` are available for diagnostics. A legacy flat/CSV dataset can still be trained only when explicitly requested, for example:
 
 ```bash
 python cnn_trainer.py --dataset-dir board_debug --csv board_debug/dataset.csv
@@ -230,7 +236,7 @@ It copies only unique legacy tiles into the physical `datasets/training/<class>/
 ChessBotV-Rewrite/
 ├── new.py              # Main GUI + engine thread (60 FPS, 640x640 board)
 ├── board-vision.py      # Screenshot → 64 reviewed squares (duplicates auto-skip)
-├── cnn_trainer.py       # Trains chessbotv_cnn.pth from datasets/training + validation
+├── cnn_trainer.py       # Live UI/CLI trainer for chessbotv_cnn.pth
 ├── datasets/            # Physical split folders; generated data is local & ignored
 │   ├── training/        # white_king/ … black_pawn/ empty/
 │   ├── validation/      # white_king/ … black_pawn/ empty/
