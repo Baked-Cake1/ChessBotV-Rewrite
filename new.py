@@ -36,6 +36,13 @@ WIDTH = PADDING + EVAL_BAR_WIDTH + EVAL_BAR_GAP + BOARD_WIDTH + PADDING
 HEIGHT = TOP_BAR_HEIGHT + PADDING + BOARD_WIDTH + INFO_HEIGHT
 
 FPS = 60
+# Held-piece "grab" pose: ease a dragged sprite up to 115% size with a
+# slight clockwise tilt over 160 ms, plus at most 5 degrees of smoothed
+# lean from horizontal cursor movement.
+DRAG_GRAB_SCALE = 1.15
+DRAG_GRAB_ROTATION_DEGREES = -4.0
+DRAG_GRAB_ANIMATION_MS = 160
+DRAG_GRAB_MAX_LEAN_DEGREES = 5.0
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ANALYSIS_ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 
@@ -1370,6 +1377,78 @@ class AnimationManager:
         self.multi_arrow_fade_speed = 0.15
         self.multi_arrow_morph_speed = 0.18
 
+        # Dragged-piece pickup pose. Time-based (rather than a fixed
+        # increment in update()) so the scale/tilt remains smooth if a
+        # frame is late, and keyed by square so every fresh grab restarts.
+        self.drag_grab_square = None
+        self.drag_grab_started_ms = None
+        self.drag_grab_last_ms = None
+        self.drag_grab_last_mouse_pos = None
+        self.drag_grab_lean_degrees = 0.0
+
+    def reset_drag_grab_pose(self):
+        """Forget the current held-piece pose ready for the next grab."""
+        self.drag_grab_square = None
+        self.drag_grab_started_ms = None
+        self.drag_grab_last_ms = None
+        self.drag_grab_last_mouse_pos = None
+        self.drag_grab_lean_degrees = 0.0
+
+    def get_drag_grab_pose(self, drag_sq, mouse_pos, now_ms=None):
+        """Return the smoothly eased ``(scale, rotation)`` for a drag.
+
+        The piece grows to ``DRAG_GRAB_SCALE`` and takes on a slight
+        clockwise tilt over ``DRAG_GRAB_ANIMATION_MS``. Horizontal mouse
+        movement adds a small, exponentially smoothed lean: moving right
+        lets the lower part of the sprite trail left (more clockwise),
+        moving left does the reverse, and it settles back to the base
+        tilt when the cursor stops.
+        """
+        if drag_sq is None:
+            self.reset_drag_grab_pose()
+            return 1.0, 0.0
+
+        if now_ms is None:
+            now_ms = pygame.time.get_ticks()
+        now_ms = int(now_ms)
+        mouse_pos = (float(mouse_pos[0]), float(mouse_pos[1]))
+
+        if self.drag_grab_square != drag_sq or self.drag_grab_started_ms is None:
+            self.drag_grab_square = drag_sq
+            self.drag_grab_started_ms = now_ms
+            self.drag_grab_last_ms = now_ms
+            self.drag_grab_last_mouse_pos = mouse_pos
+            self.drag_grab_lean_degrees = 0.0
+        elif (
+            self.drag_grab_last_ms is not None
+            and self.drag_grab_last_mouse_pos is not None
+        ):
+            dt_ms = now_ms - self.drag_grab_last_ms
+            if dt_ms > 0:
+                vx = (
+                    mouse_pos[0] - self.drag_grab_last_mouse_pos[0]
+                ) * 1000.0 / dt_ms
+                target_lean = max(
+                    -DRAG_GRAB_MAX_LEAN_DEGREES,
+                    min(DRAG_GRAB_MAX_LEAN_DEGREES, -vx * 0.004),
+                )
+                # Frame-rate-independent smoothing: around a 48 ms
+                # time constant, so mouse jitter becomes gentle lean.
+                blend = 1.0 - math.exp(-dt_ms / 48.0)
+                self.drag_grab_lean_degrees += (
+                    target_lean - self.drag_grab_lean_degrees
+                ) * blend
+                self.drag_grab_last_ms = now_ms
+                self.drag_grab_last_mouse_pos = mouse_pos
+
+        elapsed = max(0, now_ms - self.drag_grab_started_ms)
+        amount = cubic_ease_out(elapsed / DRAG_GRAB_ANIMATION_MS)
+        scale = 1.0 + (DRAG_GRAB_SCALE - 1.0) * amount
+        rotation = (
+            DRAG_GRAB_ROTATION_DEGREES + self.drag_grab_lean_degrees
+        ) * amount
+        return scale, rotation
+
     def update(self):
         if self.move_anim:
             self.move_anim["progress"] += self.move_anim["speed"]
@@ -2628,6 +2707,36 @@ def get_legal_squares(board, selected_sq):
 
 
 # --- Drag & Click Helpers ---
+def _transform_dragged_piece_image(image, drag_offset, scale, angle_degrees):
+    """Scale/rotate a held piece around the exact point that was grabbed.
+
+    Returns ``(surface, grab_x, grab_y)`` where the grab coordinates are
+    the position of the original ``drag_offset`` inside the transformed
+    surface. Blitting at ``mouse_pos - grab`` therefore keeps the clicked
+    point under the cursor while the rest of the sprite grows/tilts;
+    transforming around the sprite centre alone would make an off-centre
+    grab slide in the player's hand.
+    """
+    grab_x, grab_y = float(drag_offset[0]), float(drag_offset[1])
+    if abs(scale - 1.0) < 0.0005 and abs(angle_degrees) < 0.005:
+        return image, grab_x, grab_y
+
+    transformed = pygame.transform.rotozoom(image, angle_degrees, scale)
+    theta = math.radians(angle_degrees)
+    # pygame rotations are counter-clockwise as seen on screen. With the
+    # screen's y axis pointing down, that maps an offset from the centre
+    # as (x cos + y sin, -x sin + y cos).
+    rel_x = grab_x - image.get_width() / 2.0
+    rel_y = grab_y - image.get_height() / 2.0
+    transformed_grab_x = transformed.get_width() / 2.0 + scale * (
+        rel_x * math.cos(theta) + rel_y * math.sin(theta)
+    )
+    transformed_grab_y = transformed.get_height() / 2.0 + scale * (
+        -rel_x * math.sin(theta) + rel_y * math.cos(theta)
+    )
+    return transformed, transformed_grab_x, transformed_grab_y
+
+
 def get_square_from_pos(pos):
     """Return chess square for a mouse pos inside the board, else None."""
     mx, my = pos
@@ -23325,17 +23434,24 @@ def draw_gui(
     # while a piece currently being dragged still renders above them.
     draw_analysis_board_overlays(screen, board)
 
-    # 5b. Dragged piece — follows cursor on top of everything
+    # 5b. Dragged piece — follows cursor on top of everything. Ease it
+    # into a slightly larger, tilted "grabbed" pose around the clicked
+    # point instead of blitting the settled square sprite unchanged.
     if dragging and drag_sq is not None and drag_offset is not None:
         piece = board.piece_at(drag_sq)
         if piece:
             pkey = get_piece_key(piece)
             if pkey in images:
                 mx, my = mouse_pos
-                ox, oy = drag_offset
-                draw_x = mx - ox
-                draw_y = my - oy
-                screen.blit(images[pkey], (draw_x, draw_y))
+                grab_scale, grab_rotation = anim_mgr.get_drag_grab_pose(
+                    drag_sq, mouse_pos
+                )
+                held_image, grab_x, grab_y = _transform_dragged_piece_image(
+                    images[pkey], drag_offset, grab_scale, grab_rotation
+                )
+                screen.blit(held_image, (mx - grab_x, my - grab_y))
+    else:
+        anim_mgr.reset_drag_grab_pose()
 
     # Promotion choice overlay (must be over board but under menu)
     if promotion_pending is not None:
