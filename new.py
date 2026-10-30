@@ -22440,10 +22440,10 @@ def draw_settings_menu(screen):
     # --- Page switching ---
     # The outgoing and incoming pages are drawn at the same time and slide
     # together: going forward the new page pushes in from the right while
-    # the old one recedes slightly to the left (parallax) and dims; going
-    # back the current page slides away to reveal the previous one
-    # underneath. (The old version slid one page completely out, left the
-    # screen empty, then slid the next one in.)
+    # the old one recedes slightly to the left (parallax); going back the
+    # current page slides away to reveal the previous one underneath.
+    # (The old version slid one page completely out, left the screen
+    # empty, then slid the next one in.)
     out_off = in_off = 0
     trans_e = 0.0
     if menu_transition_direction == "none":
@@ -22559,32 +22559,12 @@ def draw_settings_menu(screen):
         elif page_state == "autoplay_settings":
             draw_autoplay_settings_content(screen, offset_x, open_slide)
 
-    for idx, (page_state, page_off) in enumerate(pages_to_draw):
-        # The page on top rides in on a "sheet" that occludes the page
-        # underneath (pages have different heights, so without it the old
-        # page would show through below the new one). The sheet fades in
-        # and back out over the transition, so nothing changes at rest.
-        if len(pages_to_draw) > 1 and idx == 1:
-            sheet_alpha = int(225 * math.sin(math.pi * max(0.0, min(1.0, trans_e))))
-            if sheet_alpha > 0:
-                sheet = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-                sheet.fill((34, 34, 41, sheet_alpha))
-                screen.blit(sheet, (page_off, 0))
-                # soft shadow on the sheet's leading edge
-                shadow = pygame.Surface((22, HEIGHT), pygame.SRCALPHA)
-                for i in range(22):
-                    edge_a = int(sheet_alpha * 0.45 * (i / 22))
-                    if edge_a > 0:
-                        pygame.draw.line(shadow, (0, 0, 0, edge_a), (i, 0), (i, HEIGHT), 1)
-                screen.blit(shadow, (page_off - 22, 0))
+    # Slide only the pages' controls and text over the shell's single,
+    # fixed backdrop above. Do not attach another translucent full-page
+    # sheet (or inter-page dim) to the top page: its moving edge/doubled
+    # darkening made the Settings background look like it was sliding too.
+    for page_state, page_off in pages_to_draw:
         draw_page(page_state, page_off)
-        # Dim the page underneath while the other one is on top of it.
-        if len(pages_to_draw) > 1 and idx == 0:
-            dim_alpha = int(100 * trans_e) if menu_transition_direction == "forward" else int(100 * (1 - trans_e))
-            if dim_alpha > 0:
-                dim = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-                dim.fill((0, 0, 0, dim_alpha))
-                screen.blit(dim, (0, 0))
 
     # --- Header: cross-fading title, breadcrumb, back/close ---
     if menu_transition_direction == "none":
