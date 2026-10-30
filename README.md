@@ -14,7 +14,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 ## Features
 
 ### Play & Input
-- **Two input modes:** Click piece → green circles, *or* **drag & drop** to any legal square
+- **Two input modes:** Click piece → green circles, *or* **drag & drop** to any legal square; a held piece smoothly grows to 115% and tilts slightly around the grabbed point, with a little smoothed lean as it moves
 - Handles **castling, en-passant, promotion (choice dialog Q/R/B/N, no pawn/king), captures** and all legal chess rules via `python-chess`
 - **Space** to play the engine's top move instantly
 - **New Game** smoothly animates pieces back to starting squares
@@ -131,7 +131,7 @@ python new.py --help
 |---|---|
 | **Left-click** piece | Select, show legal moves (green = quiet, red+ring = capture) |
 | **Left-click** green/red | Move selected piece |
-| **Drag & drop** | Alternative: drag any of your pieces to a legal square |
+| **Drag & drop** | Alternative: drag any of your pieces to a legal square; while held, it eases to 115% size with a slight grab tilt/lean |
 | **Pawn to last rank** | Promotion dialog — click Q/R/B/N (no pawn/king) |
 | **Space** (menu closed, not animating) | Play engine's `pv[0]` if legal |
 | **Flip** (top bar) or **F** | Flip the board perspective; the brass button's ivory/charcoal arrows ease-swap colours and its tooltip names the side you will view from |
