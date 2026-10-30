@@ -1075,6 +1075,14 @@ depth_slider_pulse_phase = 0.0
 # staged Save flow, UCI MultiPV option and recalculation remain unchanged.
 multipv_slider_hover_amount = 0.0
 multipv_slider_pulse_phase = 0.0
+# Engine Settings Reset/Save action-button polish. These values animate
+# only the buttons' medallions, glow and enabled cross-fade; their click
+# rects, default-staging Reset and dirty-gated Save behaviour are unchanged.
+engine_reset_button_hover_amount = 0.0
+engine_reset_button_icon_rotation = 0.0
+engine_save_button_hover_amount = 0.0
+engine_save_button_enabled_amount = 0.0
+engine_save_button_pulse_phase = 0.0
 # Settings main-menu Board button polish. The phase drives only the
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
@@ -18093,6 +18101,710 @@ def _draw_polished_multipv_slider(
     return thumb_x, thumb_y
 
 
+def _engine_settings_changed_count():
+    """Count staged Engine Settings values that differ from saved config.
+
+    This mirrors ``update_slider_display``'s direct draft/config
+    comparison and is read-only; it only supplies the Save button badge.
+    """
+
+    try:
+        return int(
+            sum(
+                1
+                for key in ENGINE_ROW_KEYS
+                if engine_draft.get(key) != config.get(key)
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _draw_engine_action_button_body(
+    screen,
+    visual_rect,
+    top_colour,
+    bottom_colour,
+    border_colour,
+    hover_amount=0.0,
+    pressed=False,
+    glow_colour=(120, 180, 255),
+    glow_strength=0.0,
+    shadow_colour=(12, 16, 24),
+):
+    """Draw the shared metal body for Engine Settings Reset/Save."""
+
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    glow_strength = max(0.0, min(1.0, float(glow_strength)))
+    radius = min(10, max(2, min(visual_rect.width, visual_rect.height) // 2))
+
+    if visual_rect.width < 4 or visual_rect.height < 4:
+        pygame.draw.rect(
+            screen, bottom_colour, visual_rect, border_radius=radius
+        )
+        pygame.draw.rect(
+            screen, border_colour, visual_rect, 1, border_radius=radius
+        )
+        return
+
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 18), (4, 28), (7, 42)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=max(2, radius + 5 - inset),
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        shadow_colour,
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=radius,
+    )
+
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for body_row in range(visual_rect.height):
+        colour = _lerp_color(
+            top_colour, bottom_colour, body_row / denom
+        )
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, body_row),
+            (visual_rect.width - 1, body_row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(10 + 17 * hover_amount)),
+        [
+            (-12, visual_rect.height),
+            (visual_rect.width * 0.42, 0),
+            (visual_rect.width * 0.62, 0),
+            (visual_rect.width * 0.14, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(70 + 48 * hover_amount)),
+        (8, 1),
+        (visual_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 23),
+        (2, 6),
+        (2, visual_rect.height - 7),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 46 if pressed else 31),
+        (0, visual_rect.height - 4, visual_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 25),
+        (visual_rect.width - 3, 5, 3, visual_rect.height - 10),
+        border_radius=2,
+    )
+    if visual_rect.width >= 60:
+        for stripe_x in (8, 15):
+            pygame.draw.polygon(
+                overlay,
+                (255, 255, 255, 11),
+                [
+                    (stripe_x, visual_rect.height),
+                    (stripe_x + 10, 0),
+                    (stripe_x + 14, 0),
+                    (stripe_x + 4, visual_rect.height),
+                ],
+            )
+            pygame.draw.polygon(
+                overlay,
+                (255, 255, 255, 11),
+                [
+                    (
+                        visual_rect.width - stripe_x - 14,
+                        visual_rect.height,
+                    ),
+                    (visual_rect.width - stripe_x - 4, 0),
+                    (visual_rect.width - stripe_x, 0),
+                    (
+                        visual_rect.width - stripe_x - 10,
+                        visual_rect.height,
+                    ),
+                ],
+            )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask,
+        (255, 255, 255, 255),
+        mask.get_rect(),
+        border_radius=radius,
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+
+    pygame.draw.rect(
+        screen, border_colour, visual_rect, 2, border_radius=radius
+    )
+    if visual_rect.width > 6 and visual_rect.height > 6:
+        pygame.draw.rect(
+            screen,
+            _lerp_color(border_colour, (255, 255, 255), 0.30),
+            visual_rect.inflate(-3, -3),
+            1,
+            border_radius=max(2, radius - 2),
+        )
+
+
+def _draw_engine_reset_icon(
+    surface, cx, cy, radius, rotation, hover_amount=0.0
+):
+    """Draw twin restore arrows on a pale slate Reset medallion."""
+
+    cx, cy, radius = int(cx), int(cy), max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+
+    pygame.draw.circle(surface, (24, 32, 44), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, (238, 244, 250), (cx, cy), radius)
+    pygame.draw.circle(
+        surface, (210, 221, 233), (cx, cy), max(5, radius - 2)
+    )
+    pygame.draw.circle(surface, (54, 68, 84), (cx, cy), radius, 1)
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (54, 68, 84, 255)
+        )
+        pygame.gfxdraw.aacircle(
+            surface,
+            cx,
+            cy,
+            max(5, radius - 2),
+            (125, 151, 175, 255),
+        )
+    except Exception:
+        pass
+
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (cx - max(2, radius // 3), cy - max(2, radius // 3)),
+        1,
+    )
+
+    arc_radius = max(5, radius - 4)
+    arc_colours = ((37, 99, 235), (217, 119, 6))
+    for arc_index in range(2):
+        start = rotation + arc_index * math.pi - 0.35
+        end = start + 2.25
+        points = []
+        steps = 14
+        for step in range(steps + 1):
+            angle = start + (end - start) * step / steps
+            points.append(
+                (
+                    cx + arc_radius * math.cos(angle),
+                    cy + arc_radius * math.sin(angle),
+                )
+            )
+        colour = _lerp_color(
+            arc_colours[arc_index],
+            (255, 255, 255),
+            0.14 * hover_amount,
+        )
+        pygame.draw.lines(surface, colour, False, points, 2)
+        try:
+            pygame.draw.aalines(surface, colour, False, points)
+        except Exception:
+            pass
+
+        end_x, end_y = points[-1]
+        tangent = (-math.sin(end), math.cos(end))
+        normal = (math.cos(end), math.sin(end))
+        tip = (
+            end_x + tangent[0] * 3.2,
+            end_y + tangent[1] * 3.2,
+        )
+        base = (
+            end_x - tangent[0] * 1.4,
+            end_y - tangent[1] * 1.4,
+        )
+        arrowhead = [
+            tip,
+            (
+                base[0] + normal[0] * 2.6,
+                base[1] + normal[1] * 2.6,
+            ),
+            (
+                base[0] - normal[0] * 2.6,
+                base[1] - normal[1] * 2.6,
+            ),
+        ]
+        pygame.draw.polygon(surface, colour, arrowhead)
+        try:
+            pygame.gfxdraw.aapolygon(
+                surface, arrowhead, (*colour, 255)
+            )
+        except Exception:
+            pass
+
+    pygame.draw.circle(surface, (245, 158, 11), (cx, cy), 2)
+    pygame.draw.circle(surface, (255, 246, 220), (cx - 1, cy - 1), 1)
+
+
+def _draw_engine_save_icon(
+    surface,
+    cx,
+    cy,
+    radius,
+    enabled_amount=0.0,
+    hover_amount=0.0,
+    phase=0.0,
+):
+    """Draw a floppy-disk glyph on the Save button medallion."""
+
+    cx, cy, radius = int(cx), int(cy), max(8, int(radius))
+    try:
+        enabled_amount = float(enabled_amount)
+    except (TypeError, ValueError):
+        enabled_amount = 0.0
+    enabled_amount = max(0.0, min(1.0, enabled_amount))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+
+    face_colour = _lerp_color(
+        (205, 211, 207), (226, 255, 237), enabled_amount
+    )
+    inner_colour = _lerp_color(
+        (174, 182, 177), (187, 247, 208), enabled_amount
+    )
+    rim_colour = _lerp_color(
+        (84, 91, 87), (22, 101, 52), enabled_amount
+    )
+    disk_colour = _lerp_color(
+        (105, 112, 109), (21, 128, 61), enabled_amount
+    )
+    disk_colour = _lerp_color(
+        disk_colour, (255, 255, 255), 0.10 * hover_amount
+    )
+
+    pygame.draw.circle(surface, (16, 32, 24), (cx, cy + 1), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), radius)
+    pygame.draw.circle(
+        surface, inner_colour, (cx, cy), max(5, radius - 2)
+    )
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius, 1)
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (*rim_colour, 255)
+        )
+    except Exception:
+        pass
+
+    disk_left = cx - 6
+    disk_top = cy - 6
+    disk_right = cx + 6
+    disk_bottom = cy + 6
+    disk_points = [
+        (disk_left, disk_top),
+        (disk_right - 3, disk_top),
+        (disk_right, disk_top + 3),
+        (disk_right, disk_bottom),
+        (disk_left, disk_bottom),
+    ]
+    pygame.draw.polygon(surface, disk_colour, disk_points)
+    pygame.draw.polygon(surface, rim_colour, disk_points, 1)
+
+    shutter_colour = _lerp_color(
+        (190, 196, 192), (220, 252, 231), enabled_amount
+    )
+    shutter = pygame.Rect(cx - 4, cy - 6, 7, 4)
+    pygame.draw.rect(surface, shutter_colour, shutter)
+    pygame.draw.rect(
+        surface,
+        rim_colour,
+        pygame.Rect(cx + 1, cy - 5, 1, 2),
+    )
+    label_rect = pygame.Rect(cx - 4, cy + 2, 8, 4)
+    pygame.draw.rect(surface, shutter_colour, label_rect)
+    pygame.draw.line(
+        surface,
+        rim_colour,
+        (label_rect.x + 2, label_rect.centery),
+        (label_rect.right - 3, label_rect.centery),
+        1,
+    )
+
+    if enabled_amount > 0.03 or hover_amount > 0.03:
+        orbit_distance = max(4.0, radius - 3.0)
+        orbit = (
+            int(round(cx + orbit_distance * math.cos(phase - 0.7))),
+            int(round(cy + orbit_distance * math.sin(phase - 0.7))),
+        )
+        pygame.draw.circle(
+            surface,
+            _lerp_color(disk_colour, (255, 255, 255), 0.62),
+            orbit,
+            1,
+        )
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (cx - max(2, radius // 3), cy - max(2, radius // 3)),
+        1,
+    )
+
+
+def draw_polished_engine_reset_button(screen, rect, hovered):
+    """Draw Engine Settings Reset with a rotating restore medallion.
+
+    The original ``rect`` remains the click target. This renderer only
+    eases hover/pressed visuals and never stages the default values.
+    """
+
+    global engine_reset_button_hover_amount
+    global engine_reset_button_icon_rotation
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    engine_reset_button_hover_amount += (
+        hover_target - engine_reset_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - engine_reset_button_hover_amount) < 0.01:
+        engine_reset_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, engine_reset_button_hover_amount)
+    )
+    if hovered:
+        engine_reset_button_icon_rotation = (
+            engine_reset_button_icon_rotation
+            + (0.018 if pressed else 0.045)
+        ) % (2.0 * math.pi)
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+    if pressed:
+        top_colour, bottom_colour = (70, 78, 94), (48, 55, 68)
+        border_colour = (128, 140, 158)
+    elif hovered:
+        top_colour, bottom_colour = (110, 121, 138), (69, 78, 95)
+        border_colour = (190, 205, 222)
+    else:
+        top_colour, bottom_colour = (91, 100, 116), (58, 66, 80)
+        border_colour = (145, 158, 176)
+
+    _draw_engine_action_button_body(
+        screen,
+        visual_rect,
+        top_colour,
+        bottom_colour,
+        border_colour,
+        hover_amount=hover_amount,
+        pressed=pressed,
+        glow_colour=(125, 181, 252),
+        glow_strength=hover_amount,
+        shadow_colour=(17, 23, 33),
+    )
+
+    if hover_amount > 0.04:
+        accent_width = int(76 * hover_amount)
+        if accent_width >= 2:
+            accent_centre_x = visual_rect.centerx - 10
+            pygame.draw.line(
+                screen,
+                (125, 211, 252),
+                (
+                    accent_centre_x - accent_width // 2,
+                    visual_rect.bottom - 3,
+                ),
+                (
+                    accent_centre_x + accent_width // 2,
+                    visual_rect.bottom - 3,
+                ),
+                2,
+            )
+
+    label = "Reset"
+    text_colour = _lerp_color(
+        (232, 238, 245), (255, 255, 255), hover_amount
+    )
+    text = font_small.render(label, True, text_colour)
+    icon_radius = 12
+    gap = 8
+    group_width = icon_radius * 2 + gap + text.get_width()
+    group_x = visual_rect.centerx - group_width // 2 - 10
+    icon_cx = group_x + icon_radius
+    _draw_engine_reset_icon(
+        screen,
+        icon_cx,
+        visual_rect.centery,
+        icon_radius,
+        engine_reset_button_icon_rotation,
+        hover_amount=hover_amount,
+    )
+    text_rect = text.get_rect(
+        midleft=(
+            group_x + icon_radius * 2 + gap,
+            visual_rect.centery,
+        )
+    )
+    text_shadow = font_small.render(label, True, (24, 32, 44))
+    screen.blit(text_shadow, text_rect.move(0, 1))
+    screen.blit(text, text_rect)
+
+    # Five short rails for the five slider defaults Reset will stage.
+    rail_x0 = visual_rect.right - 25
+    rail_x1 = visual_rect.right - 11
+    for rail_index, rail_offset in enumerate((-8, -4, 0, 4, 8)):
+        rail_y = visual_rect.centery + rail_offset
+        lit = hover_amount >= (rail_index + 1) / 5.0
+        rail_colour = (
+            _lerp_color(
+                (96, 165, 250),
+                (245, 158, 11),
+                rail_index / 4.0,
+            )
+            if lit
+            else (103, 115, 132)
+        )
+        pygame.draw.line(
+            screen,
+            (24, 32, 44),
+            (rail_x0, rail_y + 1),
+            (rail_x1, rail_y + 1),
+            2,
+        )
+        pygame.draw.line(
+            screen, rail_colour, (rail_x0, rail_y), (rail_x1, rail_y), 2
+        )
+        pygame.draw.circle(screen, rail_colour, (rail_x1, rail_y), 1)
+
+    return visual_rect
+
+
+def draw_polished_engine_save_button(screen, rect, hovered, has_changes):
+    """Draw Engine Settings Save with its enabled/disabled polish.
+
+    The original ``rect`` remains the click target and the caller still
+    applies only when ``has_changes`` is true. This renderer only eases
+    hover, pressed, pulse and enabled-state visuals.
+    """
+
+    global engine_save_button_hover_amount
+    global engine_save_button_enabled_amount
+    global engine_save_button_pulse_phase
+
+    has_changes = bool(has_changes)
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    hover_target = 1.0 if hovered else 0.0
+    engine_save_button_hover_amount += (
+        hover_target - engine_save_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - engine_save_button_hover_amount) < 0.01:
+        engine_save_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, engine_save_button_hover_amount)
+    )
+
+    enabled_target = 1.0 if has_changes else 0.0
+    engine_save_button_enabled_amount += (
+        enabled_target - engine_save_button_enabled_amount
+    ) * 0.22
+    if abs(enabled_target - engine_save_button_enabled_amount) < 0.01:
+        engine_save_button_enabled_amount = enabled_target
+    enabled_amount = max(
+        0.0, min(1.0, engine_save_button_enabled_amount)
+    )
+
+    if hovered:
+        phase_step = 0.025 if pressed else 0.09
+    elif has_changes:
+        phase_step = 0.035
+    else:
+        phase_step = 0.0
+    if phase_step:
+        engine_save_button_pulse_phase = (
+            engine_save_button_pulse_phase + phase_step
+        ) % (2.0 * math.pi)
+    phase = engine_save_button_pulse_phase
+
+    visual_rect = rect.move(0, 1 if pressed else 0)
+    if pressed:
+        disabled_palette = ((66, 70, 72), (46, 49, 51), (91, 96, 98))
+        enabled_palette = ((46, 124, 76), (30, 91, 57), (96, 178, 124))
+    elif hovered:
+        disabled_palette = ((94, 99, 101), (61, 65, 67), (119, 124, 126))
+        enabled_palette = (
+            (82, 184, 112),
+            (43, 130, 76),
+            (166, 240, 188),
+        )
+    else:
+        disabled_palette = ((82, 86, 88), (55, 58, 60), (105, 110, 112))
+        enabled_palette = (
+            (64, 158, 96),
+            (35, 112, 67),
+            (113, 214, 145),
+        )
+    top_colour = _lerp_color(
+        disabled_palette[0], enabled_palette[0], enabled_amount
+    )
+    bottom_colour = _lerp_color(
+        disabled_palette[1], enabled_palette[1], enabled_amount
+    )
+    border_colour = _lerp_color(
+        disabled_palette[2], enabled_palette[2], enabled_amount
+    )
+    glow_colour = _lerp_color(
+        (148, 158, 152), (74, 222, 128), enabled_amount
+    )
+    glow_strength = max(
+        0.72 * hover_amount, 0.30 * enabled_amount
+    )
+
+    _draw_engine_action_button_body(
+        screen,
+        visual_rect,
+        top_colour,
+        bottom_colour,
+        border_colour,
+        hover_amount=hover_amount,
+        pressed=pressed,
+        glow_colour=glow_colour,
+        glow_strength=glow_strength,
+        shadow_colour=(13, 28, 20),
+    )
+
+    accent_strength = max(hover_amount, 0.35 * enabled_amount)
+    if accent_strength > 0.04:
+        accent_width = int(76 * accent_strength)
+        if accent_width >= 2:
+            accent_centre_x = visual_rect.centerx - 10
+            accent_colour = _lerp_color(
+                (128, 138, 132), (167, 243, 208), enabled_amount
+            )
+            pygame.draw.line(
+                screen,
+                accent_colour,
+                (
+                    accent_centre_x - accent_width // 2,
+                    visual_rect.bottom - 3,
+                ),
+                (
+                    accent_centre_x + accent_width // 2,
+                    visual_rect.bottom - 3,
+                ),
+                2,
+            )
+
+    label = "Save"
+    text_colour = _lerp_color(
+        (139, 145, 142), (235, 255, 241), enabled_amount
+    )
+    text_colour = _lerp_color(
+        text_colour, (255, 255, 255), 0.45 * hover_amount
+    )
+    text = font_small.render(label, True, text_colour)
+    icon_radius = 12
+    gap = 8
+    group_width = icon_radius * 2 + gap + text.get_width()
+    group_x = visual_rect.centerx - group_width // 2 - 10
+    icon_cx = group_x + icon_radius
+    _draw_engine_save_icon(
+        screen,
+        icon_cx,
+        visual_rect.centery,
+        icon_radius,
+        enabled_amount=enabled_amount,
+        hover_amount=hover_amount,
+        phase=phase,
+    )
+    text_rect = text.get_rect(
+        midleft=(
+            group_x + icon_radius * 2 + gap,
+            visual_rect.centery,
+        )
+    )
+    text_shadow = font_small.render(label, True, (16, 32, 24))
+    screen.blit(text_shadow, text_rect.move(0, 1))
+    screen.blit(text, text_rect)
+
+    badge_centre = (visual_rect.right - 17, visual_rect.centery)
+    badge_radius = 8
+    pygame.draw.circle(
+        screen,
+        (16, 32, 24),
+        (badge_centre[0], badge_centre[1] + 1),
+        badge_radius,
+    )
+    if has_changes:
+        pulse_radius = 10 + int(
+            round((math.sin(phase) + 1.0) * 0.5)
+        )
+        pygame.draw.circle(
+            screen, (166, 119, 43), badge_centre, pulse_radius, 1
+        )
+        pygame.draw.circle(
+            screen, (255, 200, 80), badge_centre, badge_radius
+        )
+        pygame.draw.circle(
+            screen, (255, 236, 178), badge_centre, badge_radius, 1
+        )
+        changed_count = _engine_settings_changed_count()
+        if changed_count <= 0:
+            changed_count = 1
+        badge_text = str(changed_count) if changed_count <= 9 else "9+"
+        badge_surface = font_tiny.render(
+            badge_text, True, (43, 29, 9)
+        )
+        screen.blit(
+            badge_surface,
+            badge_surface.get_rect(center=badge_centre),
+        )
+    else:
+        pygame.draw.circle(
+            screen, (63, 92, 76), badge_centre, badge_radius
+        )
+        pygame.draw.circle(
+            screen, (105, 140, 120), badge_centre, badge_radius, 1
+        )
+        check_points = [
+            (badge_centre[0] - 3, badge_centre[1]),
+            (badge_centre[0] - 1, badge_centre[1] + 2),
+            (badge_centre[0] + 4, badge_centre[1] - 3),
+        ]
+        pygame.draw.lines(
+            screen, (190, 220, 200), False, check_points, 2
+        )
+
+    return visual_rect
+
+
 def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
 
@@ -18216,24 +18928,10 @@ def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     save_rect = get_engine_save_rect(offset_x, offset_y)
     reset_hovered = reset_rect.collidepoint(mx, my)
     save_hovered = save_rect.collidepoint(mx, my)
-    # Reset button
-    pygame.draw.rect(screen, (95, 95, 95) if reset_hovered else (75, 75, 75), reset_rect, border_radius=8)
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, reset_rect, 2, border_radius=8)
-    reset_text = font_small.render("Reset", True, TEXT_COLOR)
-    screen.blit(reset_text, reset_text.get_rect(center=reset_rect.center))
-    # Save button — modern, disabled look if no changes
-    if engine_has_changes:
-        save_bg = (55, 145, 85) if save_hovered else (45, 125, 75)
-        save_border = (80, 180, 110)
-        save_text_col = TEXT_COLOR
-    else:
-        save_bg = (60, 60, 60)
-        save_border = (80, 80, 80)
-        save_text_col = (130,130,130)
-    pygame.draw.rect(screen, save_bg, save_rect, border_radius=8)
-    pygame.draw.rect(screen, save_border, save_rect, 2, border_radius=8)
-    save_text = font_small.render("Save", True, save_text_col)
-    screen.blit(save_text, save_text.get_rect(center=save_rect.center))
+    draw_polished_engine_reset_button(screen, reset_rect, reset_hovered)
+    draw_polished_engine_save_button(
+        screen, save_rect, save_hovered, engine_has_changes
+    )
 
     note = font_tiny.render("Adjust sliders then press Save to apply", True, TEXT_MUTED)
     screen.blit(note, (WIDTH // 2 - note.get_width() // 2, reset_rect.bottom + 10))
