@@ -496,6 +496,12 @@ _autoplay = {
     "last_grid": None,
     "expected_fen": None,
     "next_poll_at": 0.0,
+    "poll_id": 0,
+    "poll_session_id": 0,
+    "poll_running": False,
+    "poll_ready": False,
+    "poll_result": None,
+    "poll_kind": "",
     "pending_move": None,
     "pending_before_image": None,
     "pending_before_grid": None,
@@ -543,6 +549,7 @@ _advisor = {
     "error": "",
     "window": None,
     "pending_window": None,
+    "own_hwnd": 0,
     "side": "white",
     "vision_backend": "cnn",
     "vision_use_package": False,
@@ -558,6 +565,12 @@ _advisor = {
     "last_grid": None,
     "expected_fen": None,
     "next_poll_at": 0.0,
+    "poll_id": 0,
+    "poll_session_id": 0,
+    "poll_running": False,
+    "poll_ready": False,
+    "poll_result": None,
+    "poll_kind": "",
     "mouse_down": False,
     "mouse_released_at": 0.0,
     "sync_pending": False,
@@ -8543,8 +8556,21 @@ def _advisor_any_mouse_button_down():
         return False
 
 
-def _advisor_cursor_in_target_window():
-    """True when the cursor is over the Advisor target/board.
+def _advisor_own_hwnd_value():
+    """ChessBotV's HWND, cached after a GUI-thread lookup when possible."""
+    cached = _hwnd_value(_advisor.get("own_hwnd"))
+    if cached:
+        return cached
+    value = _hwnd_value(_get_window_hwnd(_user32()))
+    if value:
+        _advisor["own_hwnd"] = value
+    return value
+
+
+def _advisor_cursor_in_target_window_snapshot(
+    target_hwnd, screen_board_rect=None, own_hwnd=0
+):
+    """Worker-safe target-cursor test using only Win32 and snapshots.
 
     ``WindowFromPoint`` can return cliv-gui's transparent overlay rather
     than the chess window itself, so after the exact-HWND check this also
@@ -8552,11 +8578,8 @@ def _advisor_cursor_in_target_window():
     not treat a hold over ChessBotV's own window as a target hold.
     """
     user32 = _autoplay_user32()
-    if user32 is None:
-        return False
-    window_info = _advisor.get("window") or _advisor.get("pending_window") or {}
-    target_hwnd = _hwnd_value(window_info.get("hwnd")) if isinstance(window_info, dict) else 0
-    if not target_hwnd:
+    target_hwnd = _hwnd_value(target_hwnd)
+    if user32 is None or not target_hwnd:
         return False
 
     try:
@@ -8571,13 +8594,12 @@ def _advisor_cursor_in_target_window():
         )  # GA_ROOT
         if root_hwnd == target_hwnd:
             return True
-        own_hwnd = _hwnd_value(_get_window_hwnd(_user32()))
+        own_hwnd = _hwnd_value(own_hwnd)
         if own_hwnd and root_hwnd == own_hwnd:
             return False
 
-        board_rect = _advisor.get("screen_board_rect")
-        if board_rect:
-            bx, by, bw, _bh = [int(value) for value in board_rect]
+        if screen_board_rect:
+            bx, by, bw, _bh = [int(value) for value in screen_board_rect]
             if bx <= x < bx + bw and by <= y < by + bw:
                 return True
 
@@ -8593,13 +8615,43 @@ def _advisor_cursor_in_target_window():
     return False
 
 
+def _advisor_cursor_in_target_window():
+    """True when the cursor is over the Advisor target/board."""
+    window_info = _advisor.get("window") or _advisor.get("pending_window") or {}
+    target_hwnd = (
+        _hwnd_value(window_info.get("hwnd"))
+        if isinstance(window_info, dict)
+        else 0
+    )
+    if not target_hwnd:
+        return False
+    return _advisor_cursor_in_target_window_snapshot(
+        target_hwnd,
+        _advisor.get("screen_board_rect"),
+        _advisor_own_hwnd_value(),
+    )
+
+
+def _advisor_target_mouse_down_snapshot(
+    target_hwnd, screen_board_rect=None, own_hwnd=0, latched=False
+):
+    """Snapshot form of the Advisor mouse gate for background polls."""
+    if not _advisor_any_mouse_button_down():
+        return False
+    if latched:
+        # The press began in the target; keep pausing until the physical
+        # release even if the drag moves outside the board/window.
+        return True
+    return _advisor_cursor_in_target_window_snapshot(
+        target_hwnd, screen_board_rect, own_hwnd
+    )
+
+
 def _advisor_target_mouse_down():
     """Latched target mouse-hold used to suppress Advisor screenshots."""
     if not _advisor_any_mouse_button_down():
         return False
     if _advisor.get("mouse_down"):
-        # The press began in the target; keep pausing until the physical
-        # release even if the drag moves outside the board/window.
         return True
     return _advisor_cursor_in_target_window()
 
@@ -10071,6 +10123,7 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
     global show_autoplay_side_dialog, show_autoplay_gameover_dialog
     global show_board_detection_dialog, board_detection_picker_purpose
     _autoplay_invalidate_drag()
+    _autoplay_poll_runner.invalidate()
     _autoplay["scan_id"] = int(_autoplay.get("scan_id", 0)) + 1
     _autoplay.update({
         "enabled": False,
@@ -10126,6 +10179,7 @@ def request_autoplay_start():
         return False
 
     _autoplay_invalidate_drag()
+    _autoplay_poll_runner.invalidate()
     _autoplay.update({
         "enabled": True,
         "running": False,
@@ -10219,6 +10273,7 @@ def start_autoplay_scan(side=None):
         return stop_autoplay("Choose a window before scanning.", error=True)
     side = _autoplay_side_name(side or _autoplay.get("side", "white"))
     _autoplay_invalidate_drag()
+    _autoplay_poll_runner.invalidate()
     scan_id = int(_autoplay.get("scan_id", 0)) + 1
     use_package_snapshot = bool(use_package_enabled)
     _autoplay.update({
@@ -10360,6 +10415,7 @@ def stop_advisor(reason="Advisor Mode stopped", error=False):
         _advisor_overlay_service.stop_session(overlay_generation or None)
     except Exception:
         pass
+    _advisor_poll_runner.invalidate()
     _advisor["scan_id"] = int(_advisor.get("scan_id", 0)) + 1
     _advisor.update({
         "enabled": False,
@@ -10445,6 +10501,7 @@ def request_advisor_start():
         print(f"Advisor Mode: {message}")
         return False
 
+    _advisor_poll_runner.invalidate()
     _advisor.update({
         "enabled": True,
         "running": False,
@@ -10605,6 +10662,7 @@ def start_advisor_scan(side=None):
     if not window_info:
         return stop_advisor("Choose a window before scanning.", error=True)
     side = _autoplay_side_name(side or _advisor.get("side", "white"))
+    _advisor_poll_runner.invalidate()
     scan_id = int(_advisor.get("scan_id", 0)) + 1
     use_package_snapshot = bool(use_package_enabled)
     _advisor.update({
@@ -10627,6 +10685,9 @@ def start_advisor_scan(side=None):
         "sync_pending": False,
         "capture_failures": 0,
     })
+    # Resolve/cache ChessBotV's HWND on this GUI thread; the scan/poll
+    # workers then use Win32-only snapshot mouse checks.
+    _advisor_own_hwnd_value()
     _advisor_set_status(
         f"Scanning the full board as {side.capitalize()} with "
         f"{_vision_backend_label(use_package_snapshot)}..."
@@ -10653,35 +10714,85 @@ def _autoplay_board_crop_from_screenshot(image, board_rect):
     return image[y:y + side, x:x + side].copy()
 
 
+def _capture_board_crop_snapshot(window_info, board_rect, expected_window_size):
+    """Capture one already-located board without touching session state.
+
+    This is the worker-thread-safe part of live polling. The GUI thread
+    remains responsible for applying returned window geometry and for
+    stopping a session when this reports ``status == "resized"``.
+    """
+    result = {
+        "status": "capture_failed",
+        "crop": None,
+        "window_rect": None,
+        "window_size": None,
+        "screen_board_rect": None,
+    }
+    if not window_info or board_rect is None:
+        return result
+    try:
+        board_rect = tuple(int(value) for value in board_rect)
+    except Exception:
+        return result
+    if len(board_rect) != 4:
+        return result
+
+    image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
+    if image is None or window_rect is None:
+        return result
+    window_size = (
+        int(window_rect[2] - window_rect[0]),
+        int(window_rect[3] - window_rect[1]),
+    )
+    result.update({
+        "window_rect": window_rect,
+        "window_size": window_size,
+        "screen_board_rect": (
+            window_rect[0] + board_rect[0],
+            window_rect[1] + board_rect[1],
+            board_rect[2],
+            board_rect[3],
+        ),
+    })
+    if expected_window_size is not None and tuple(expected_window_size) != window_size:
+        result["status"] = "resized"
+        return result
+    crop = _autoplay_board_crop_from_screenshot(image, board_rect)
+    if crop is None:
+        return result
+    result["status"] = "ok"
+    result["crop"] = crop
+    return result
+
+
+def _apply_capture_window_geometry(state, capture_result):
+    if not capture_result:
+        return
+    if capture_result.get("window_rect") is not None:
+        state["window_rect"] = capture_result["window_rect"]
+    if capture_result.get("window_size") is not None:
+        state["window_size"] = capture_result["window_size"]
+    if capture_result.get("screen_board_rect") is not None:
+        state["screen_board_rect"] = capture_result["screen_board_rect"]
+
+
 def _autoplay_capture_board_crop():
     """Capture the target and keep only its already-located board crop."""
     window_info = _autoplay.get("window") or {}
     board_rect = _autoplay.get("board_rect")
     if not window_info or board_rect is None:
         return None
-    image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
-    if image is None or window_rect is None:
-        return None
-    window_size = (
-        int(window_rect[2] - window_rect[0]),
-        int(window_rect[3] - window_rect[1]),
+    result = _capture_board_crop_snapshot(
+        window_info, board_rect, _autoplay.get("window_size")
     )
-    expected_size = _autoplay.get("window_size")
-    if expected_size is not None and tuple(expected_size) != window_size:
+    if result.get("status") == "resized":
         stop_autoplay(
             "The target window was resized; restart Auto-play to scan its board again.",
             error=True,
         )
         return None
-    _autoplay["window_rect"] = window_rect
-    _autoplay["window_size"] = window_size
-    _autoplay["screen_board_rect"] = (
-        window_rect[0] + board_rect[0],
-        window_rect[1] + board_rect[1],
-        board_rect[2],
-        board_rect[3],
-    )
-    return _autoplay_board_crop_from_screenshot(image, board_rect)
+    _apply_capture_window_geometry(_autoplay, result)
+    return result.get("crop")
 
 
 def _advisor_capture_board_crop():
@@ -10690,29 +10801,322 @@ def _advisor_capture_board_crop():
     board_rect = _advisor.get("board_rect")
     if not window_info or board_rect is None:
         return None
-    image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
-    if image is None or window_rect is None:
-        return None
-    window_size = (
-        int(window_rect[2] - window_rect[0]),
-        int(window_rect[3] - window_rect[1]),
+    result = _capture_board_crop_snapshot(
+        window_info, board_rect, _advisor.get("window_size")
     )
-    expected_size = _advisor.get("window_size")
-    if expected_size is not None and tuple(expected_size) != window_size:
+    if result.get("status") == "resized":
         stop_advisor(
             "The target window was resized; turn Advisor Mode on again to scan its board.",
             error=True,
         )
         return None
-    _advisor["window_rect"] = window_rect
-    _advisor["window_size"] = window_size
-    _advisor["screen_board_rect"] = (
-        window_rect[0] + board_rect[0],
-        window_rect[1] + board_rect[1],
-        board_rect[2],
-        board_rect[3],
+    _apply_capture_window_geometry(_advisor, result)
+    return result.get("crop")
+
+
+def _live_poll_snapshot(
+    *,
+    window_info,
+    board_rect,
+    expected_window_size,
+    baseline_image,
+    base_grid,
+    side,
+    use_package=False,
+    mouse_gate=None,
+    board_snapshot=None,
+    move_search="",
+    pending_move_uci="",
+):
+    """Capture and analyse one live board poll from immutable inputs.
+
+    No pygame, Tk or session-state mutation happens here. The returned
+    crop/candidate are applied later on the GUI thread, where the board,
+    dialogs, engine handle and animations live.
+    """
+    result = _capture_board_crop_snapshot(
+        window_info, board_rect, expected_window_size
     )
-    return _autoplay_board_crop_from_screenshot(image, board_rect)
+    result.update({
+        "candidate": None,
+        "changed": [],
+        "move_uci": "",
+        "reply_move_uci": "",
+        "sequence_ucis": None,
+        "move_search_error": "",
+    })
+    if result.get("status") != "ok":
+        return result
+
+    def mouse_is_down():
+        if mouse_gate is None:
+            return False
+        try:
+            return bool(mouse_gate())
+        except Exception:
+            return False
+
+    crop = result["crop"]
+    if mouse_is_down():
+        result.update({"status": "mouse_down", "crop": None, "changed": None})
+        return result
+
+    changed = _autoplay_changed_visual_squares(baseline_image, crop)
+    result["changed"] = list(changed)
+    if not changed:
+        return result
+
+    classified = _autoplay_classify_visual_squares(
+        crop, changed, use_package=bool(use_package)
+    )
+    if mouse_is_down():
+        result.update({"status": "mouse_down", "crop": None, "changed": None})
+        return result
+
+    candidate = _autoplay_candidate_grid(
+        [list(row) for row in base_grid], classified, side
+    )
+    result["candidate"] = candidate
+
+    if board_snapshot is not None and move_search:
+        try:
+            if move_search == "single":
+                move = _autoplay_find_legal_move(board_snapshot, candidate)
+                result["move_uci"] = move.uci() if move is not None else ""
+            elif move_search == "advisor_sequence":
+                sequence = _advisor_find_move_sequence(board_snapshot, candidate)
+                result["sequence_ucis"] = (
+                    [move.uci() for move in sequence]
+                    if sequence is not None
+                    else None
+                )
+            elif move_search == "after_pending":
+                pending_move = chess.Move.from_uci(str(pending_move_uci))
+                if pending_move not in board_snapshot.legal_moves:
+                    raise ValueError("pending move is not legal in poll snapshot")
+                after_pending = board_snapshot.copy(stack=False)
+                after_pending.push(pending_move)
+                after_grid = _autoplay_board_grid_from_board(after_pending)
+                verified = _autoplay_candidate_matches(
+                    candidate, after_grid, base_grid
+                )
+                if not verified and after_pending.is_checkmate():
+                    verified = _autoplay_transition_matches(
+                        candidate, after_grid, base_grid
+                    )
+                if not verified:
+                    reply = _autoplay_find_legal_move(after_pending, candidate)
+                    result["reply_move_uci"] = (
+                        reply.uci() if reply is not None else ""
+                    )
+        except Exception as exc:
+            result["move_search_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+class _LiveBoardPollRunner:
+    """One-at-a-time background polls for a live Advisor/Auto-play session.
+
+    The pygame window and event loop deliberately stay on the process's
+    UI/main thread: SDL video/event calls are not generally safe to move
+    wholesale to an arbitrary worker. This runner moves only the work
+    that used to stall that loop (window capture, pixel diffing, CNN /
+    package inference and legal-move matching) to daemon workers. Jobs
+    are generation-checked, so stopping or rescanning invalidates any
+    in-flight result before the GUI can consume it.
+    """
+
+    def __init__(self, state, session_key, thread_name):
+        self.state = state
+        self.session_key = session_key
+        self.thread_name = str(thread_name)
+        self._lock = threading.Lock()
+        self._thread = None
+
+    def _is_current_locked(self, poll_id, session_id):
+        return (
+            int(self.state.get("poll_id", 0) or 0) == int(poll_id)
+            and int(self.state.get(self.session_key, 0) or 0) == int(session_id)
+        )
+
+    def start(self, kind, snapshot_kwargs, context=None):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            poll_id = int(self.state.get("poll_id", 0) or 0) + 1
+            session_id = int(self.state.get(self.session_key, 0) or 0)
+            self.state.update({
+                "poll_id": poll_id,
+                "poll_session_id": session_id,
+                "poll_running": True,
+                "poll_ready": False,
+                "poll_result": None,
+                "poll_kind": str(kind or ""),
+            })
+            thread = threading.Thread(
+                target=self._run,
+                args=(
+                    poll_id,
+                    session_id,
+                    str(kind or ""),
+                    dict(snapshot_kwargs or {}),
+                    dict(context or {}),
+                ),
+                name=self.thread_name,
+                daemon=True,
+            )
+            self._thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                if self._is_current_locked(poll_id, session_id):
+                    self.state.update({
+                        "poll_running": False,
+                        "poll_ready": False,
+                        "poll_result": None,
+                        "poll_kind": "",
+                    })
+            return False
+        return True
+
+    def _run(self, poll_id, session_id, kind, snapshot_kwargs, context):
+        try:
+            result = _live_poll_snapshot(**snapshot_kwargs)
+            if not isinstance(result, dict):
+                result = {"status": "error", "error": "Invalid poll result"}
+        except Exception as exc:
+            result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "crop": None,
+                "candidate": None,
+                "changed": [],
+            }
+        result = dict(result)
+        result.update({
+            "kind": kind,
+            "poll_id": int(poll_id),
+            "session_id": int(session_id),
+            "context": dict(context or {}),
+        })
+        with self._lock:
+            if not self._is_current_locked(poll_id, session_id):
+                return
+            if not self.state.get("poll_running"):
+                return
+            self.state.update({
+                "poll_running": False,
+                "poll_ready": True,
+                "poll_result": result,
+                "poll_kind": kind,
+            })
+
+    def take(self, kind=None):
+        with self._lock:
+            if not self.state.get("poll_ready"):
+                return None
+            result = self.state.get("poll_result")
+            if not isinstance(result, dict):
+                self.state.update({"poll_ready": False, "poll_result": None})
+                return None
+            if kind is not None and str(result.get("kind", "")) != str(kind):
+                return None
+            self.state.update({
+                "poll_ready": False,
+                "poll_result": None,
+                "poll_kind": "",
+            })
+            return dict(result)
+
+    def is_running(self, kind=None):
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                return False
+            if not self.state.get("poll_running"):
+                return False
+            return kind is None or str(self.state.get("poll_kind", "")) == str(kind)
+
+    def is_busy(self):
+        """Whether any worker, including an invalidated one, is alive."""
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def invalidate(self):
+        with self._lock:
+            self.state.update({
+                "poll_id": int(self.state.get("poll_id", 0) or 0) + 1,
+                "poll_running": False,
+                "poll_ready": False,
+                "poll_result": None,
+                "poll_kind": "",
+            })
+
+
+_autoplay_poll_runner = _LiveBoardPollRunner(
+    _autoplay, "scan_id", "ChessBotV-AutoplayLivePoll"
+)
+_advisor_poll_runner = _LiveBoardPollRunner(
+    _advisor, "scan_id", "ChessBotV-AdvisorLivePoll"
+)
+
+
+def _autoplay_poll_snapshot_kwargs(
+    base_grid,
+    baseline_image,
+    board_snapshot=None,
+    move_search="",
+    pending_move_uci="",
+):
+    window_info = _autoplay.get("window") or {}
+    return {
+        "window_info": dict(window_info) if isinstance(window_info, dict) else {},
+        "board_rect": _autoplay.get("board_rect"),
+        "expected_window_size": _autoplay.get("window_size"),
+        "baseline_image": baseline_image,
+        "base_grid": [list(row) for row in base_grid],
+        "side": _autoplay_side_name(_autoplay.get("side", "white")),
+        "use_package": _autoplay_use_package_selected(),
+        "board_snapshot": board_snapshot,
+        "move_search": move_search,
+        "pending_move_uci": str(pending_move_uci or ""),
+    }
+
+
+def _advisor_poll_snapshot_kwargs(
+    base_grid, baseline_image, board_snapshot=None
+):
+    window_info = _advisor.get("window") or {}
+    window_snapshot = (
+        dict(window_info) if isinstance(window_info, dict) else {}
+    )
+    target_hwnd = _hwnd_value(window_snapshot.get("hwnd"))
+    screen_board_rect = _advisor.get("screen_board_rect")
+    own_hwnd = _advisor_own_hwnd_value()
+
+    def mouse_gate():
+        # The latch itself is deliberately read live: the GUI sets it as
+        # soon as it observes the press, while all HWND/rect inputs and
+        # pygame window lookup were snapshotted on the GUI thread above.
+        return _advisor_target_mouse_down_snapshot(
+            target_hwnd,
+            screen_board_rect,
+            own_hwnd,
+            latched=bool(_advisor.get("mouse_down")),
+        )
+
+    return {
+        "window_info": window_snapshot,
+        "board_rect": _advisor.get("board_rect"),
+        "expected_window_size": _advisor.get("window_size"),
+        "baseline_image": baseline_image,
+        "base_grid": [list(row) for row in base_grid],
+        "side": _autoplay_side_name(_advisor.get("side", "white")),
+        "use_package": bool(_advisor.get("vision_use_package")),
+        "mouse_gate": mouse_gate,
+        "board_snapshot": board_snapshot,
+        "move_search": "advisor_sequence" if board_snapshot is not None else "",
+    }
 
 
 def get_autoplay_side_dialog_rects():
@@ -23193,6 +23597,7 @@ def main():
         if result is None:
             return False
         _autoplay_invalidate_drag()
+        _autoplay_poll_runner.invalidate()
         _autoplay.update({
             "enabled": False,
             "running": False,
@@ -23272,6 +23677,7 @@ def main():
         if board_crop is None:
             return stop_autoplay("Auto-play scan did not include a usable board image.", error=True)
 
+        _autoplay_poll_runner.invalidate()
         _autoplay.update({
             "running": True,
             "board_rect": result.get("board_rect"),
@@ -23321,21 +23727,85 @@ def main():
             )
         return True
 
-    def autoplay_poll_candidate(base_grid, baseline_image):
-        """Return (board crop, candidate grid or None, changed visual cells)."""
-        crop = _autoplay_capture_board_crop()
-        if not _autoplay.get("enabled"):
-            return None, None, []
-        if crop is None:
-            return None, None, []
-        changed = _autoplay_changed_visual_squares(baseline_image, crop)
-        if not changed:
-            return crop, None, []
-        classified = _autoplay_classify_visual_squares(crop, changed)
-        candidate = _autoplay_candidate_grid(
-            base_grid, classified, _autoplay.get("side", "white")
+    def autoplay_poll_candidate_async(
+        kind,
+        base_grid,
+        baseline_image,
+        *,
+        board_snapshot=None,
+        move_search="",
+        pending_move_uci="",
+        force=False,
+        launch=True,
+    ):
+        """Launch or consume one non-blocking Auto-play live-board poll.
+
+        Returns the ready worker result, or ``None`` while that result is
+        not due/running. Screenshot capture, diffing and vision inference
+        therefore no longer stall pygame's event/render loop; all session
+        and board mutations below still happen on this GUI thread.
+        """
+        result = _autoplay_poll_runner.take(kind)
+        if result is not None:
+            context = result.get("context") or {}
+            if context.get("board_fen") not in (None, board.fen()):
+                return None
+            expected_pending = str(context.get("pending_move_uci", "") or "")
+            actual_pending = (
+                _autoplay.get("pending_move").uci()
+                if _autoplay.get("pending_move") is not None
+                else ""
+            )
+            if kind == "verify_our_move" and expected_pending != actual_pending:
+                return None
+            if result.get("status") == "resized":
+                stop_autoplay(
+                    "The target window was resized; restart Auto-play to scan its board again.",
+                    error=True,
+                )
+                return {
+                    "status": "stopped",
+                    "crop": None,
+                    "candidate": None,
+                    "changed": [],
+                }
+            _apply_capture_window_geometry(_autoplay, result)
+            return result
+
+        if _autoplay_poll_runner.is_running() or _autoplay_poll_runner.is_busy():
+            return None
+        if not launch:
+            return None
+        now = time.monotonic()
+        if not force and now < float(_autoplay.get("next_poll_at", 0.0)):
+            return None
+        _autoplay["next_poll_at"] = now + AUTOPLAY_POLL_SECONDS
+        launch_base_grid = base_grid() if callable(base_grid) else base_grid
+        launch_board_snapshot = (
+            board_snapshot() if callable(board_snapshot) else board_snapshot
         )
-        return crop, candidate, changed
+        started = _autoplay_poll_runner.start(
+            kind,
+            _autoplay_poll_snapshot_kwargs(
+                launch_base_grid,
+                baseline_image,
+                board_snapshot=launch_board_snapshot,
+                move_search=move_search,
+                pending_move_uci=pending_move_uci,
+            ),
+            context={
+                "board_fen": board.fen(),
+                "pending_move_uci": str(pending_move_uci or ""),
+            },
+        )
+        if not started:
+            return {
+                "status": "error",
+                "crop": None,
+                "candidate": None,
+                "changed": [],
+            }
+        return None
 
     def autoplay_process_drag_result():
         """Consume one non-blocking drag result on the GUI thread."""
@@ -23429,6 +23899,19 @@ def main():
                 _autoplay["next_poll_at"] = now + AUTOPLAY_POLL_SECONDS
                 _autoplay_set_status("Auto-play waiting for the opponent...")
                 return
+            pre_drag_poll = autoplay_poll_candidate_async(
+                "pre_drag",
+                [],
+                _autoplay.get("last_image"),
+                launch=False,
+            )
+            if pre_drag_poll is None and _autoplay_poll_runner.is_running("pre_drag"):
+                _autoplay_set_status(
+                    f"Auto-play ({side}) checking the live board before dragging..."
+                )
+                return
+            if pre_drag_poll is not None and not _autoplay.get("enabled"):
+                return
             with engine_thread.lock:
                 depth_now = int(engine_thread.info.get("depth", 0) or 0)
                 pv_now = list(engine_thread.info.get("pv", []))
@@ -23451,23 +23934,34 @@ def main():
                 return
 
             move = pv_now[0]
+            pre_drag_base_grid = _autoplay_board_grid_from_board(board)
             # Take a fresh board-only baseline immediately before touching
-            # the external board. Known placement mismatches mean the live
-            # window no longer matches ChessBot, so do not drag blindly.
-            crop = _autoplay_capture_board_crop()
+            # the external board, but do the screenshot/vision work in the
+            # background poll runner. Known placement mismatches mean the
+            # live window no longer matches ChessBot, so do not drag blindly.
+            if pre_drag_poll is None:
+                pre_drag_poll = autoplay_poll_candidate_async(
+                    "pre_drag",
+                    pre_drag_base_grid,
+                    _autoplay.get("last_image"),
+                    force=True,
+                )
+                if pre_drag_poll is None:
+                    _autoplay_set_status(
+                        f"Auto-play ({side}) depth {target_depth} reached; "
+                        "checking the live board before dragging..."
+                    )
+                    return
             if not _autoplay.get("enabled"):
                 return
+            crop = pre_drag_poll.get("crop")
             if crop is not None and _autoplay.get("last_image") is not None:
-                changed = _autoplay_changed_visual_squares(_autoplay["last_image"], crop)
-                if changed:
-                    classified = _autoplay_classify_visual_squares(crop, changed)
-                    candidate = _autoplay_candidate_grid(
-                        _autoplay_board_grid_from_board(board), classified, side
-                    )
-                    expected_grid = _autoplay_board_grid_from_board(board)
+                changed = pre_drag_poll.get("changed") or []
+                candidate = pre_drag_poll.get("candidate")
+                if changed and candidate is not None:
                     known_mismatch = any(
                         candidate[row][col] != "?"
-                        and candidate[row][col] != expected_grid[row][col]
+                        and candidate[row][col] != pre_drag_base_grid[row][col]
                         for row in range(8)
                         for col in range(8)
                     )
@@ -23508,22 +24002,39 @@ def main():
             if board.turn == player:
                 _autoplay["state"] = "our_turn"
                 return
-            if now < float(_autoplay.get("next_poll_at", 0.0)):
-                return
-            _autoplay["next_poll_at"] = now + AUTOPLAY_POLL_SECONDS
-            base_grid = _autoplay_board_grid_from_board(board)
-            crop, candidate, changed = autoplay_poll_candidate(
-                base_grid, _autoplay.get("last_image")
+            poll_result = autoplay_poll_candidate_async(
+                "wait_opponent",
+                lambda: _autoplay_board_grid_from_board(board),
+                _autoplay.get("last_image"),
+                board_snapshot=lambda: board.copy(stack=False),
+                move_search="single",
             )
+            if poll_result is None:
+                return
             if not _autoplay.get("running"):
                 return
+            crop = poll_result.get("crop")
+            candidate = poll_result.get("candidate")
+            changed = poll_result.get("changed") or []
             if crop is None:
                 _autoplay_set_status("Auto-play waiting: could not screenshot the target board; retrying...")
                 return
             if not changed:
                 _autoplay_set_status("Auto-play waiting for the opponent (board unchanged)...")
                 return
-            move = _autoplay_find_legal_move(board, candidate)
+            move = None
+            move_uci = str(poll_result.get("move_uci") or "")
+            if move_uci:
+                try:
+                    parsed_move = chess.Move.from_uci(move_uci)
+                except Exception:
+                    parsed_move = None
+                if parsed_move in board.legal_moves:
+                    move = parsed_move
+            if move is None and poll_result.get("move_search_error"):
+                # The normal path matched the legal move in the worker.
+                # Keep a GUI fallback only if that search itself failed.
+                move = _autoplay_find_legal_move(board, candidate)
             if move is None:
                 _autoplay_set_status(
                     f"Auto-play saw {len(changed)} changed square(s); waiting for the move to settle..."
@@ -23544,19 +24055,26 @@ def main():
             return
 
         if state == "verify_our_move":
-            if now < float(_autoplay.get("next_poll_at", 0.0)):
-                return
-            _autoplay["next_poll_at"] = now + AUTOPLAY_POLL_SECONDS
             pending = _autoplay.get("pending_move")
             if pending is None:
                 _autoplay["state"] = "wait_opponent"
                 return
             before_grid = _autoplay.get("pending_before_grid") or _autoplay_board_grid_from_board(board)
-            crop, candidate, changed = autoplay_poll_candidate(
-                before_grid, _autoplay.get("pending_before_image")
+            poll_result = autoplay_poll_candidate_async(
+                "verify_our_move",
+                before_grid,
+                _autoplay.get("pending_before_image"),
+                board_snapshot=lambda: board.copy(stack=False),
+                move_search="after_pending",
+                pending_move_uci=pending.uci(),
             )
+            if poll_result is None:
+                return
             if not _autoplay.get("running"):
                 return
+            crop = poll_result.get("crop")
+            candidate = poll_result.get("candidate")
+            changed = poll_result.get("changed") or []
             if crop is None:
                 _autoplay_set_status("Auto-play verifying move: could not screenshot the board; retrying...")
                 return
@@ -23622,9 +24140,19 @@ def main():
                 return
 
             # A very fast opponent reply/premove can already be present in
-            # the verification screenshot. Accept the two-move sequence if
-            # it uniquely matches the changed squares.
-            opponent_move = _autoplay_find_legal_move(clone, candidate)
+            # the verification screenshot. The worker searched for that
+            # unique reply; accept it only after revalidating it here.
+            opponent_move = None
+            reply_uci = str(poll_result.get("reply_move_uci") or "")
+            if reply_uci:
+                try:
+                    parsed_reply = chess.Move.from_uci(reply_uci)
+                except Exception:
+                    parsed_reply = None
+                if parsed_reply in clone.legal_moves:
+                    opponent_move = parsed_reply
+            if opponent_move is None and poll_result.get("move_search_error"):
+                opponent_move = _autoplay_find_legal_move(clone, candidate)
             if opponent_move is not None:
                 our_san = board.san(pending)
                 if not autoplay_push_move(pending):
@@ -23810,6 +24338,7 @@ def main():
                 error=True,
             )
 
+        _advisor_poll_runner.invalidate()
         _advisor.update({
             "running": True,
             "state": "live",
@@ -23853,38 +24382,57 @@ def main():
             )
         return True
 
-    def advisor_poll_candidate():
-        """Return (board crop, candidate grid or None, changed cells).
+    def advisor_poll_candidate_async():
+        """Launch or consume one non-blocking Advisor live-board poll.
 
-        ``changed is None`` is the mouse-gate sentinel: a press began
-        during capture/classification, so that screenshot is discarded
-        rather than being allowed to affect board sync.
+        The worker performs the screenshot, changed-square diff, vision
+        classification and 0/1/2-ply move search from a board snapshot.
+        ``changed is None`` remains the mouse-gate sentinel in a ready
+        result. ``None`` itself means no result is due or one is still
+        running, so the GUI can keep drawing/overlay-refreshing.
         """
-        crop = _advisor_capture_board_crop()
-        if not _advisor.get("enabled"):
-            return None, None, []
-        if crop is None:
-            return None, None, []
-        if _advisor_target_mouse_down():
-            return None, None, None
-        changed = _autoplay_changed_visual_squares(
-            _advisor.get("last_image"), crop
+        result = _advisor_poll_runner.take("live")
+        if result is not None:
+            context = result.get("context") or {}
+            if context.get("board_fen") not in (None, board.fen()):
+                return None
+            if result.get("status") == "resized":
+                stop_advisor(
+                    "The target window was resized; turn Advisor Mode on again to scan its board.",
+                    error=True,
+                )
+                return {
+                    "status": "stopped",
+                    "crop": None,
+                    "candidate": None,
+                    "changed": [],
+                }
+            _apply_capture_window_geometry(_advisor, result)
+            return result
+
+        if _advisor_poll_runner.is_running() or _advisor_poll_runner.is_busy():
+            return None
+        now = time.monotonic()
+        if now < float(_advisor.get("next_poll_at", 0.0)):
+            return None
+        _advisor["next_poll_at"] = now + ADVISOR_POLL_SECONDS
+        started = _advisor_poll_runner.start(
+            "live",
+            _advisor_poll_snapshot_kwargs(
+                _autoplay_board_grid_from_board(board),
+                _advisor.get("last_image"),
+                board_snapshot=board.copy(stack=False),
+            ),
+            context={"board_fen": board.fen()},
         )
-        if not changed:
-            return crop, None, []
-        classified = _autoplay_classify_visual_squares(
-            crop,
-            changed,
-            use_package=bool(_advisor.get("vision_use_package")),
-        )
-        if _advisor_target_mouse_down():
-            return None, None, None
-        candidate = _autoplay_candidate_grid(
-            _autoplay_board_grid_from_board(board),
-            classified,
-            _advisor.get("side", "white"),
-        )
-        return crop, candidate, changed
+        if not started:
+            return {
+                "status": "error",
+                "crop": None,
+                "candidate": None,
+                "changed": [],
+            }
+        return None
 
     def update_advisor():
         if _advisor.get("scan_ready"):
@@ -23925,12 +24473,16 @@ def main():
         mouse_down = _advisor_target_mouse_down()
         if mouse_down:
             if not _advisor.get("mouse_down"):
+                # Discard any screenshot that was in flight when this
+                # press began; a held/dragged piece must never sync.
+                _advisor_poll_runner.invalidate()
                 _advisor_set_status(
                     "Advisor paused while the mouse is held in the target window..."
                 )
             _advisor["mouse_down"] = True
         else:
             if _advisor.get("mouse_down"):
+                _advisor_poll_runner.invalidate()
                 _advisor.update({
                     "mouse_down": False,
                     "mouse_released_at": now,
@@ -23940,9 +24492,11 @@ def main():
                     "Mouse released; checking the board..."
                 )
 
-            if now >= float(_advisor.get("next_poll_at", 0.0)):
-                _advisor["next_poll_at"] = now + ADVISOR_POLL_SECONDS
-                crop, candidate, changed = advisor_poll_candidate()
+            poll_result = advisor_poll_candidate_async()
+            if poll_result is not None:
+                crop = poll_result.get("crop")
+                candidate = poll_result.get("candidate")
+                changed = poll_result.get("changed")
                 if not _advisor.get("enabled") or not _advisor.get("running"):
                     return
                 if changed is None:
@@ -23969,7 +24523,31 @@ def main():
                     _advisor["sync_pending"] = False
                 else:
                     _advisor["capture_failures"] = 0
-                    sequence = _advisor_find_move_sequence(board, candidate)
+                    sequence = None
+                    sequence_ucis = poll_result.get("sequence_ucis")
+                    if sequence_ucis is not None:
+                        parsed_sequence = []
+                        sequence_clone = board.copy(stack=False)
+                        sequence_valid = True
+                        for move_uci in sequence_ucis:
+                            try:
+                                parsed_move = chess.Move.from_uci(
+                                    str(move_uci)
+                                )
+                            except Exception:
+                                sequence_valid = False
+                                break
+                            if parsed_move not in sequence_clone.legal_moves:
+                                sequence_valid = False
+                                break
+                            parsed_sequence.append(parsed_move)
+                            sequence_clone.push(parsed_move)
+                        if sequence_valid:
+                            sequence = parsed_sequence
+                    if sequence is None and poll_result.get("move_search_error"):
+                        # Normal matching happens in the poll worker.
+                        # Keep this only as a failure fallback.
+                        sequence = _advisor_find_move_sequence(board, candidate)
                     if sequence is not None:
                         move_sans = []
                         for move in sequence:
