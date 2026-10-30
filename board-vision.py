@@ -1442,6 +1442,8 @@ def run_cnn_trainer(records, dataset_dir=DATASET_DIR):
         str(Path(dataset_dir)),
         "--output",
         str(BASE_DIR / "chessbotv_cnn.pth"),
+        "--ui",
+        "--start",
     ]
     print("\nStarting CNN trainer...")
     print("Command:", " ".join(command))
