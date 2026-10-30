@@ -984,6 +984,9 @@ SETTINGS_MAIN_ITEMS = [
     "Analysis Settings",
     "Auto-Play Settings",
 ]
+# Match the wide 600 px row column used by Analysis Settings so the
+# Auto-Play Settings cards span the same part of the Settings window.
+AUTOPLAY_SETTINGS_ROW_WIDTH = 600
 
 
 def _settings_main_start_y(item_count, item_height=50, item_gap=20):
@@ -11327,7 +11330,12 @@ def get_board_detection_button_rect(offset_x=0, offset_y=0):
     # Sit below the always-visible Auto-Move depth row, and below the
     # colour/status controls too when Auto-Move is enabled.
     y = 494 if auto_move_enabled else 386
-    return pygame.Rect(WIDTH // 2 - 220 + offset_x, y + offset_y, 440, 88)
+    return pygame.Rect(
+        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
+        y + offset_y,
+        AUTOPLAY_SETTINGS_ROW_WIDTH,
+        88,
+    )
 
 
 def _elide_text(text, font, max_width):
@@ -13093,12 +13101,22 @@ def draw_polished_always_on_top_toggle(screen, rect, on, anim, hovered):
 
 
 def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
-    return pygame.Rect(WIDTH // 2 - 220 + offset_x, 150 + offset_y, 440, 94)
+    return pygame.Rect(
+        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
+        150 + offset_y,
+        AUTOPLAY_SETTINGS_ROW_WIDTH,
+        94,
+    )
 
 
 def get_auto_move_depth_rects(offset_x=0, offset_y=0):
     """Row and − / value / + controls for Auto-Move's target depth."""
-    row = pygame.Rect(WIDTH // 2 - 220 + offset_x, 304 + offset_y, 440, 58)
+    row = pygame.Rect(
+        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
+        304 + offset_y,
+        AUTOPLAY_SETTINGS_ROW_WIDTH,
+        58,
+    )
     minus = pygame.Rect(row.right - 178, row.centery - 18, 42, 36)
     value = pygame.Rect(minus.right + 8, row.centery - 18, 72, 36)
     plus = pygame.Rect(value.right + 8, row.centery - 18, 42, 36)
@@ -13163,7 +13181,9 @@ def _draw_auto_move_depth_row(screen, offset_x=0, offset_y=0, idle=True):
 
 def get_auto_move_color_rects(offset_x=0, offset_y=0):
     colors = ("white", "black", "both")
-    w, h, gap = 140, 46, 10
+    # Three equal buttons plus their gaps exactly fill the shared
+    # Auto-Play Settings row width used by the cards above and below.
+    w, h, gap = 190, 46, 15
     total = 3 * w + 2 * gap
     x0 = WIDTH // 2 - total // 2 + offset_x
     return {c: pygame.Rect(x0 + i * (w + gap), 402 + offset_y, w, h) for i, c in enumerate(colors)}
@@ -13300,7 +13320,12 @@ def get_advisor_toggle_rect(offset_x=0, offset_y=0):
     strip between the intro line and the Auto-Move card rather than
     moving any established card.
     """
-    return pygame.Rect(WIDTH // 2 - 220 + offset_x, 106 + offset_y, 440, 40)
+    return pygame.Rect(
+        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
+        106 + offset_y,
+        AUTOPLAY_SETTINGS_ROW_WIDTH,
+        40,
+    )
 
 
 def _autoplay_settings_button_summary():
@@ -14126,7 +14151,7 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         advisor_status = "cliv-gui live overlay"
         advisor_colour = TEXT_MUTED
     advisor_status_s = font_tiny.render(
-        _elide_text(advisor_status, font_tiny, 178),
+        _elide_text(advisor_status, font_tiny, advisor_rect.width - 262),
         True,
         advisor_colour,
     )
