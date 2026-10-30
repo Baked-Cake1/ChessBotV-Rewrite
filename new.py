@@ -22440,8 +22440,11 @@ def draw_settings_menu(screen):
     # --- Page switching ---
     # The outgoing and incoming pages are drawn at the same time and slide
     # together: going forward the new page pushes in from the right while
-    # the old one recedes slightly to the left (parallax); going back the
-    # current page slides away to reveal the previous one underneath.
+    # the old one recedes to the left; going back the current page slides
+    # away to the right to reveal the previous one underneath. The page
+    # underneath travels 260 px (rather than a barely-visible nudge), and
+    # the outgoing page is faded as a content layer below so it reaches
+    # transparency instead of popping out when the state flips.
     # (The old version slid one page completely out, left the screen
     # empty, then slid the next one in.)
     out_off = in_off = 0
@@ -22452,12 +22455,12 @@ def draw_settings_menu(screen):
     else:
         trans_e = cubic_ease_in_out(max(0.0, min(1.0, menu_transition_progress)))
         if menu_transition_direction == "forward":
-            out_off = -int(115 * trans_e)
+            out_off = -int(260 * trans_e)
             in_off = int(390 * (1 - trans_e))
             pages_to_draw = [(settings_menu_from, out_off), (settings_menu_target, in_off)]
         else:  # back
             out_off = int(390 * trans_e)
-            in_off = -int(115 * (1 - trans_e))
+            in_off = -int(260 * (1 - trans_e))
             pages_to_draw = [(settings_menu_target, in_off), (settings_menu_from, out_off)]
         effective_page = settings_menu_target if trans_e >= 0.5 else settings_menu_from
 
@@ -22563,8 +22566,31 @@ def draw_settings_menu(screen):
     # fixed backdrop above. Do not attach another translucent full-page
     # sheet (or inter-page dim) to the top page: its moving edge/doubled
     # darkening made the Settings background look like it was sliding too.
+    # For the exit animation, render just the outgoing page to a
+    # transparent layer and fade *its pixels* with linear transition
+    # progress. The backdrop itself neither moves nor changes alpha, and
+    # by the final transition frame the old controls are effectively
+    # transparent rather than disappearing in one opaque jump.
+    outgoing_page = (
+        settings_menu_from if menu_transition_direction != "none" else None
+    )
+    transition_raw = max(0.0, min(1.0, float(menu_transition_progress)))
+    outgoing_alpha = int(round(255 * (1.0 - transition_raw)))
+    base_screen = screen
     for page_state, page_off in pages_to_draw:
-        draw_page(page_state, page_off)
+        if page_state != outgoing_page:
+            draw_page(page_state, page_off)
+        elif outgoing_alpha > 0:
+            outgoing_surface = pygame.Surface(
+                (WIDTH, HEIGHT), pygame.SRCALPHA
+            )
+            screen = outgoing_surface
+            try:
+                draw_page(page_state, page_off)
+            finally:
+                screen = base_screen
+            outgoing_surface.set_alpha(outgoing_alpha)
+            screen.blit(outgoing_surface, (0, 0))
 
     # --- Header: cross-fading title, breadcrumb, back/close ---
     if menu_transition_direction == "none":
