@@ -506,6 +506,76 @@ auto_move_status_text = ""  # human-readable arming state for the Analysis page
 use_package_enabled = False  # chess-fen-detector instead of chessbotv_cnn.pth
 analysis_overlay_enabled = {key: False for key in ANALYSIS_OVERLAY_KEYS}
 analysis_overlay_scroll_offset = 0.0
+
+# --- Game Review (experimental) ---
+# A dedicated, lower-depth review engine rates every move in the current
+# history without touching the live EngineThread's UCI stream. Ratings use
+# centipawn loss from the mover's point of view.
+GAME_REVIEW_DEPTH = 12
+GAME_REVIEW_PANEL_HEIGHT = 142
+GAME_REVIEW_BUTTON_HEIGHT = 96
+GAME_REVIEW_RATINGS = {
+    "best": {
+        "label": "Best Move",
+        "filename": "best.png",
+        "colour": (124, 190, 75),
+        "symbol": "★",
+    },
+    "excellent": {
+        "label": "Excellent",
+        "filename": "excellent.png",
+        "colour": (55, 170, 180),
+        "symbol": "!",
+    },
+    "good": {
+        "label": "Good",
+        "filename": "good.png",
+        "colour": (145, 190, 95),
+        "symbol": "✓",
+    },
+    "inaccuracy": {
+        "label": "Inaccuracy",
+        "filename": "inaccuracy.png",
+        "colour": (240, 190, 60),
+        "symbol": "?!",
+    },
+    "mistake": {
+        "label": "Mistake",
+        "filename": "mistake.png",
+        "colour": (240, 130, 55),
+        "symbol": "?",
+    },
+    "blunder": {
+        "label": "Blunder",
+        "filename": "blunder.png",
+        "colour": (220, 65, 55),
+        "symbol": "??",
+    },
+}
+_game_review_lock = threading.Lock()
+_game_review_thread = None
+_game_review_icon_cache = {}
+_game_review = {
+    "active": False,
+    "closing": False,
+    "requested": False,
+    "anim": 0.0,
+    "status": "idle",  # idle | analysing | complete | empty | error | closed
+    "generation": 0,
+    "root_fen": None,
+    "moves_uci": [],
+    "evaluations": [],
+    "results": {},
+    "analysed_positions": 0,
+    "total_positions": 0,
+    "playing": False,
+    "last_advance_at": 0.0,
+    "error": "",
+}
+analysis_settings_button_hover_amount = 0.0
+analysis_settings_button_pulse_phase = 0.0
+game_review_button_hover_amount = 0.0
+game_review_button_pulse_phase = 0.0
 show_auto_color_dialog = False
 auto_color_dialog_anim = 0.0
 
@@ -1387,6 +1457,7 @@ def update_global_anims():
         analysis_overlay_anims[key] = (
             target if abs(cur - target) < 0.02 else cur + (target - cur) * 0.25
         )
+    update_game_review_animation()
 
 # --- Math & Animations ---
 def cubic_ease_in(t):
@@ -2887,6 +2958,451 @@ class EngineThread:
                 self.proc.kill()
             except Exception:
                 pass
+
+
+# --- Game Review rating engine ---
+def game_review_centipawn_loss(before_cp, after_cp, mover_colour):
+    """Centipawn loss for a move, from the mover's point of view."""
+    try:
+        before_cp = int(before_cp)
+        after_cp = int(after_cp)
+    except Exception:
+        return 0
+    if mover_colour == chess.WHITE:
+        return max(0, before_cp - after_cp)
+    return max(0, after_cp - before_cp)
+
+
+def classify_game_review_move(centipawn_loss, is_best_move=False):
+    """Map centipawn loss to one of the six Game Review ratings."""
+    if is_best_move:
+        return "best"
+    try:
+        loss = max(0, int(round(float(centipawn_loss))))
+    except Exception:
+        loss = 0
+    if loss <= 5:
+        return "best"
+    if loss <= 15:
+        return "excellent"
+    if loss <= 30:
+        return "good"
+    if loss <= 75:
+        return "inaccuracy"
+    if loss <= 150:
+        return "mistake"
+    return "blunder"
+
+
+def get_game_review_snapshot():
+    """Thread-safe shallow snapshot of the Game Review session."""
+    with _game_review_lock:
+        snapshot = dict(_game_review)
+        snapshot["moves_uci"] = list(_game_review.get("moves_uci", []))
+        snapshot["evaluations"] = [
+            dict(item) if isinstance(item, dict) else item
+            for item in _game_review.get("evaluations", [])
+        ]
+        snapshot["results"] = {
+            ply: dict(result)
+            for ply, result in _game_review.get("results", {}).items()
+        }
+        return snapshot
+
+
+def game_review_is_active():
+    with _game_review_lock:
+        return bool(_game_review.get("active"))
+
+
+def request_game_review():
+    """Ask main() (which owns the live board/history) to start review."""
+    with _game_review_lock:
+        _game_review["requested"] = True
+    return True
+
+
+def consume_game_review_request():
+    with _game_review_lock:
+        requested = bool(_game_review.get("requested"))
+        _game_review["requested"] = False
+        return requested
+
+
+def cancel_game_review(reason=""):
+    """Invalidate the worker and slide the coach back down."""
+    with _game_review_lock:
+        _game_review["generation"] = int(_game_review.get("generation", 0)) + 1
+        _game_review["requested"] = False
+        _game_review["playing"] = False
+        _game_review["closing"] = True
+        if _game_review.get("active"):
+            _game_review["status"] = "error" if reason else "closed"
+            if reason:
+                _game_review["error"] = str(reason)
+        if float(_game_review.get("anim", 0.0)) <= 0.0:
+            _game_review["active"] = False
+            _game_review["closing"] = False
+
+
+def close_game_review():
+    cancel_game_review()
+
+
+def set_game_review_playing(playing):
+    with _game_review_lock:
+        if _game_review.get("active") and not _game_review.get("closing"):
+            if playing and _game_review.get("status") in (
+                "empty",
+                "error",
+                "closed",
+            ):
+                _game_review["playing"] = False
+                return False
+            _game_review["playing"] = bool(playing)
+            _game_review["last_advance_at"] = time.monotonic()
+            return bool(playing)
+    return False
+
+
+def mark_game_review_advanced():
+    with _game_review_lock:
+        _game_review["last_advance_at"] = time.monotonic()
+
+
+def update_game_review_animation():
+    """Advance the coach dock's rise/settle amount once per GUI frame."""
+    with _game_review_lock:
+        anim = float(_game_review.get("anim", 0.0))
+        if _game_review.get("closing"):
+            anim = max(0.0, anim - 0.085)
+            if anim <= 0.0:
+                _game_review["active"] = False
+                _game_review["closing"] = False
+                _game_review["playing"] = False
+        elif _game_review.get("active"):
+            anim = min(1.0, anim + 0.052)
+        _game_review["anim"] = anim
+        return anim
+
+
+def game_review_line_matches(board, history_redo=None):
+    """Whether the live board/redo stack is still the reviewed line."""
+    snapshot = get_game_review_snapshot()
+    if not snapshot.get("active"):
+        return False
+    full_line = [move.uci() for move in board.move_stack]
+    full_line.extend(
+        move.uci() for move in reversed(list(history_redo or []))
+    )
+    return full_line == snapshot.get("moves_uci", [])
+
+
+def get_game_review_current_result(board):
+    """Rating for the last move of the currently displayed position."""
+    snapshot = get_game_review_snapshot()
+    if not snapshot.get("active") or snapshot.get("closing"):
+        return None
+    ply = len(board.move_stack)
+    moves_uci = snapshot.get("moves_uci", [])
+    if ply <= 0 or ply > len(moves_uci):
+        return None
+    if [move.uci() for move in board.move_stack] != moves_uci[:ply]:
+        return None
+    result = snapshot.get("results", {}).get(ply)
+    return dict(result) if result else None
+
+
+def _game_review_terminal_evaluation(board):
+    if board.is_checkmate():
+        # The side to move has been mated.
+        cp = 10000 if board.turn == chess.BLACK else -10000
+    else:
+        cp = 0
+    return {
+        "cp": cp,
+        "mate": None,
+        "bestmove_uci": None,
+        "bestmove_san": "—",
+        "depth": GAME_REVIEW_DEPTH,
+    }
+
+
+class _GameReviewEngine:
+    """Small dedicated UCI evaluator used only by the review worker.
+
+    It intentionally uses a capped hash/thread count and forces Skill 20:
+    the main engine remains free for the board on screen, while review
+    ratings still come from full-strength play at an experimental depth.
+    """
+
+    def __init__(self, path=None, cfg=None):
+        cfg = cfg or config
+        self.proc = subprocess.Popen(
+            [path or ENGINE_PATH],
+            universal_newlines=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        self._send("uci")
+        self._wait_for("uciok")
+        threads = max(1, min(int(cfg.get("threads", 4) or 4), 4))
+        self._send(f"setoption name Threads value {threads}")
+        self._send("setoption name Hash value 128")
+        self._send("setoption name Skill Level value 20")
+        self._send("setoption name MultiPV value 1")
+        self._send("isready")
+        self._wait_for("readyok")
+
+    def _send(self, command):
+        self.proc.stdin.write(command + "\n")
+        self.proc.stdin.flush()
+
+    def _read_line(self):
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("review engine closed its output stream")
+        return line.strip()
+
+    def _wait_for(self, token):
+        while True:
+            if self._read_line().startswith(token):
+                return
+
+    def evaluate(self, board):
+        if get_game_status(board)[2]:
+            return _game_review_terminal_evaluation(board)
+
+        self._send(f"position fen {board.fen()}")
+        self._send(f"go depth {GAME_REVIEW_DEPTH}")
+        score_cp = None
+        mate = None
+        depth = 0
+        pv_first = None
+        bestmove_uci = None
+        while True:
+            line = self._read_line()
+            if line.startswith("bestmove"):
+                parts = line.split()
+                if len(parts) > 1 and parts[1] != "(none)":
+                    bestmove_uci = parts[1]
+                break
+            if not line.startswith("info") or line.startswith("info string"):
+                continue
+            tokens = line.split()
+            try:
+                index = 1
+                while index < len(tokens):
+                    token = tokens[index]
+                    if token == "depth" and index + 1 < len(tokens):
+                        depth = int(tokens[index + 1])
+                        index += 2
+                    elif token == "score" and index + 2 < len(tokens):
+                        if tokens[index + 1] == "cp":
+                            score_cp = int(tokens[index + 2])
+                            mate = None
+                        elif tokens[index + 1] == "mate":
+                            mate = int(tokens[index + 2])
+                            score_cp = None
+                        index += 3
+                    elif token == "pv" and index + 1 < len(tokens):
+                        pv_first = tokens[index + 1]
+                        break
+                    else:
+                        index += 1
+            except (TypeError, ValueError):
+                continue
+
+        if bestmove_uci is None:
+            bestmove_uci = pv_first
+        if bestmove_uci is None:
+            return _game_review_terminal_evaluation(board)
+
+        white_to_move = board.turn == chess.WHITE
+        if mate is not None:
+            sign = 1 if mate > 0 else -1
+            side_cp = sign * (10000 - min(abs(mate), 99) * 10)
+            white_cp = side_cp if white_to_move else -side_cp
+            white_mate = mate if white_to_move else -mate
+        else:
+            side_cp = int(score_cp or 0)
+            white_cp = side_cp if white_to_move else -side_cp
+            white_mate = None
+        white_cp = max(-10000, min(10000, int(white_cp)))
+
+        bestmove_san = bestmove_uci
+        try:
+            best_move = chess.Move.from_uci(bestmove_uci)
+            if best_move in board.legal_moves:
+                bestmove_san = board.san(best_move)
+        except Exception:
+            pass
+        return {
+            "cp": white_cp,
+            "mate": white_mate,
+            "bestmove_uci": bestmove_uci,
+            "bestmove_san": bestmove_san,
+            "depth": int(depth or GAME_REVIEW_DEPTH),
+        }
+
+    def quit(self):
+        try:
+            self._send("quit")
+        except Exception:
+            pass
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=2)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+def _game_review_generation_is_current(generation):
+    with _game_review_lock:
+        return int(_game_review.get("generation", 0)) == int(generation)
+
+
+def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory):
+    """Worker body: evaluate each position once and publish each rating."""
+    evaluator = None
+    try:
+        evaluator = evaluator_factory()
+        board = chess.Board(root_fen)
+        before = evaluator.evaluate(board)
+        with _game_review_lock:
+            if int(_game_review.get("generation", 0)) != int(generation):
+                return
+            if _game_review["evaluations"]:
+                _game_review["evaluations"][0] = dict(before)
+            _game_review["analysed_positions"] = 1
+
+        for index, move_uci in enumerate(moves_uci):
+            if not _game_review_generation_is_current(generation):
+                return
+            move = chess.Move.from_uci(move_uci)
+            if move not in board.legal_moves:
+                raise ValueError(f"review move is no longer legal: {move_uci}")
+            mover = board.turn
+            move_san = board.san(move)
+            board.push(move)
+            after = evaluator.evaluate(board)
+            if not _game_review_generation_is_current(generation):
+                return
+            cpl = game_review_centipawn_loss(
+                before.get("cp", 0), after.get("cp", 0), mover
+            )
+            is_best = before.get("bestmove_uci") == move_uci
+            rating = classify_game_review_move(cpl, is_best_move=is_best)
+            result = {
+                "ply": index + 1,
+                "move_uci": move_uci,
+                "move_san": move_san,
+                "mover": "white" if mover == chess.WHITE else "black",
+                "rating": rating,
+                "centipawn_loss": int(cpl),
+                "is_best_move": bool(is_best),
+                "bestmove_uci": before.get("bestmove_uci"),
+                "bestmove_san": before.get("bestmove_san") or "—",
+                "eval_before_cp": int(before.get("cp", 0)),
+                "eval_after_cp": int(after.get("cp", 0)),
+                "mate_before": before.get("mate"),
+                "mate_after": after.get("mate"),
+                "depth": int(after.get("depth", GAME_REVIEW_DEPTH)),
+                "from_square": move.from_square,
+                "to_square": move.to_square,
+            }
+            with _game_review_lock:
+                if int(_game_review.get("generation", 0)) != int(generation):
+                    return
+                position_index = index + 1
+                if position_index < len(_game_review["evaluations"]):
+                    _game_review["evaluations"][position_index] = dict(after)
+                _game_review["results"][result["ply"]] = result
+                _game_review["analysed_positions"] = position_index + 1
+            before = after
+
+        with _game_review_lock:
+            if int(_game_review.get("generation", 0)) == int(generation):
+                _game_review["status"] = "complete"
+                _game_review["playing"] = bool(
+                    _game_review.get("playing")
+                )
+    except Exception as exc:
+        with _game_review_lock:
+            if int(_game_review.get("generation", 0)) == int(generation):
+                _game_review["status"] = "error"
+                _game_review["error"] = str(exc)
+                _game_review["playing"] = False
+        print(f"Game Review analysis failed: {exc}")
+    finally:
+        if evaluator is not None:
+            try:
+                evaluator.quit()
+            except Exception:
+                pass
+
+
+def start_game_review(board, history_redo=None, evaluator_factory=None):
+    """Start (or restart) reviewing the board's full recorded line."""
+    global _game_review_thread
+    played = list(board.move_stack)
+    future = list(reversed(list(history_redo or [])))
+    line = played + future
+
+    root = board.copy()
+    while root.move_stack:
+        root.pop()
+    replay = root.copy()
+    valid = True
+    error = ""
+    for move in line:
+        if move not in replay.legal_moves:
+            valid = False
+            error = "The recorded history no longer replays legally."
+            break
+        replay.push(move)
+
+    with _game_review_lock:
+        generation = int(_game_review.get("generation", 0)) + 1
+        was_open = bool(
+            _game_review.get("active") and not _game_review.get("closing")
+        )
+        _game_review.update(
+            {
+                "active": True,
+                "closing": False,
+                "requested": False,
+                "anim": float(_game_review.get("anim", 0.0)) if was_open else 0.0,
+                "status": "analysing" if line and valid else ("empty" if not line else "error"),
+                "generation": generation,
+                "root_fen": root.fen(),
+                "moves_uci": [move.uci() for move in line],
+                "evaluations": [None] * (len(line) + 1),
+                "results": {},
+                "analysed_positions": 0,
+                "total_positions": len(line) + 1,
+                "playing": bool(line and valid),
+                "last_advance_at": time.monotonic(),
+                "error": error,
+            }
+        )
+
+    if not line or not valid:
+        return True
+    factory = evaluator_factory or (lambda: _GameReviewEngine())
+    _game_review_thread = threading.Thread(
+        target=_run_game_review_analysis,
+        args=(generation, root.fen(), [move.uci() for move in line], factory),
+        name="ChessBotV-GameReview",
+        daemon=True,
+    )
+    _game_review_thread.start()
+    return True
 
 
 # --- Main App ---
@@ -12555,6 +13071,817 @@ def draw_analysis_board_overlays(screen, board):
             pygame.draw.circle(screen, (245, 250, 252), centre, 5, 1)
 
 
+# --- Game Review icons, coach, and bottom dock ---
+_game_review_font_cache = {}
+
+
+def _game_review_font(size, bold=False):
+    key = (int(size), bool(bold))
+    if key not in _game_review_font_cache:
+        _game_review_font_cache[key] = pygame.font.SysFont(
+            "segoeui", int(size), bold=bool(bold)
+        )
+    return _game_review_font_cache[key]
+
+
+def get_game_review_rating_icon(rating, size):
+    """Load a rating PNG from ``icons/`` preserving its own alpha.
+
+    Unlike the pinned/unprotected artwork, rating badges may use white
+    symbols, so they deliberately do *not* go through the white chroma
+    key. Loaded images are circular-cropped for a consistent badge look.
+    Missing files return ``None`` and callers draw a coloured fallback.
+    """
+    spec = GAME_REVIEW_RATINGS.get(rating)
+    if spec is None:
+        return None
+    size = max(8, int(size))
+    path = os.path.join(ANALYSIS_ICON_DIR, spec["filename"])
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    cache_key = (rating, size, path, mtime)
+    if cache_key in _game_review_icon_cache:
+        return _game_review_icon_cache[cache_key]
+
+    icon = None
+    if mtime is not None:
+        try:
+            loaded = pygame.image.load(path).convert_alpha()
+            width, height = loaded.get_size()
+            if width > 0 and height > 0:
+                scale = min(size / width, size / height)
+                scaled = pygame.transform.smoothscale(
+                    loaded,
+                    (
+                        max(1, int(round(width * scale))),
+                        max(1, int(round(height * scale))),
+                    ),
+                )
+                icon = pygame.Surface((size, size), pygame.SRCALPHA)
+                icon.blit(
+                    scaled,
+                    scaled.get_rect(center=(size // 2, size // 2)),
+                )
+                mask = pygame.Surface((size, size), pygame.SRCALPHA)
+                pygame.draw.circle(
+                    mask,
+                    (255, 255, 255, 255),
+                    (size // 2, size // 2),
+                    max(1, size // 2 - 1),
+                )
+                icon.blit(
+                    mask,
+                    (0, 0),
+                    special_flags=pygame.BLEND_RGBA_MULT,
+                )
+        except Exception as exc:
+            print(f"Game Review icon could not be loaded ({path}): {exc}")
+            icon = None
+    _game_review_icon_cache[cache_key] = icon
+    return icon
+
+
+def draw_game_review_rating_icon(surface, rating, centre, size=26):
+    """Draw one rating badge, using its PNG or a coloured fallback."""
+    spec = GAME_REVIEW_RATINGS.get(rating)
+    if spec is None:
+        return
+    centre = (int(centre[0]), int(centre[1]))
+    size = max(10, int(size))
+    radius = max(5, size // 2 - 1)
+    pygame.draw.circle(
+        surface, (22, 24, 30), (centre[0], centre[1] + 1), radius + 1
+    )
+    icon = get_game_review_rating_icon(rating, size)
+    if icon is not None:
+        surface.blit(icon, icon.get_rect(center=centre))
+        pygame.draw.circle(
+            surface, (245, 250, 252), centre, radius, 1
+        )
+        return
+
+    colour = spec["colour"]
+    pygame.draw.circle(surface, colour, centre, radius)
+    pygame.draw.circle(surface, (245, 250, 252), centre, radius, 1)
+    pygame.draw.circle(
+        surface,
+        _lerp_color(colour, (255, 255, 255), 0.35),
+        (centre[0] - radius // 3, centre[1] - radius // 3),
+        max(1, radius // 5),
+    )
+    symbol = spec["symbol"]
+    # Draw the three positive symbols geometrically: star/check/exclamation
+    # glyph coverage varies too much between system fonts for a fallback.
+    if rating == "best":
+        points = []
+        for index in range(10):
+            angle = -math.pi / 2 + index * math.pi / 5
+            point_radius = radius * (0.78 if index % 2 == 0 else 0.36)
+            points.append(
+                (
+                    centre[0] + math.cos(angle) * point_radius,
+                    centre[1] + math.sin(angle) * point_radius,
+                )
+            )
+        pygame.draw.polygon(
+            surface,
+            (25, 30, 36),
+            [(x, y + 1) for x, y in points],
+        )
+        pygame.draw.polygon(surface, (255, 255, 255), points)
+        return
+    if rating == "good":
+        check_points = [
+            (centre[0] - radius * 0.55, centre[1] + radius * 0.02),
+            (centre[0] - radius * 0.16, centre[1] + radius * 0.42),
+            (centre[0] + radius * 0.58, centre[1] - radius * 0.42),
+        ]
+        width = max(2, int(round(radius * 0.25)))
+        pygame.draw.lines(
+            surface,
+            (25, 30, 36),
+            False,
+            [(x, y + 1) for x, y in check_points],
+            width,
+        )
+        pygame.draw.lines(surface, (255, 255, 255), False, check_points, width)
+        return
+    if rating == "excellent":
+        stem = pygame.Rect(
+            centre[0] - max(1, radius // 6),
+            centre[1] - int(radius * 0.58),
+            max(2, radius // 3),
+            int(radius * 0.78),
+        )
+        pygame.draw.rect(surface, (25, 30, 36), stem.move(0, 1), border_radius=2)
+        pygame.draw.rect(surface, (255, 255, 255), stem, border_radius=2)
+        pygame.draw.circle(
+            surface,
+            (255, 255, 255),
+            (centre[0], centre[1] + int(radius * 0.52)),
+            max(1, radius // 5),
+        )
+        return
+
+    font_size = max(10, int(size * (0.48 if len(symbol) > 1 else 0.62)))
+    text = _game_review_font(font_size, True).render(
+        symbol, True, (255, 255, 255)
+    )
+    shadow = _game_review_font(font_size, True).render(
+        symbol, True, (25, 30, 36)
+    )
+    rect = text.get_rect(center=centre)
+    surface.blit(shadow, rect.move(0, 1))
+    surface.blit(text, rect)
+
+
+def draw_game_review_rating_badge(screen, board):
+    """Badge the displayed last move at its destination's top-right."""
+    result = get_game_review_current_result(board)
+    if not result or not board.move_stack:
+        return
+    move = board.move_stack[-1]
+    x, y = square_to_screen(move.to_square)
+    draw_game_review_rating_icon(
+        screen,
+        result.get("rating"),
+        (x + SQUARE_SIZE - 13, y + 13),
+        26,
+    )
+
+
+def _wrap_game_review_text(text, font, max_width, max_lines=2):
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if font.size(candidate)[0] <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines:
+                break
+    if len(lines) < max_lines and current:
+        lines.append(current)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    # If words remain after filling the allowed lines, elide the last.
+    consumed = " ".join(lines).split()
+    if len(consumed) < len(words) and lines:
+        remaining = " ".join(words[len(consumed):])
+        lines[-1] = _elide_text(
+            f"{lines[-1]} {remaining}", font, max_width
+        )
+    return lines[:max_lines]
+
+
+def _game_review_eval_text(cp, mate=None):
+    if mate is not None:
+        try:
+            mate = int(mate)
+            return f"M{abs(mate)} {'W' if mate > 0 else 'B'}"
+        except Exception:
+            pass
+    try:
+        return f"{int(cp) / 100.0:+.2f}"
+    except Exception:
+        return "+0.00"
+
+
+def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
+    """Draw Coach Nova as a polished supersampled vector bust.
+
+    Eyes, brows, mouth, hair highlights, hands and small props all change
+    with the rating. The character is rendered at 3x and downscaled so
+    the curves stay smooth at both the settings-button and dock sizes.
+    """
+    if rect.width < 24 or rect.height < 24:
+        return
+    if time_ms is None:
+        time_ms = pygame.time.get_ticks()
+    reaction = reaction if reaction in GAME_REVIEW_RATINGS else "thinking"
+    supersample = 3
+    canvas_w = max(24, rect.width * supersample)
+    canvas_h = max(24, rect.height * supersample)
+    canvas = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+    sx = canvas_w / 120.0
+    sy = canvas_h / 132.0
+
+    def p(x, y):
+        return (int(round(x * sx)), int(round(y * sy)))
+
+    def r(x, y, w, h):
+        return pygame.Rect(
+            int(round(x * sx)),
+            int(round(y * sy)),
+            max(1, int(round(w * sx))),
+            max(1, int(round(h * sy))),
+        )
+
+    def line(colour, points, width=2, closed=False):
+        pygame.draw.lines(
+            canvas,
+            colour,
+            closed,
+            [p(x, y) for x, y in points],
+            max(1, int(round(width * sx))),
+        )
+
+    def circle(colour, centre, radius, width=0):
+        pygame.draw.circle(
+            canvas,
+            colour,
+            p(*centre),
+            max(1, int(round(radius * sx))),
+            max(0, int(round(width * sx))) if width else 0,
+        )
+
+    def ellipse(colour, box, width=0):
+        pygame.draw.ellipse(
+            canvas,
+            colour,
+            r(*box),
+            max(0, int(round(width * sx))) if width else 0,
+        )
+
+    bob_speed = 420 if reaction in ("best", "excellent") else 720
+    bob = math.sin(time_ms / bob_speed) * (1.2 if reaction == "best" else 0.7)
+    shake = 0.0
+    if reaction == "blunder":
+        shake = math.sin(time_ms / 55.0) * 0.8
+    tilt = {
+        "best": -1.2,
+        "excellent": -0.8,
+        "good": 0.0,
+        "inaccuracy": 2.2,
+        "mistake": 1.4,
+        "blunder": shake,
+        "thinking": -1.6,
+    }.get(reaction, 0.0)
+    head_cx = 60 + tilt
+    head_y = bob
+
+    skin = (242, 190, 151)
+    skin_shadow = (218, 154, 117)
+    hair = (91, 55, 38)
+    hair_dark = (62, 36, 27)
+    hair_light = (139, 88, 54)
+    jacket = (43, 116, 128)
+    jacket_dark = (28, 82, 96)
+    shirt = (246, 241, 222)
+
+    # Body first, so the head and expressive hands sit naturally over it.
+    ellipse(jacket_dark, (18, 101 + bob * 0.25, 84, 38))
+    pygame.draw.polygon(
+        canvas,
+        jacket,
+        [
+            p(24, 132),
+            p(30, 101 + bob * 0.25),
+            p(48, 91 + bob * 0.25),
+            p(72, 91 + bob * 0.25),
+            p(90, 101 + bob * 0.25),
+            p(96, 132),
+        ],
+    )
+    pygame.draw.polygon(
+        canvas,
+        shirt,
+        [p(49, 94 + bob * 0.25), p(71, 94 + bob * 0.25), p(60, 118 + bob * 0.25)],
+    )
+    line(jacket_dark, [(49, 94 + bob * 0.25), (60, 116 + bob * 0.25), (71, 94 + bob * 0.25)], 2)
+    # A tiny chess-king pin on the jacket.
+    circle((245, 202, 92), (82, 108 + bob * 0.25), 5)
+    line((130, 88, 24), [(82, 104 + bob * 0.25), (82, 112 + bob * 0.25)], 1.2)
+    line((130, 88, 24), [(79.5, 107 + bob * 0.25), (84.5, 107 + bob * 0.25)], 1.2)
+
+    # Neck and ears.
+    pygame.draw.rect(canvas, skin_shadow, r(head_cx - 7, 83 + head_y, 14, 17), border_radius=int(4 * sx))
+    circle(skin, (head_cx - 29, 58 + head_y), 6)
+    circle(skin, (head_cx + 29, 58 + head_y), 6)
+    circle(skin_shadow, (head_cx - 29, 58 + head_y), 2.5)
+    circle(skin_shadow, (head_cx + 29, 58 + head_y), 2.5)
+
+    # Hair: a full back mass, bun, sweeping fringe and glossy strands.
+    ellipse(hair_dark, (head_cx - 34, 11 + head_y, 68, 72))
+    circle(hair, (head_cx + 27, 17 + head_y), 10)
+    circle(hair_light, (head_cx + 24, 14 + head_y), 3)
+    ellipse(skin, (head_cx - 27, 27 + head_y, 54, 65))
+    pygame.draw.polygon(
+        canvas,
+        hair,
+        [
+            p(head_cx - 29, 52 + head_y),
+            p(head_cx - 31, 27 + head_y),
+            p(head_cx - 17, 15 + head_y),
+            p(head_cx + 6, 17 + head_y),
+            p(head_cx + 29, 29 + head_y),
+            p(head_cx + 24, 42 + head_y),
+            p(head_cx + 10, 32 + head_y),
+            p(head_cx - 7, 38 + head_y),
+            p(head_cx - 20, 34 + head_y),
+        ],
+    )
+    for start_x, control_y in ((-18, 25), (-5, 21), (9, 24)):
+        line(
+            hair_light,
+            [
+                (head_cx + start_x, control_y + head_y),
+                (head_cx + start_x + 7, control_y - 3 + head_y),
+                (head_cx + start_x + 13, control_y + 3 + head_y),
+            ],
+            1.4,
+        )
+
+    blink = (int(time_ms) % 3600) < 110 and reaction not in ("blunder", "best")
+    gaze = {
+        "best": (0.8, -0.7),
+        "excellent": (1.0, -0.3),
+        "good": (0.5, 0.0),
+        "inaccuracy": (-1.4, 0.7),
+        "mistake": (-0.7, 1.0),
+        "blunder": (0.0, 0.0),
+        "thinking": (1.7, -0.8),
+    }.get(reaction, (0.0, 0.0))
+    eye_w = 7.4 if reaction == "blunder" else 6.4
+    eye_h = 8.6 if reaction == "blunder" else 7.4
+    if reaction in ("best", "excellent"):
+        eye_h *= 0.82
+    for side in (-1, 1):
+        eye_cx = head_cx + side * 12
+        eye_cy = 56 + head_y
+        if blink:
+            line(hair_dark, [(eye_cx - 5, eye_cy), (eye_cx + 5, eye_cy)], 1.7)
+        else:
+            ellipse((255, 255, 255), (eye_cx - eye_w / 2, eye_cy - eye_h / 2, eye_w, eye_h))
+            iris = (74, 48, 32) if reaction != "blunder" else (35, 35, 42)
+            circle(iris, (eye_cx + gaze[0], eye_cy + gaze[1]), 2.5)
+            circle((20, 18, 18), (eye_cx + gaze[0], eye_cy + gaze[1]), 1.25)
+            circle((255, 255, 255), (eye_cx + gaze[0] - 0.8, eye_cy + gaze[1] - 0.9), 0.65)
+            line(hair_dark, [(eye_cx - 4.5, eye_cy - 4.2), (eye_cx + 4.5, eye_cy - 4.5)], 1.0)
+
+    brow_y = 47 + head_y
+    if reaction in ("best", "excellent"):
+        line(hair_dark, [(head_cx - 18, brow_y + 1), (head_cx - 7, brow_y - 2)], 2)
+        line(hair_dark, [(head_cx + 7, brow_y - 2), (head_cx + 18, brow_y + 1)], 2)
+    elif reaction == "inaccuracy":
+        line(hair_dark, [(head_cx - 18, brow_y - 2), (head_cx - 7, brow_y + 1)], 2)
+        line(hair_dark, [(head_cx + 7, brow_y + 1), (head_cx + 18, brow_y - 3)], 2)
+    elif reaction in ("mistake", "blunder"):
+        line(hair_dark, [(head_cx - 18, brow_y - 3), (head_cx - 7, brow_y + 2)], 2.1)
+        line(hair_dark, [(head_cx + 7, brow_y + 2), (head_cx + 18, brow_y - 3)], 2.1)
+    elif reaction == "thinking":
+        line(hair_dark, [(head_cx - 18, brow_y), (head_cx - 7, brow_y - 1)], 2)
+        line(hair_dark, [(head_cx + 7, brow_y - 4), (head_cx + 18, brow_y - 2)], 2)
+    else:
+        line(hair_dark, [(head_cx - 18, brow_y), (head_cx - 7, brow_y - 1)], 2)
+        line(hair_dark, [(head_cx + 7, brow_y - 1), (head_cx + 18, brow_y)], 2)
+
+    line(skin_shadow, [(head_cx + 1, 61 + head_y), (head_cx - 1.5, 68 + head_y), (head_cx + 2, 69 + head_y)], 1.2)
+    if reaction in ("best", "excellent", "good"):
+        for side in (-1, 1):
+            blush = pygame.Surface((int(16 * sx), int(9 * sy)), pygame.SRCALPHA)
+            pygame.draw.ellipse(blush, (238, 130, 116, 62), blush.get_rect())
+            canvas.blit(blush, p(head_cx + side * 20 - 8, 66 + head_y))
+
+    mouth_y = 76 + head_y
+    if reaction == "best":
+        ellipse((126, 55, 48), (head_cx - 9, mouth_y - 3, 18, 12))
+        ellipse((255, 255, 255), (head_cx - 7, mouth_y - 3, 14, 5))
+        ellipse(skin, (head_cx - 10, mouth_y - 8, 20, 6))
+    elif reaction in ("excellent", "good"):
+        pygame.draw.arc(canvas, (126, 55, 48), r(head_cx - 9, mouth_y - 7, 18, 13), math.pi * 1.08, math.pi * 1.92, max(1, int(2 * sx)))
+    elif reaction == "inaccuracy":
+        line((126, 55, 48), [(head_cx - 8, mouth_y), (head_cx - 3, mouth_y - 2), (head_cx + 2, mouth_y + 1), (head_cx + 8, mouth_y - 1)], 1.8)
+    elif reaction == "mistake":
+        pygame.draw.arc(canvas, (126, 55, 48), r(head_cx - 8, mouth_y - 2, 16, 12), math.pi * 0.12, math.pi * 0.88, max(1, int(2 * sx)))
+    elif reaction == "blunder":
+        ellipse((126, 55, 48), (head_cx - 5, mouth_y - 5, 10, 13))
+        ellipse((83, 35, 34), (head_cx - 3, mouth_y - 2, 6, 8))
+    else:  # thinking
+        line((126, 55, 48), [(head_cx - 5, mouth_y + 1), (head_cx + 6, mouth_y)], 1.8)
+
+    # Hands/props reinforce each reaction without needing a full body.
+    if reaction in ("best", "excellent"):
+        line(jacket_dark, [(84, 108 + bob * 0.25), (98, 94 + head_y)], 7)
+        circle(skin, (100, 91 + head_y), 6)
+        pygame.draw.rect(canvas, skin, r(97, 80 + head_y, 5, 10), border_radius=int(2 * sx))
+        for sparkle_x, sparkle_y, sparkle_r in ((17, 29, 4), (101, 39, 5), (93, 66, 3)):
+            points = []
+            for k in range(8):
+                radius = sparkle_r if k % 2 == 0 else sparkle_r * 0.38
+                angle = k * math.pi / 4 + time_ms / 650.0
+                points.append(p(sparkle_x + math.cos(angle) * radius, sparkle_y + head_y + math.sin(angle) * radius))
+            pygame.draw.polygon(canvas, (255, 215, 92), points)
+    elif reaction == "good":
+        line(jacket_dark, [(84, 108 + bob * 0.25), (98, 99 + head_y)], 7)
+        circle(skin, (100, 97 + head_y), 5.5)
+    elif reaction == "thinking":
+        ellipse(skin, (head_cx + 8, 82 + head_y, 17, 9))
+        line(jacket_dark, [(82, 108 + bob * 0.25), (head_cx + 15, 87 + head_y)], 6)
+    elif reaction == "mistake":
+        ellipse(skin, (head_cx - 23, 31 + head_y, 20, 10))
+        sweat_y = 48 + ((time_ms // 35) % 12)
+        circle((110, 190, 245), (head_cx + 29, sweat_y + head_y), 3)
+        pygame.draw.polygon(canvas, (110, 190, 245), [p(head_cx + 25, sweat_y + head_y), p(head_cx + 33, sweat_y + head_y), p(head_cx + 29, sweat_y - 6 + head_y)])
+    elif reaction == "blunder":
+        circle(skin, (head_cx - 28, 68 + head_y), 6)
+        circle(skin, (head_cx + 28, 68 + head_y), 6)
+        sweat_y = 43 + ((time_ms // 28) % 15)
+        circle((110, 190, 245), (head_cx - 31, sweat_y + head_y), 3)
+        text = _game_review_font(max(12, int(18 * supersample)), True).render("!", True, (225, 65, 55))
+        canvas.blit(text, text.get_rect(center=p(head_cx + 34, 25 + head_y)))
+
+    rendered = pygame.transform.smoothscale(canvas, rect.size)
+    surface.blit(rendered, rect.topleft)
+
+
+def _draw_game_review_button(screen, rect, hovered):
+    """Polished Analysis-page launch button for Game Review."""
+    global game_review_button_hover_amount, game_review_button_pulse_phase
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+    target = 1.0 if hovered else 0.0
+    game_review_button_hover_amount += (
+        target - game_review_button_hover_amount
+    ) * 0.24
+    if abs(target - game_review_button_hover_amount) < 0.01:
+        game_review_button_hover_amount = target
+    hover_amount = max(0.0, min(1.0, game_review_button_hover_amount))
+    if hovered:
+        game_review_button_pulse_phase = (
+            game_review_button_pulse_phase + 0.08
+        ) % (2.0 * math.pi)
+    visual = rect.move(0, 1 if pressed else 0)
+    snapshot = get_game_review_snapshot()
+
+    if hover_amount > 0.01:
+        glow = pygame.Surface((visual.width + 18, visual.height + 18), pygame.SRCALPHA)
+        for inset, alpha in ((1, 14), (4, 22), (7, 34)):
+            pygame.draw.rect(glow, (112, 92, 220, int(alpha * hover_amount)), (inset, inset, glow.get_width() - inset * 2, glow.get_height() - inset * 2), border_radius=20 - inset)
+        screen.blit(glow, (visual.x - 9, visual.y - 9))
+    pygame.draw.rect(screen, (17, 16, 38), visual.move(0, 2), border_radius=18)
+    body = pygame.Surface(visual.size, pygame.SRCALPHA)
+    top = (82, 66, 158) if not pressed else (64, 52, 128)
+    bottom = (34, 91, 105) if not pressed else (27, 72, 84)
+    for row in range(visual.height):
+        colour = _lerp_color(top, bottom, row / max(1, visual.height - 1))
+        pygame.draw.line(body, (*colour, 255), (0, row), (visual.width - 1, row))
+    overlay = pygame.Surface(visual.size, pygame.SRCALPHA)
+    pygame.draw.polygon(overlay, (255, 255, 255, int(12 + 18 * hover_amount)), [(-30, visual.height), (visual.width * 0.38, 0), (visual.width * 0.56, 0), (visual.width * 0.12, visual.height)])
+    # A rising eval sparkline across the background.
+    spark_points = []
+    for index in range(9):
+        x = 112 + index * 52
+        y = 70 - int(18 * math.sin(index * 0.9 + game_review_button_pulse_phase))
+        spark_points.append((x, max(42, min(84, y))))
+    pygame.draw.lines(overlay, (255, 255, 255, 30), False, spark_points, 2)
+    body.blit(overlay, (0, 0))
+    mask = pygame.Surface(visual.size, pygame.SRCALPHA)
+    pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=18)
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual.topleft)
+    border = _lerp_color((164, 150, 235), (255, 255, 255), 0.25 * hover_amount)
+    pygame.draw.rect(screen, border, visual, 2, border_radius=18)
+    pygame.draw.rect(screen, _lerp_color(border, (255, 255, 255), 0.28), visual.inflate(-3, -3), 1, border_radius=16)
+
+    coach_rect = pygame.Rect(visual.x + 10, visual.y + 5, 78, 91)
+    _draw_game_review_coach_character(
+        screen, coach_rect, "excellent" if hovered else "thinking"
+    )
+
+    title_text = "Game Review (experimental)"
+    title = font_large.render(title_text, True, (255, 255, 255))
+    title_shadow = font_large.render(title_text, True, (18, 17, 42))
+    title_pos = (visual.x + 104, visual.y + 15)
+    screen.blit(title_shadow, (title_pos[0], title_pos[1] + 1))
+    screen.blit(title, title_pos)
+
+    if snapshot.get("active") and snapshot.get("status") == "analysing":
+        subtitle_text = (
+            f"Coach Nova is analysing · {snapshot.get('analysed_positions', 0)}/"
+            f"{snapshot.get('total_positions', 0)} positions"
+        )
+    elif snapshot.get("active") and snapshot.get("status") == "complete":
+        subtitle_text = "Review ready · reopen the coach for this line"
+    else:
+        subtitle_text = "Coach reactions and Stockfish move ratings for this game"
+    subtitle = font_small.render(subtitle_text, True, (222, 226, 255))
+    screen.blit(subtitle, (visual.x + 104, visual.y + 50))
+
+    for index, rating in enumerate(GAME_REVIEW_RATINGS):
+        draw_game_review_rating_icon(
+            screen,
+            rating,
+            (visual.x + 116 + index * 28, visual.bottom - 17),
+            20,
+        )
+    pill = pygame.Rect(visual.x + 282, visual.bottom - 30, 96, 24)
+    pygame.draw.rect(screen, (255, 209, 92), pill, border_radius=12)
+    pygame.draw.rect(screen, (146, 104, 28), pill, 1, border_radius=12)
+    pill_text = _game_review_font(13, True).render(
+        f"Depth {GAME_REVIEW_DEPTH}", True, (62, 42, 8)
+    )
+    screen.blit(pill_text, pill_text.get_rect(center=pill.center))
+
+    play_centre = (visual.right - 58, visual.centery)
+    pulse = 1.0 + 0.05 * math.sin(game_review_button_pulse_phase) * hover_amount
+    pygame.draw.circle(screen, (18, 18, 42), (play_centre[0], play_centre[1] + 1), int(22 * pulse))
+    pygame.draw.circle(screen, (245, 248, 255), play_centre, int(21 * pulse))
+    pygame.draw.circle(screen, (112, 92, 220), play_centre, int(21 * pulse), 2)
+    pygame.draw.polygon(screen, (76, 62, 170), [(play_centre[0] - 6, play_centre[1] - 8), (play_centre[0] - 6, play_centre[1] + 8), (play_centre[0] + 8, play_centre[1])])
+    chev_x = visual.right - 22 + int(round(2 * hover_amount))
+    pygame.draw.lines(screen, (255, 255, 255), False, [(chev_x - 5, visual.centery - 8), (chev_x + 3, visual.centery), (chev_x - 5, visual.centery + 8)], 3)
+
+
+def get_game_review_panel_rect():
+    snapshot = get_game_review_snapshot()
+    amount = cubic_ease_out(max(0.0, min(1.0, snapshot.get("anim", 0.0))))
+    target_y = HEIGHT - GAME_REVIEW_PANEL_HEIGHT - 8
+    y = target_y + int(round((1.0 - amount) * (GAME_REVIEW_PANEL_HEIGHT + 16)))
+    return pygame.Rect(12, y, WIDTH - 24, GAME_REVIEW_PANEL_HEIGHT)
+
+
+def get_game_review_control_rects(panel=None):
+    panel = panel or get_game_review_panel_rect()
+    control_y = panel.bottom - 40
+    return {
+        "close": pygame.Rect(panel.right - 39, panel.y + 9, 29, 29),
+        "prev": pygame.Rect(panel.right - 139, control_y, 38, 30),
+        "play": pygame.Rect(panel.right - 95, control_y, 38, 30),
+        "next": pygame.Rect(panel.right - 51, control_y, 38, 30),
+    }
+
+
+def game_review_control_at(pos):
+    snapshot = get_game_review_snapshot()
+    if (
+        not snapshot.get("active")
+        or snapshot.get("closing")
+        or float(snapshot.get("anim", 0.0)) < 0.85
+    ):
+        return None
+    for name, rect in get_game_review_control_rects().items():
+        if rect.collidepoint(pos):
+            return name
+    return None
+
+
+_GAME_REVIEW_LINES = {
+    "best": (
+        "That's the engine's top choice — beautifully played.",
+        "Perfect. You found the strongest move.",
+        "Best move. No notes from me.",
+    ),
+    "excellent": (
+        "Excellent — you gave away almost nothing.",
+        "Very strong. That's right up with the engine's best ideas.",
+        "Lovely move; the position barely changed.",
+    ),
+    "good": (
+        "Good move. The position stays healthy.",
+        "Solid and sensible — keep building.",
+        "That works nicely, even if it wasn't the sharpest try.",
+    ),
+    "inaccuracy": (
+        "A small slip. There was a sharper continuation.",
+        "That lets a little of the advantage drift away.",
+        "Not a disaster, but we can tighten that up.",
+    ),
+    "mistake": (
+        "That gives away too much — let's learn from it.",
+        "A real wobble there. The engine wanted something else.",
+        "Careful: that move makes the game much harder.",
+    ),
+    "blunder": (
+        "Oh no — that changes the whole game!",
+        "That's a blunder. Take a breath and see what was missed.",
+        "Yikes — the evaluation swings hard after that.",
+    ),
+}
+
+
+def _draw_game_review_control(screen, name, rect, hovered, snapshot, current_ply, total_moves):
+    disabled = False
+    if name == "prev" and current_ply <= 0:
+        disabled = True
+    if name == "next" and current_ply >= total_moves:
+        disabled = True
+    if name == "play" and (
+        total_moves == 0 or snapshot.get("status") in ("empty", "error")
+    ):
+        disabled = True
+    base = (42, 46, 66) if not hovered else (64, 72, 102)
+    if disabled:
+        base = (35, 38, 50)
+    pygame.draw.rect(screen, base, rect, border_radius=9)
+    pygame.draw.rect(screen, (130, 140, 175) if not disabled else (75, 80, 98), rect, 1, border_radius=9)
+    colour = (235, 240, 255) if not disabled else (130, 136, 155)
+    cx, cy = rect.center
+    if name == "close":
+        pygame.draw.line(screen, colour, (cx - 6, cy - 6), (cx + 6, cy + 6), 2)
+        pygame.draw.line(screen, colour, (cx + 6, cy - 6), (cx - 6, cy + 6), 2)
+    elif name == "prev":
+        pygame.draw.polygon(screen, colour, [(cx + 5, cy - 7), (cx + 5, cy + 7), (cx - 5, cy)])
+        pygame.draw.line(screen, colour, (cx - 8, cy - 7), (cx - 8, cy + 7), 2)
+    elif name == "next":
+        pygame.draw.polygon(screen, colour, [(cx - 5, cy - 7), (cx - 5, cy + 7), (cx + 5, cy)])
+        pygame.draw.line(screen, colour, (cx + 8, cy - 7), (cx + 8, cy + 7), 2)
+    elif snapshot.get("playing"):
+        pygame.draw.rect(screen, colour, (cx - 7, cy - 7, 5, 14), border_radius=2)
+        pygame.draw.rect(screen, colour, (cx + 2, cy - 7, 5, 14), border_radius=2)
+    else:
+        pygame.draw.polygon(screen, colour, [(cx - 5, cy - 8), (cx - 5, cy + 8), (cx + 7, cy)])
+
+
+def draw_game_review_coach(screen, board, mouse_pos):
+    """Draw the rising Game Review coach dock over the info panel."""
+    snapshot = get_game_review_snapshot()
+    if not snapshot.get("active") or float(snapshot.get("anim", 0.0)) <= 0.0:
+        return
+    panel = get_game_review_panel_rect()
+    moves_uci = snapshot.get("moves_uci", [])
+    total_moves = len(moves_uci)
+    current_ply = len(board.move_stack)
+    result = None
+    if 0 < current_ply <= total_moves and [
+        move.uci() for move in board.move_stack
+    ] == moves_uci[:current_ply]:
+        result = snapshot.get("results", {}).get(current_ply)
+
+    status = snapshot.get("status", "idle")
+    if result:
+        reaction = result.get("rating", "thinking")
+    elif status == "error":
+        reaction = "mistake"
+    else:
+        reaction = "thinking"
+    spec = GAME_REVIEW_RATINGS.get(reaction, {})
+    accent = spec.get("colour", (120, 150, 255))
+
+    pygame.draw.rect(screen, (8, 10, 18), panel.move(0, 3), border_radius=20)
+    body = pygame.Surface(panel.size, pygame.SRCALPHA)
+    top = (48, 43, 86)
+    bottom = (23, 55, 70)
+    for row in range(panel.height):
+        colour = _lerp_color(top, bottom, row / max(1, panel.height - 1))
+        pygame.draw.line(body, (*colour, 255), (0, row), (panel.width - 1, row))
+    overlay = pygame.Surface(panel.size, pygame.SRCALPHA)
+    pygame.draw.polygon(overlay, (255, 255, 255, 14), [(-40, panel.height), (panel.width * 0.36, 0), (panel.width * 0.55, 0), (panel.width * 0.13, panel.height)])
+    for index in range(7):
+        alpha = 12 if index % 2 == 0 else 6
+        pygame.draw.rect(overlay, (255, 255, 255, alpha), (panel.width - 230 + index * 28, 8, 22, 22), border_radius=4)
+    body.blit(overlay, (0, 0))
+    mask = pygame.Surface(panel.size, pygame.SRCALPHA)
+    pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=20)
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, panel.topleft)
+    pygame.draw.rect(screen, _lerp_color(accent, (255, 255, 255), 0.18), panel, 2, border_radius=20)
+    pygame.draw.line(screen, accent, (panel.x + 18, panel.y + 2), (panel.right - 18, panel.y + 2), 2)
+
+    coach_rect = pygame.Rect(panel.x + 8, panel.y + 5, 116, panel.height - 5)
+    _draw_game_review_coach_character(screen, coach_rect, reaction)
+
+    bubble = pygame.Rect(panel.x + 132, panel.y + 10, panel.width - 190, 78)
+    pygame.draw.polygon(screen, (250, 248, 239), [(bubble.x + 2, bubble.y + 43), (bubble.x - 12, bubble.y + 53), (bubble.x + 2, bubble.y + 62)])
+    pygame.draw.rect(screen, (250, 248, 239), bubble, border_radius=16)
+    pygame.draw.rect(screen, (205, 207, 220), bubble, 1, border_radius=16)
+
+    if result:
+        ply = int(result.get("ply", current_ply))
+        move_number = (ply + 1) // 2
+        dots = "." if result.get("mover") == "white" else "..."
+        title_text = f"{move_number}{dots} {result.get('move_san', '')} — {GAME_REVIEW_RATINGS[reaction]['label']}"
+        lines = _GAME_REVIEW_LINES.get(reaction, ())
+        speech = lines[(ply - 1) % len(lines)] if lines else ""
+        if not result.get("is_best_move") and result.get("bestmove_san") not in (None, "", result.get("move_san")):
+            speech += f" Best was {result.get('bestmove_san')}."
+        draw_game_review_rating_icon(screen, reaction, (bubble.x + 25, bubble.y + 24), 34)
+    elif status == "empty":
+        title_text = "Coach Nova"
+        speech = "Play at least one move, then I'll happily review the game with you."
+    elif status == "error":
+        title_text = "Coach Nova hit a snag"
+        speech = snapshot.get("error") or "The review engine could not start. Check the Stockfish path and try again."
+    elif current_ply == 0:
+        title_text = "Coach Nova · Game Review"
+        speech = "Let's look at your game together. I'm checking every move at depth 12."
+    elif status == "analysing":
+        title_text = "Coach Nova is thinking…"
+        speech = "I'm still checking this move. The rest of the review is on its way."
+    else:
+        title_text = "Coach Nova · Game Review"
+        speech = "Use the arrows or play button and I'll react to each move."
+
+    title = _game_review_font(19, True).render(
+        _elide_text(title_text, _game_review_font(19, True), bubble.width - 62),
+        True,
+        (35, 38, 52),
+    )
+    screen.blit(title, (bubble.x + 50, bubble.y + 9))
+    speech_font = _game_review_font(15, False)
+    for index, line in enumerate(
+        _wrap_game_review_text(speech, speech_font, bubble.width - 66, 2)
+    ):
+        rendered = speech_font.render(line, True, (72, 76, 92))
+        screen.blit(rendered, (bubble.x + 50, bubble.y + 36 + index * 18))
+
+    analysed = int(snapshot.get("analysed_positions", 0))
+    total_positions = max(1, int(snapshot.get("total_positions", 1)))
+    progress = max(0.0, min(1.0, analysed / total_positions))
+    if status == "analysing":
+        status_text = f"Analysing {analysed}/{total_positions} positions · Depth {GAME_REVIEW_DEPTH}"
+    elif status == "complete":
+        status_text = "Review complete · Prev/Next to revisit any move"
+    elif status == "empty":
+        status_text = "No moves to review yet"
+    elif status == "error":
+        status_text = "Review stopped"
+    else:
+        status_text = "Game Review (experimental)"
+    status_s = _game_review_font(13, False).render(status_text, True, (205, 212, 235))
+    screen.blit(status_s, (panel.x + 138, panel.y + 96))
+    bar = pygame.Rect(panel.x + 138, panel.y + 116, 180, 7)
+    pygame.draw.rect(screen, (31, 36, 55), bar, border_radius=4)
+    if progress > 0:
+        pygame.draw.rect(screen, accent, (bar.x, bar.y, int(bar.width * progress), bar.height), border_radius=4)
+    pygame.draw.rect(screen, (105, 112, 145), bar, 1, border_radius=4)
+
+    if result:
+        detail_text = (
+            f"Move {current_ply}/{total_moves} · -{result.get('centipawn_loss', 0)} cp · "
+            f"Eval {_game_review_eval_text(result.get('eval_before_cp'), result.get('mate_before'))} to "
+            f"{_game_review_eval_text(result.get('eval_after_cp'), result.get('mate_after'))}"
+        )
+    else:
+        detail_text = f"Move {current_ply}/{total_moves}"
+    detail_font = _game_review_font(13, False)
+    detail = detail_font.render(
+        _elide_text(detail_text, detail_font, 225), True, (190, 198, 225)
+    )
+    screen.blit(detail, (panel.x + 332, panel.y + 104))
+
+    controls = get_game_review_control_rects(panel)
+    for name, rect in controls.items():
+        _draw_game_review_control(
+            screen,
+            name,
+            rect,
+            rect.collidepoint(mouse_pos),
+            snapshot,
+            current_ply,
+            total_moves,
+        )
+
+
 # The new Analysis page deliberately uses very large rows and scrolling
 # instead of reducing seven separate board overlays to cramped controls.
 ANALYSIS_OVERLAY_ROW_WIDTH = 600
@@ -12640,6 +13967,7 @@ def _analysis_overlay_layout(offset_x=0, offset_y=0):
             if section_index < len(ANALYSIS_OVERLAY_SECTIONS) - 1
             else 12
         )
+    total_height += GAME_REVIEW_BUTTON_HEIGHT + 24
     max_scroll = max(0, total_height - viewport.height)
     try:
         scroll = float(analysis_overlay_scroll_offset)
@@ -12690,11 +14018,26 @@ def _analysis_overlay_layout(offset_x=0, offset_y=0):
             if section_index < len(ANALYSIS_OVERLAY_SECTIONS) - 1
             else 12
         )
-    return viewport, sections, total_height, max_scroll, scroll
+    game_review_rect = pygame.Rect(
+        row_x,
+        cursor_y,
+        ANALYSIS_OVERLAY_ROW_WIDTH,
+        GAME_REVIEW_BUTTON_HEIGHT,
+    )
+    return (
+        viewport,
+        sections,
+        total_height,
+        max_scroll,
+        scroll,
+        game_review_rect,
+    )
 
 
 def _analysis_overlay_item_at(pos):
-    viewport, sections, _total, _max_scroll, _scroll = _analysis_overlay_layout()
+    viewport, sections, _total, _max_scroll, _scroll, _review = (
+        _analysis_overlay_layout()
+    )
     if not viewport.collidepoint(pos):
         return None
     for section in sections:
@@ -12704,10 +14047,19 @@ def _analysis_overlay_item_at(pos):
     return None
 
 
+def _game_review_button_at(pos):
+    viewport, _sections, _total, _max_scroll, _scroll, review_rect = (
+        _analysis_overlay_layout()
+    )
+    return bool(viewport.collidepoint(pos) and review_rect.collidepoint(pos))
+
+
 def scroll_analysis_overlay(delta):
     """Move the Analysis page scroll offset, clamped to its content."""
     global analysis_overlay_scroll_offset
-    _viewport, _sections, _total, max_scroll, scroll = _analysis_overlay_layout()
+    _viewport, _sections, _total, max_scroll, scroll, _review = (
+        _analysis_overlay_layout()
+    )
     try:
         delta = float(delta)
     except Exception:
@@ -12826,7 +14178,7 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
     """Draw the scrollable Analysis Settings page and its two sections."""
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
-    viewport, sections, total_height, max_scroll, scroll = (
+    viewport, sections, total_height, max_scroll, scroll, review_rect = (
         _analysis_overlay_layout(offset_x, offset_y)
     )
 
@@ -12878,6 +14230,13 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
                     and rect.collidepoint(mx, my)
                 )
                 _draw_analysis_overlay_toggle_row(screen, item, hovered)
+        if review_rect.bottom >= viewport.y and review_rect.y <= viewport.bottom:
+            review_hovered = bool(
+                idle
+                and viewport.collidepoint(mx, my)
+                and review_rect.collidepoint(mx, my)
+            )
+            _draw_game_review_button(screen, review_rect, review_hovered)
     finally:
         screen.set_clip(previous_clip)
 
@@ -14068,6 +15427,307 @@ def _draw_autoplay_settings_chevron(surface, centre, colour, scale=1.0):
     points = [(cx - arm * 0.55, cy - arm), (cx + arm, cy), (cx - arm * 0.55, cy + arm)]
     pygame.draw.aalines(surface, (17, 29, 36), False, [(x, y + 1) for x, y in points])
     pygame.draw.aalines(surface, colour, False, points)
+
+
+def draw_polished_analysis_settings_button(screen, rect, hovered):
+    """Draw the Settings-main Analysis Settings navigation row.
+
+    The caller owns the original 400x50 row, hover gating and navigation.
+    This visual-only renderer summarises the seven board overlays and the
+    Game Review coach with a magnified-board medallion, live eval trace and
+    the six coach rating badges on the right.
+    """
+    global analysis_settings_button_hover_amount
+    global analysis_settings_button_pulse_phase
+
+    try:
+        pressed = bool(hovered and pygame.mouse.get_pressed()[0])
+    except Exception:
+        pressed = False
+
+    enabled_count = sum(
+        1
+        for key in ANALYSIS_OVERLAY_KEYS
+        if analysis_overlay_enabled.get(key, False)
+    )
+    snapshot = get_game_review_snapshot()
+    review_live = bool(
+        snapshot.get("active") and snapshot.get("status") == "analysing"
+    )
+
+    hover_target = 1.0 if hovered else 0.0
+    analysis_settings_button_hover_amount += (
+        hover_target - analysis_settings_button_hover_amount
+    ) * 0.22
+    if abs(hover_target - analysis_settings_button_hover_amount) < 0.01:
+        analysis_settings_button_hover_amount = hover_target
+    hover_amount = max(
+        0.0, min(1.0, analysis_settings_button_hover_amount)
+    )
+    if hovered or review_live:
+        analysis_settings_button_pulse_phase = (
+            analysis_settings_button_pulse_phase
+            + (0.08 if hovered else 0.055)
+        ) % (2.0 * math.pi)
+    phase = analysis_settings_button_pulse_phase
+    visual_rect = rect.move(0, 1 if pressed else 0)
+
+    glow_strength = max(hover_amount, 0.35 if review_live else 0.0)
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (visual_rect.width + 18, visual_rect.height + 18),
+            pygame.SRCALPHA,
+        )
+        for inset, alpha in ((1, 15), (4, 24), (7, 36)):
+            pygame.draw.rect(
+                glow,
+                (112, 92, 220, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=16 - inset,
+            )
+        screen.blit(glow, (visual_rect.x - 9, visual_rect.y - 9))
+
+    pygame.draw.rect(
+        screen,
+        (17, 16, 38),
+        visual_rect.move(0, 1 if pressed else 2),
+        border_radius=10,
+    )
+    if pressed:
+        top_colour = (64, 52, 128)
+        bottom_colour = (27, 72, 84)
+        border_colour = (126, 112, 196)
+    elif hovered:
+        top_colour = (96, 78, 184)
+        bottom_colour = (34, 104, 118)
+        border_colour = (205, 196, 255)
+    else:
+        top_colour = (76, 62, 148)
+        bottom_colour = (30, 86, 98)
+        border_colour = (164, 150, 235)
+
+    body = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    denom = max(1, visual_rect.height - 1)
+    for row in range(visual_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, row),
+            (visual_rect.width - 1, row),
+        )
+
+    overlay = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(9 + 14 * hover_amount)),
+        [
+            (-20, visual_rect.height),
+            (visual_rect.width * 0.36, 0),
+            (visual_rect.width * 0.55, 0),
+            (visual_rect.width * 0.13, visual_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(58 + 42 * hover_amount)),
+        (9, 1),
+        (visual_rect.width - 10, 1),
+        1,
+    )
+    # Faint checker squares behind the title's left/right breathing room.
+    checker_alpha = int(9 + 10 * hover_amount)
+    for base_x in (58, 286):
+        for row in range(3):
+            for col in range(5):
+                if (row + col) % 2:
+                    continue
+                pygame.draw.rect(
+                    overlay,
+                    (210, 225, 255, checker_alpha),
+                    (base_x + col * 10, 7 + row * 12, 9, 9),
+                    border_radius=2,
+                )
+    # A small live evaluation sparkline on both sides of the centred text.
+    for base_x, phase_offset in ((58, 0.0), (286, 1.7)):
+        points = []
+        for index in range(6):
+            x = base_x + index * 10
+            y = 30 - int(
+                7 * math.sin(index * 1.05 + phase + phase_offset)
+                + 2 * hover_amount
+            )
+            points.append((x, max(11, min(40, y))))
+        pygame.draw.lines(
+            overlay,
+            (140, 235, 220, int(32 + 46 * hover_amount)),
+            False,
+            points,
+            1,
+        )
+        for point in points[1:-1]:
+            pygame.draw.circle(
+                overlay,
+                (190, 255, 240, int(50 + 70 * hover_amount)),
+                point,
+                1,
+            )
+    body.blit(overlay, (0, 0))
+    mask = pygame.Surface(visual_rect.size, pygame.SRCALPHA)
+    pygame.draw.rect(
+        mask, (255, 255, 255, 255), mask.get_rect(), border_radius=10
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, visual_rect.topleft)
+    pygame.draw.rect(screen, border_colour, visual_rect, 2, border_radius=10)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        visual_rect.inflate(-3, -3),
+        1,
+        border_radius=8,
+    )
+
+    # Bottom inlay: seven overlay pips, lit only for enabled overlays.
+    pip_y = visual_rect.bottom - 5
+    for index, key in enumerate(ANALYSIS_OVERLAY_KEYS):
+        enabled = bool(analysis_overlay_enabled.get(key, False))
+        colour = (
+            _lerp_color((105, 230, 170), (255, 255, 255), 0.18 * hover_amount)
+            if enabled
+            else (86, 86, 122)
+        )
+        pygame.draw.circle(
+            screen,
+            colour,
+            (visual_rect.centerx - 60 + index * 20, pip_y),
+            2,
+        )
+
+    # Magnified-board medallion: the Analysis page in miniature.
+    icon_centre = (visual_rect.x + 31, visual_rect.centery)
+    icon_radius = 17 + int(round(hover_amount))
+    pygame.draw.circle(
+        screen,
+        (20, 18, 45),
+        (icon_centre[0], icon_centre[1] + 1),
+        icon_radius,
+    )
+    pygame.draw.circle(screen, (238, 232, 255), icon_centre, icon_radius)
+    pygame.draw.circle(
+        screen, (191, 181, 238), icon_centre, max(5, icon_radius - 2)
+    )
+    pygame.draw.circle(
+        screen,
+        _lerp_color((100, 84, 184), (255, 255, 255), 0.20 * hover_amount),
+        icon_centre,
+        icon_radius,
+        1,
+    )
+    board_left = icon_centre[0] - 9
+    board_top = icon_centre[1] - 9
+    for row in range(3):
+        for col in range(3):
+            colour = (
+                (245, 248, 255)
+                if (row + col) % 2 == 0
+                else (91, 108, 154)
+            )
+            pygame.draw.rect(
+                screen,
+                colour,
+                (board_left + col * 6, board_top + row * 6, 6, 6),
+            )
+    pygame.draw.rect(
+        screen,
+        (52, 55, 86),
+        (board_left, board_top, 18, 18),
+        1,
+        border_radius=2,
+    )
+    lens_centre = (
+        icon_centre[0] + 4 + int(round(2 * math.sin(phase) * hover_amount)),
+        icon_centre[1] + 3,
+    )
+    pygame.draw.circle(screen, (216, 245, 255), lens_centre, 7)
+    pygame.draw.circle(screen, (52, 55, 86), lens_centre, 7, 2)
+    pygame.draw.circle(screen, (255, 255, 255), (lens_centre[0] - 2, lens_centre[1] - 2), 1)
+    pygame.draw.line(
+        screen,
+        (52, 55, 86),
+        (lens_centre[0] + 5, lens_centre[1] + 5),
+        (lens_centre[0] + 9, lens_centre[1] + 9),
+        3,
+    )
+
+    # Two-line centred label, matching Board/Engine/Auto-Play polish.
+    label = "Analysis Settings"
+    title_colour = _lerp_color((238, 240, 255), (255, 255, 255), hover_amount)
+    title = font_large.render(label, True, title_colour)
+    title_rect = title.get_rect(
+        center=(visual_rect.centerx, visual_rect.centery - 9)
+    )
+    title_shadow = font_large.render(label, True, (18, 17, 42))
+    screen.blit(title_shadow, title_rect.move(0, 1))
+    screen.blit(title, title_rect)
+
+    if snapshot.get("active") and snapshot.get("status") == "analysing":
+        subtitle_text = (
+            f"Coach analysing {snapshot.get('analysed_positions', 0)}/"
+            f"{snapshot.get('total_positions', 0)}"
+        )
+        subtitle_colour = (153, 224, 255)
+    elif snapshot.get("active") and snapshot.get("status") == "complete":
+        subtitle_text = "Coach review ready"
+        subtitle_colour = (160, 240, 190)
+    else:
+        subtitle_text = f"{enabled_count} of 7 overlays on · Coach review"
+        subtitle_colour = _lerp_color(
+            (203, 205, 235), (240, 242, 255), hover_amount
+        )
+    subtitle_text = _elide_text(subtitle_text, font_tiny, 214)
+    subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
+    subtitle_rect = subtitle.get_rect(
+        center=(visual_rect.centerx, visual_rect.centery + 15)
+    )
+    subtitle_shadow = font_tiny.render(subtitle_text, True, (18, 17, 42))
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    # Right-hand detail: all six coach badges in a compact 3 x 2 cluster.
+    for index, rating in enumerate(GAME_REVIEW_RATINGS):
+        col = index % 3
+        row = index // 3
+        draw_game_review_rating_icon(
+            screen,
+            rating,
+            (
+                visual_rect.right - 98 + col * 24,
+                visual_rect.centery - 11 + row * 22,
+            ),
+            17,
+        )
+    if review_live:
+        live_dot = (visual_rect.right - 98, visual_rect.y + 8)
+        live_radius = 3 + int(round(hover_amount))
+        pygame.draw.circle(screen, (110, 210, 255), live_dot, live_radius)
+        pygame.draw.circle(screen, (255, 255, 255), live_dot, live_radius + 1, 1)
+
+    chevron_x = visual_rect.right - 22 + int(round(2 * hover_amount))
+    chevron_colour = (
+        (255, 255, 255) if hovered else _lerp_color(border_colour, (255, 255, 255), 0.18)
+    )
+    _draw_autoplay_settings_chevron(
+        screen,
+        (chevron_x, visual_rect.centery),
+        chevron_colour,
+        1.0,
+    )
 
 
 def draw_polished_autoplay_settings_button(screen, rect, hovered):
@@ -22847,6 +24507,10 @@ def draw_settings_menu(screen):
                     draw_polished_board_button(
                         screen, item_rect, is_hovered
                     )
+                elif item == "Analysis Settings":
+                    draw_polished_analysis_settings_button(
+                        screen, item_rect, is_hovered
+                    )
                 elif item == "Auto-Play Settings":
                     draw_polished_autoplay_settings_button(
                         screen, item_rect, is_hovered
@@ -22992,6 +24656,10 @@ def handle_menu_click(mx, my):
             return True
 
     if settings_menu_state == "analysis":
+        if _game_review_button_at((mx, my)):
+            request_game_review()
+            begin_settings_menu_close()
+            return True
         analysis_key = _analysis_overlay_item_at((mx, my))
         if analysis_key is not None:
             set_analysis_overlay_enabled(
@@ -23726,6 +25394,10 @@ def draw_gui(
     else:
         anim_mgr.reset_drag_grab_pose()
 
+    # The Game Review badge is deliberately the last board marker, so it
+    # sits over the same-corner Unprotected Pieces icon as requested.
+    draw_game_review_rating_badge(screen, board)
+
     # Promotion choice overlay (must be over board but under menu)
     if promotion_pending is not None:
         draw_promotion_menu(screen, promotion_pending["color"])
@@ -23858,6 +25530,10 @@ def draw_gui(
         except Exception:
             pass
 
+    # Game Review coach rises over the info panel, below the top chrome,
+    # dialogs and Settings so those retain their usual priority.
+    draw_game_review_coach(screen, board, mouse_pos)
+
     # Buttons (top bar) + flip + confirmation + menu overlay
     draw_new_game_button(screen, mouse_pos)
     draw_settings_button(screen, mouse_pos)
@@ -23930,6 +25606,7 @@ def main():
         nonlocal selected_sq, dragging, drag_sq, drag_offset, auto_seen_ply, auto_fired_key
         old_board = board.copy()
         anim_mgr.add_board_reset(old_board, chess.Board())
+        cancel_game_review()
         board.reset()
         reset_opening()
         history_redo.clear()
@@ -23954,6 +25631,8 @@ def main():
         """A move was just played from the displayed position. If it is
         exactly the next move in the recorded line, keep the rest of that
         line for →; otherwise the game has branched, so drop it."""
+        if game_review_is_active():
+            cancel_game_review()
         if history_redo and board.move_stack and history_redo[-1] == board.move_stack[-1]:
             history_redo.pop()
         else:
@@ -23974,6 +25653,112 @@ def main():
         anim_mgr.set_multipv_arrows({})
         check_effect.reset()
         engine_thread.update_position(board)
+
+    def game_review_step(delta, *, from_playback=False):
+        """Move one ply through the reviewed line using normal history."""
+        if anim_mgr.move_anim is not None:
+            return False
+        changed = False
+        if delta < 0 and board.move_stack:
+            add_move_animation_for_move(
+                anim_mgr, board, board.peek(), reverse=True
+            )
+            history_redo.append(board.pop())
+            changed = True
+        elif delta > 0 and history_redo:
+            move = history_redo[-1]
+            add_move_animation_for_move(
+                anim_mgr, board, move, reverse=False
+            )
+            history_redo.pop()
+            board.push(move)
+            changed = True
+        if changed:
+            sync_after_history_step()
+            mark_game_review_advanced()
+            if not from_playback:
+                set_game_review_playing(False)
+        return changed
+
+    def game_review_jump_to_ply(target_ply):
+        """Jump without per-move animation (review start / replay)."""
+        total_ply = len(board.move_stack) + len(history_redo)
+        target_ply = max(0, min(int(target_ply), total_ply))
+        if len(board.move_stack) == target_ply:
+            return False
+        anim_mgr.move_anim = None
+        anim_mgr.rook_anim = None
+        anim_mgr.capture_anims = []
+        while len(board.move_stack) > target_ply:
+            history_redo.append(board.pop())
+        while len(board.move_stack) < target_ply and history_redo:
+            board.push(history_redo.pop())
+        sync_after_history_step()
+        mark_game_review_advanced()
+        return True
+
+    def start_requested_game_review():
+        global show_game_over
+        if not consume_game_review_request():
+            return False
+        start_game_review(board, history_redo)
+        game_review_jump_to_ply(0)
+        show_game_over = False
+        return True
+
+    def handle_game_review_panel_click(pos):
+        action = game_review_control_at(pos)
+        if action is None:
+            return False
+        if action == "close":
+            close_game_review()
+        elif action == "prev":
+            game_review_step(-1)
+        elif action == "next":
+            game_review_step(1)
+        elif action == "play":
+            snapshot = get_game_review_snapshot()
+            total_moves = len(snapshot.get("moves_uci", []))
+            if not snapshot.get("playing"):
+                if total_moves and len(board.move_stack) >= total_moves:
+                    game_review_jump_to_ply(0)
+                set_game_review_playing(True)
+            else:
+                set_game_review_playing(False)
+        return True
+
+    def update_game_review():
+        """Start requested reviews, validate the line, and auto-play."""
+        start_requested_game_review()
+        snapshot = get_game_review_snapshot()
+        if not snapshot.get("active"):
+            return
+        if not game_review_line_matches(board, history_redo):
+            cancel_game_review()
+            return
+        if not snapshot.get("playing"):
+            return
+        if (
+            menu_anim_progress > 0.01
+            or show_newgame_confirm
+            or show_auto_color_dialog
+            or show_board_detection_dialog
+            or show_autoplay_side_dialog
+            or show_autoplay_gameover_dialog
+            or show_advisor_side_dialog
+            or anim_mgr.move_anim is not None
+        ):
+            return
+        total_moves = len(snapshot.get("moves_uci", []))
+        current_ply = len(board.move_stack)
+        if current_ply >= total_moves:
+            set_game_review_playing(False)
+            return
+        if (current_ply + 1) not in snapshot.get("results", {}):
+            return
+        if time.monotonic() - float(snapshot.get("last_advance_at", 0.0)) < 0.95:
+            return
+        game_review_step(1, from_playback=True)
 
     def execute_engine_best_move():
         """Play the engine's current best move (Space / Auto-Move)."""
@@ -25020,6 +26805,7 @@ def main():
         update_board_detection()
         update_autoplay()
         update_advisor()
+        update_game_review()
 
         is_check = board.is_check()
         is_mate = board.is_checkmate()
@@ -25034,7 +26820,12 @@ def main():
         _result = get_game_result(board)
         if _result is not None:
             _term_key = (board.fen(), len(board.move_stack))
-            if not show_game_over and _term_key != game_over_seen_key:
+            if game_review_is_active():
+                # Coach Nova narrates the finish; do not cover the dock
+                # with the modal (and do not reopen it on review close).
+                show_game_over = False
+                game_over_seen_key = _term_key
+            elif not show_game_over and _term_key != game_over_seen_key:
                 show_game_over = True
                 game_over_anim = 0.0
                 game_over_seen_key = _term_key
@@ -25084,6 +26875,7 @@ def main():
             auto_pos_frames += 1
         if (
             auto_move_enabled
+            and not game_review_is_active()
             and not _autoplay.get("enabled")
             and not _advisor.get("enabled")
             and auto_stage == 2
@@ -25202,6 +26994,8 @@ def main():
                 )
 
                 if not menu_active:
+                    if handle_game_review_panel_click((mx, my)):
+                        continue
                     if promotion_pending is not None:
                         rects = get_promotion_rects()
                         handled = False
@@ -25246,7 +27040,7 @@ def main():
                     elif settings_button_rect.collidepoint(mx, my):
                         begin_settings_menu_open()
 
-                    elif not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim):
+                    elif not game_review_is_active() and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim):
                         if not board.is_game_over(claim_draw=True):
                             sq = get_square_from_pos(event.pos)
                             if sq is not None:
@@ -25294,7 +27088,7 @@ def main():
                     or menu_anim_opening
                     or menu_anim_closing
                 )
-                if dragging and not menu_active and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim):
+                if dragging and not menu_active and not game_review_is_active() and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim):
                     drop_sq = get_square_from_pos(event.pos)
                     if drop_sq is not None and drag_sq is not None and drop_sq != drag_sq:
                         if is_promotion_move(board, drag_sq, drop_sq):
@@ -25414,6 +27208,9 @@ def main():
                     if promotion_pending is not None:
                         promotion_pending = None
                         continue
+                    if game_review_is_active() and menu_anim_progress == 0:
+                        close_game_review()
+                        continue
                     if menu_anim_progress > 0 and not (
                         menu_anim_opening or menu_anim_closing
                     ):
@@ -25432,18 +27229,22 @@ def main():
                             add_move_animation_for_move(anim_mgr, board, board.move_stack[-1], reverse=True)
                             history_redo.append(board.pop())
                             sync_after_history_step()
+                            if game_review_is_active():
+                                set_game_review_playing(False)
                     else:
                         # Next move — only if it has actually been played
                         if history_redo:
                             add_move_animation_for_move(anim_mgr, board, history_redo[-1], reverse=False)
                             board.push(history_redo.pop())
                             sync_after_history_step()
+                            if game_review_is_active():
+                                set_game_review_playing(False)
                 elif event.key == pygame.K_f and menu_anim_progress == 0 and not show_newgame_confirm:
                     toggle_flip_board()
                 elif event.key == pygame.K_e and menu_anim_progress == 0 and not show_newgame_confirm:
                     toggle_eval_side()
 
-                elif event.key == pygame.K_SPACE and menu_anim_progress == 0 and not show_auto_color_dialog:
+                elif event.key == pygame.K_SPACE and menu_anim_progress == 0 and not show_auto_color_dialog and not game_review_is_active():
                     if not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.illegal_return_anim):
                         execute_engine_best_move()
 
