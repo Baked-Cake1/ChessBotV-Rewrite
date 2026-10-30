@@ -1070,6 +1070,11 @@ hash_slider_pulse_phase = 0.0
 # staged Save flow and shared drag mapping remain owned by existing code.
 depth_slider_hover_amount = 0.0
 depth_slider_pulse_phase = 0.0
+# Engine Settings MultiPV slider polish. Hover/pulse state animates only
+# its candidate-line artwork; the 1..5 draft, smoothed display float,
+# staged Save flow, UCI MultiPV option and recalculation remain unchanged.
+multipv_slider_hover_amount = 0.0
+multipv_slider_pulse_phase = 0.0
 # Settings main-menu Board button polish. The phase drives only the
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
@@ -17001,6 +17006,1093 @@ def _draw_polished_depth_slider(
     return thumb_x, thumb_y
 
 
+def _multipv_slider_fraction(value, low, high):
+    """Normalise a MultiPV value on its established linear 1..5 scale."""
+
+    try:
+        numeric = float(value)
+        low = float(low)
+        high = float(high)
+    except (TypeError, ValueError):
+        return 0.0
+    if high <= low:
+        return 1.0
+    return max(0.0, min(1.0, (numeric - low) / (high - low)))
+
+
+def _multipv_rank_palette(rank):
+    """Return the sanitized suggestion-arrow palette for a 1..5 rank."""
+
+    fallback = ((96, 165, 250), (29, 78, 216))
+    try:
+        rank = int(rank)
+    except (TypeError, ValueError):
+        rank = 1
+    rank = max(1, min(5, rank))
+    try:
+        palette = SUGGESTION_ARROW_PALETTES.get(rank, fallback)
+        start_raw, end_raw = palette
+    except Exception:
+        return fallback
+
+    def clean_colour(raw, default):
+        try:
+            values = tuple(
+                max(0, min(255, int(round(float(channel)))))
+                for channel in raw[:3]
+            )
+        except Exception:
+            return default
+        return values if len(values) == 3 else default
+
+    return (
+        clean_colour(start_raw, fallback[0]),
+        clean_colour(end_raw, fallback[1]),
+    )
+
+
+def _multipv_slider_accent(fraction):
+    """Interpolate through the five MultiPV rank colours."""
+
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError):
+        fraction = 0.0
+    fraction = max(0.0, min(1.0, fraction))
+    scaled = fraction * 4.0
+    segment = min(3, int(scaled))
+    local = max(0.0, min(1.0, scaled - segment))
+    start_colour = _multipv_rank_palette(segment + 1)[0]
+    end_colour = _multipv_rank_palette(segment + 2)[0]
+    return _lerp_color(start_colour, end_colour, local)
+
+
+def _multipv_slider_tier(value, low, high):
+    """Return ``(tier_index, label)`` for a MultiPV count."""
+
+    try:
+        low = int(low)
+        high = int(high)
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0, "Best line only"
+    high = max(low, high)
+    count = int(round(max(float(low), min(float(high), numeric))))
+    tier_index = max(0, min(4, count - low))
+    if high <= low:
+        tier_index = 4
+    if count <= low:
+        return tier_index, "Best line only"
+    return tier_index, f"{count} ranked lines"
+
+
+def _format_multipv_lines(count):
+    """Human-readable MultiPV line count with correct singular grammar."""
+
+    try:
+        count = int(round(float(count)))
+    except (TypeError, ValueError):
+        count = 1
+    count = max(0, count)
+    return "1 engine line" if count == 1 else f"{count} engine lines"
+
+
+def _multipv_display_rank_amount(display, tick_value):
+    """How fully a rank stop has been reached by the smoothed display."""
+
+    try:
+        amount = float(display) - float(tick_value) + 1.0
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, amount))
+
+
+def _multipv_slider_values():
+    """Read staged/saved/display MultiPV values for its renderer.
+
+    This helper never writes a setting. The chip, subtitle and bubble use
+    the staged integer draft; the thumb/fill/rank artwork use the existing
+    smoothed display float; and the ivory marker uses the saved config.
+    """
+
+    try:
+        low_raw, high_raw = ENGINE_ROW_LIMITS.get("multipv", (1, 5))
+        low = int(low_raw)
+        high = int(high_raw)
+    except Exception:
+        low, high = 1, 5
+    high = max(low, high)
+
+    def staged_value(raw, default):
+        try:
+            value = int(round(float(raw)))
+        except (TypeError, ValueError):
+            value = int(default)
+        return max(low, min(high, value))
+
+    saved_default = ENGINE_DEFAULTS.get("multipv", 1)
+    saved = staged_value(
+        config.get("multipv", saved_default), saved_default
+    )
+    draft = staged_value(engine_draft.get("multipv", saved), saved)
+    try:
+        display = float(
+            engine_slider_display.get("multipv", float(draft))
+        )
+    except (TypeError, ValueError):
+        display = float(draft)
+    display = max(float(low), min(float(high), display))
+
+    display_fraction = _multipv_slider_fraction(display, low, high)
+    draft_fraction = _multipv_slider_fraction(draft, low, high)
+    saved_fraction = _multipv_slider_fraction(saved, low, high)
+    draft_tier_index, draft_tier = _multipv_slider_tier(
+        draft, low, high
+    )
+    display_tier_index, display_tier = _multipv_slider_tier(
+        display, low, high
+    )
+    return {
+        "low": low,
+        "high": high,
+        "draft": draft,
+        "saved": saved,
+        "display": display,
+        "dirty": draft != saved,
+        "display_fraction": display_fraction,
+        "draft_fraction": draft_fraction,
+        "saved_fraction": saved_fraction,
+        "draft_tier_index": draft_tier_index,
+        "draft_tier": draft_tier,
+        "display_tier_index": display_tier_index,
+        "display_tier": display_tier,
+    }
+
+
+def _multipv_slider_tick_values(low, high, max_intervals=8):
+    """Inclusive MultiPV ticks; the 1..5 range gets every rank."""
+
+    try:
+        low = int(low)
+        high = int(high)
+        max_intervals = max(1, int(max_intervals))
+    except Exception:
+        return (1, 2, 3, 4, 5)
+    if high <= low:
+        return (low,)
+
+    span = high - low
+    if span <= max_intervals:
+        return tuple(range(low, high + 1))
+
+    raw_step = int(math.ceil(span / float(max_intervals)))
+    step = raw_step
+    for candidate in (
+        1, 2, 4, 5, 8, 10, 16, 20, 25, 32, 50, 64, 100, 128, 200,
+        250, 500, 1000,
+    ):
+        if candidate >= raw_step:
+            step = candidate
+            break
+    values = list(range(low, high + 1, step))
+    if values[-1] != high:
+        values.append(high)
+    return tuple(values)
+
+
+def _draw_multipv_fan_icon(
+    surface,
+    cx,
+    cy,
+    size,
+    hover_amount=0.0,
+    phase=0.0,
+    display=1.0,
+    low=1,
+    high=5,
+):
+    """Draw one origin fanning into the ranked MultiPV candidate lines."""
+
+    cx, cy = int(cx), int(cy)
+    size = max(22, int(size))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    try:
+        low = int(low)
+        high = int(high)
+        display = float(display)
+    except (TypeError, ValueError):
+        low, high, display = 1, 5, 1.0
+    high = max(low, high)
+    rank_count = max(1, min(5, high - low + 1))
+
+    origin = (cx - 11, cy)
+    endpoint_x = cx + 12
+    if rank_count == 1:
+        endpoint_offsets = (0,)
+    else:
+        endpoint_offsets = tuple(
+            int(round(-12 + 24 * index / (rank_count - 1)))
+            for index in range(rank_count)
+        )
+
+    routes = []
+    for rank_index, endpoint_offset in enumerate(endpoint_offsets):
+        tick_value = low + rank_index
+        amount = _multipv_display_rank_amount(display, tick_value)
+        rank_start, rank_end = _multipv_rank_palette(rank_index + 1)
+        line_colour = _lerp_color((69, 68, 86), rank_start, amount)
+        line_colour = _lerp_color(
+            line_colour,
+            (255, 255, 255),
+            0.12 * hover_amount * amount,
+        )
+        endpoint = (endpoint_x, cy + endpoint_offset)
+        routes.append((endpoint, amount, line_colour, rank_end))
+
+        pygame.draw.line(
+            surface,
+            (12, 11, 24),
+            (origin[0] + 1, origin[1] + 1),
+            (endpoint[0], endpoint[1] + 1),
+            3,
+        )
+        pygame.draw.line(surface, line_colour, origin, endpoint, 2)
+        pygame.draw.circle(
+            surface, line_colour, (endpoint[0] - 2, endpoint[1]), 2
+        )
+        pygame.draw.polygon(
+            surface,
+            line_colour,
+            [
+                (endpoint[0] - 2, endpoint[1] - 3),
+                (endpoint[0] + 2, endpoint[1]),
+                (endpoint[0] - 2, endpoint[1] + 3),
+            ],
+        )
+        pygame.draw.circle(
+            surface,
+            rank_end if amount > 0.03 else (43, 42, 58),
+            (endpoint[0] - 2, endpoint[1]),
+            1,
+        )
+
+    origin_start, origin_end = _multipv_rank_palette(1)
+    pygame.draw.circle(
+        surface, (12, 11, 24), (origin[0], origin[1] + 1), 4
+    )
+    pygame.draw.circle(surface, origin_start, origin, 4)
+    pygame.draw.circle(surface, origin_end, origin, 4, 1)
+    pygame.draw.circle(surface, (255, 255, 255), origin, 1)
+
+    if hover_amount > 0.03:
+        for route_index, (endpoint, amount, line_colour, _end) in enumerate(
+            routes
+        ):
+            if amount <= 0.03:
+                continue
+            glint_t = (
+                phase / (2.0 * math.pi)
+                + route_index / float(max(1, len(routes)))
+            ) % 1.0
+            glint = (
+                int(round(origin[0] + (endpoint[0] - origin[0]) * glint_t)),
+                int(round(origin[1] + (endpoint[1] - origin[1]) * glint_t)),
+            )
+            pygame.draw.circle(
+                surface,
+                _lerp_color(line_colour, (255, 255, 255), 0.55),
+                glint,
+                1,
+            )
+
+
+def _draw_multipv_slider_thumb(
+    surface,
+    cx,
+    cy,
+    radius,
+    hover_amount=0.0,
+    dragging=False,
+    phase=0.0,
+    fraction=0.0,
+):
+    """Draw the MultiPV thumb as a miniature candidate-line fan."""
+
+    cx, cy = int(cx), int(cy)
+    radius = max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    active_amount = 1.0 if dragging else hover_amount
+    accent = _multipv_slider_accent(fraction)
+    rim_colour = _lerp_color(
+        _lerp_color(accent, (235, 234, 255), 0.34),
+        (255, 255, 255),
+        0.26 * active_amount,
+    )
+    face_colour = _lerp_color((58, 56, 78), (72, 69, 94), active_amount)
+    inner_colour = _lerp_color((35, 33, 52), (47, 44, 66), active_amount)
+
+    pygame.draw.circle(surface, (12, 11, 24), (cx, cy + 2), radius)
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), max(2, radius - 2))
+    pygame.draw.circle(surface, inner_colour, (cx, cy), max(1, radius - 3))
+
+    origin = (cx - 5, cy)
+    endpoints = (
+        (cx + 5, cy - 5),
+        (cx + 6, cy),
+        (cx + 5, cy + 5),
+    )
+    for endpoint in endpoints:
+        pygame.draw.line(
+            surface,
+            (13, 12, 26),
+            (origin[0], origin[1] + 1),
+            (endpoint[0], endpoint[1] + 1),
+            2,
+        )
+    for line_index, endpoint in enumerate(endpoints):
+        rank_start, _rank_end = _multipv_rank_palette(line_index * 2 + 1)
+        line_colour = _lerp_color(
+            rank_start,
+            (255, 255, 255),
+            0.18 * active_amount,
+        )
+        pygame.draw.line(surface, line_colour, origin, endpoint, 1)
+        pygame.draw.circle(surface, line_colour, endpoint, 1)
+
+    origin_start, origin_end = _multipv_rank_palette(1)
+    pygame.draw.circle(surface, origin_start, origin, 2)
+    pygame.draw.circle(surface, origin_end, origin, 2, 1)
+    pygame.draw.circle(surface, (255, 255, 255), origin, 1)
+
+    if active_amount > 0.03:
+        orbit_distance = max(3.0, radius * 0.58)
+        orbit = (
+            int(round(cx + orbit_distance * math.cos(phase - 0.7))),
+            int(round(cy + orbit_distance * math.sin(phase - 0.7))),
+        )
+        pygame.draw.circle(
+            surface,
+            _lerp_color(accent, (255, 255, 255), 0.55),
+            orbit,
+            1,
+        )
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (cx - max(1, radius // 3), cy - max(1, radius // 3)),
+        1,
+    )
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (16, 15, 30, 255)
+        )
+    except Exception:
+        pass
+
+
+def _draw_polished_multipv_slider(
+    screen, row_rect, track_rect, value_rect, mx, my
+):
+    """Draw the Engine Settings MultiPV row inside its original rects.
+
+    Candidate-line artwork, numbered rank stops, markers, chip and bubble
+    are presentation only. ``track_rect`` remains the exact 180x6 track
+    consumed by the shared click/drag helper; the thumb follows the
+    smoothed display float, labels use the staged draft, and the ivory
+    marker uses the saved config value.
+    """
+
+    global multipv_slider_hover_amount, multipv_slider_pulse_phase
+
+    values = _multipv_slider_values()
+    low = values["low"]
+    high = values["high"]
+    draft = values["draft"]
+    saved = values["saved"]
+    display = values["display"]
+    is_dirty = values["dirty"]
+    display_fraction = values["display_fraction"]
+    draft_fraction = values["draft_fraction"]
+    accent_display = _multipv_slider_accent(display_fraction)
+    accent_draft = _multipv_slider_accent(draft_fraction)
+    draft_tier = values["draft_tier"]
+    tick_values = _multipv_slider_tick_values(low, high)
+
+    thumb_x = track_rect.x + int(display_fraction * track_rect.width)
+    thumb_y = track_rect.centery
+    is_dragging = engine_slider_dragging == "multipv"
+    thumb_hover = bool(
+        is_dragging
+        or (abs(mx - thumb_x) < 14 and abs(my - thumb_y) < 14)
+        or track_rect.collidepoint(mx, my)
+    )
+
+    hover_target = 1.0 if thumb_hover else 0.0
+    multipv_slider_hover_amount += (
+        hover_target - multipv_slider_hover_amount
+    ) * 0.24
+    if abs(hover_target - multipv_slider_hover_amount) < 0.01:
+        multipv_slider_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, multipv_slider_hover_amount))
+    if is_dragging:
+        phase_step = 0.16
+    elif thumb_hover:
+        phase_step = 0.11
+    elif is_dirty:
+        phase_step = 0.025
+    else:
+        phase_step = 0.0
+    if phase_step:
+        multipv_slider_pulse_phase = (
+            multipv_slider_pulse_phase + phase_step
+        ) % (2.0 * math.pi)
+    phase = multipv_slider_pulse_phase
+    active_amount = 1.0 if is_dragging else hover_amount
+
+    glow_colour = (255, 196, 92) if is_dirty else accent_display
+    glow_strength = max(hover_amount, 0.20 if is_dirty else 0.0)
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (row_rect.width + 16, row_rect.height + 16), pygame.SRCALPHA
+        )
+        for inset, alpha in ((1, 13), (4, 21), (7, 31)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (row_rect.x - 8, row_rect.y - 8))
+
+    pygame.draw.rect(
+        screen, (13, 12, 24), row_rect.move(0, 2), border_radius=6
+    )
+    if is_dragging:
+        top_colour, bottom_colour = (72, 70, 87), (47, 45, 60)
+        border_colour = _lerp_color(
+            accent_display, (255, 255, 255), 0.34
+        )
+    elif thumb_hover:
+        top_colour, bottom_colour = (78, 76, 93), (51, 49, 65)
+        border_colour = _lerp_color(
+            accent_display, (255, 255, 255), 0.30
+        )
+    else:
+        top_colour, bottom_colour = (66, 64, 79), (43, 42, 55)
+        border_colour = _lerp_color(
+            accent_display, (128, 125, 148), 0.58
+        )
+    if is_dirty:
+        border_colour = _lerp_color(
+            border_colour, (255, 200, 104), 0.38
+        )
+
+    body = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    denom = max(1, row_rect.height - 1)
+    for body_row in range(row_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, body_row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, body_row),
+            (row_rect.width - 1, body_row),
+        )
+
+    overlay = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(8 + 13 * hover_amount)),
+        [
+            (-18, row_rect.height),
+            (row_rect.width * 0.38, 0),
+            (row_rect.width * 0.56, 0),
+            (row_rect.width * 0.16, row_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(58 + 40 * hover_amount)),
+        (8, 1),
+        (row_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 20),
+        (2, 7),
+        (2, row_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 30),
+        (0, row_rect.height - 4, row_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 23),
+        (row_rect.width - 3, 6, 3, row_rect.height - 12),
+        border_radius=2,
+    )
+    trace_alpha = int(17 + 23 * hover_amount)
+    trace_colour = (
+        *_lerp_color(accent_display, (255, 255, 255), 0.28),
+        trace_alpha,
+    )
+    centre_y = row_rect.height // 2
+    for route_offset in (-18, -9, 0, 9, 18):
+        route = [
+            (112, centre_y),
+            (136, centre_y + route_offset // 2),
+            (169, centre_y + route_offset),
+        ]
+        pygame.draw.lines(overlay, trace_colour, False, route, 1)
+        pygame.draw.circle(overlay, trace_colour, route[-1], 2)
+    for trace in (
+        [(418, 9), (442, 9), (451, 16), (468, 16)],
+        [(418, 54), (442, 54), (451, 47), (468, 47)],
+    ):
+        pygame.draw.lines(overlay, trace_colour, False, trace, 1)
+        for node in (trace[0], trace[-1]):
+            pygame.draw.circle(overlay, trace_colour, node, 2)
+    # Faint rank-stop boundaries behind the track.
+    for tick_value in tick_values:
+        boundary_x = int(
+            150
+            + _multipv_slider_fraction(tick_value, low, high) * 180
+        )
+        pygame.draw.line(
+            overlay,
+            (255, 255, 255, int(7 + 9 * hover_amount)),
+            (boundary_x, 8),
+            (boundary_x, row_rect.height - 9),
+            1,
+        )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask, (255, 255, 255, 255), mask.get_rect(), border_radius=6
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, row_rect.topleft)
+    pygame.draw.rect(screen, border_colour, row_rect, 2, border_radius=6)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        row_rect.inflate(-3, -3),
+        1,
+        border_radius=5,
+    )
+
+    _draw_multipv_fan_icon(
+        screen,
+        row_rect.x + 27,
+        row_rect.centery,
+        31,
+        hover_amount=active_amount,
+        phase=phase,
+        display=display,
+        low=low,
+        high=high,
+    )
+    label_colour = _lerp_color(
+        (239, 238, 250), (255, 255, 255), hover_amount
+    )
+    label = font_small.render("MultiPV", True, label_colour)
+    label_rect = label.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery - 10)
+    )
+    label_shadow = font_small.render("MultiPV", True, (17, 16, 28))
+    screen.blit(label_shadow, label_rect.move(0, 1))
+    screen.blit(label, label_rect)
+
+    subtitle_text = draft_tier
+    subtitle_colour = _lerp_color(
+        (178, 176, 205),
+        _lerp_color(accent_draft, (255, 255, 255), 0.36),
+        hover_amount,
+    )
+    subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
+    subtitle_rect = subtitle.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery + 13)
+    )
+    subtitle_shadow = font_tiny.render(
+        subtitle_text, True, (17, 16, 28)
+    )
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    socket_rect = track_rect.inflate(10, 10)
+    groove_rect = track_rect.inflate(4, 4)
+    pygame.draw.rect(
+        screen,
+        (12, 11, 24),
+        socket_rect.move(0, 1),
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (24, 23, 40), socket_rect, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(
+            (103, 100, 128),
+            accent_display,
+            0.42 + 0.28 * hover_amount,
+        ),
+        socket_rect,
+        1,
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (39, 38, 57), groove_rect, border_radius=5)
+    pygame.draw.rect(
+        screen, (16, 15, 30), groove_rect, 1, border_radius=5
+    )
+
+    fill_end_x = max(groove_rect.x + 4, thumb_x)
+    fill_width = max(
+        0, min(groove_rect.width, fill_end_x - groove_rect.x)
+    )
+    if fill_width > 0:
+        fill_surface = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_denom = max(1, groove_rect.width - 1)
+        for fill_x in range(groove_rect.width):
+            colour = _multipv_slider_accent(fill_x / fill_denom)
+            colour = _lerp_color(
+                colour, (255, 255, 255), 0.10 * hover_amount
+            )
+            pygame.draw.line(
+                fill_surface,
+                (*colour, 255),
+                (fill_x, 0),
+                (fill_x, groove_rect.height - 1),
+            )
+        fill_overlay = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        pygame.draw.line(
+            fill_overlay,
+            (255, 255, 255, int(80 + 45 * hover_amount)),
+            (2, 1),
+            (groove_rect.width - 3, 1),
+            1,
+        )
+        pygame.draw.rect(
+            fill_overlay,
+            (0, 0, 0, 42),
+            (0, groove_rect.height - 3, groove_rect.width, 3),
+        )
+        fill_surface.blit(fill_overlay, (0, 0))
+        fill_mask = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_mask.fill((0, 0, 0, 0))
+        pygame.draw.rect(
+            fill_mask,
+            (255, 255, 255, 255),
+            fill_mask.get_rect(),
+            border_radius=5,
+        )
+        fill_surface.blit(
+            fill_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT
+        )
+        screen.blit(
+            fill_surface,
+            groove_rect.topleft,
+            area=pygame.Rect(0, 0, fill_width, groove_rect.height),
+        )
+
+    def fraction_to_x(fraction):
+        return track_rect.x + int(fraction * track_rect.width)
+
+    saved_x = fraction_to_x(values["saved_fraction"])
+    draft_x = fraction_to_x(draft_fraction)
+
+    # Numbered medallion for every rank stop, coloured exactly like the
+    # corresponding board suggestion arrow and bottom-panel line label.
+    for tick_index, tick_value in enumerate(tick_values):
+        tick_fraction = _multipv_slider_fraction(tick_value, low, high)
+        tick_x = fraction_to_x(tick_fraction)
+        rank_amount = _multipv_display_rank_amount(display, tick_value)
+        rank_start, rank_end = _multipv_rank_palette(tick_index + 1)
+
+        pygame.draw.line(
+            screen,
+            _lerp_color((84, 82, 104), rank_end, rank_amount),
+            (tick_x, groove_rect.y + 1),
+            (tick_x, groove_rect.bottom - 2),
+            1,
+        )
+
+        medallion_centre = (tick_x, track_rect.centery + 17)
+        medallion_radius = 7
+        medallion_fill = _lerp_color(
+            (48, 47, 64), rank_start, rank_amount
+        )
+        medallion_fill = _lerp_color(
+            medallion_fill,
+            (255, 255, 255),
+            0.10 * hover_amount * rank_amount,
+        )
+        medallion_border = _lerp_color(
+            (94, 92, 116), rank_end, rank_amount
+        )
+        pygame.draw.circle(
+            screen,
+            (12, 11, 24),
+            (medallion_centre[0], medallion_centre[1] + 1),
+            medallion_radius,
+        )
+        pygame.draw.circle(
+            screen, medallion_fill, medallion_centre, medallion_radius
+        )
+        pygame.draw.circle(
+            screen,
+            medallion_border,
+            medallion_centre,
+            medallion_radius,
+            1,
+        )
+        digit_colour = _lerp_color(
+            (154, 152, 178), (12, 16, 28), rank_amount
+        )
+        digit = font_tiny.render(str(tick_value), True, digit_colour)
+        screen.blit(
+            digit,
+            digit.get_rect(center=medallion_centre),
+        )
+
+    if hover_amount > 0.03 and fill_width > 8:
+        for tick_index, tick_value in enumerate(tick_values):
+            rank_amount = _multipv_display_rank_amount(
+                display, tick_value
+            )
+            if rank_amount <= 0.03:
+                continue
+            if tick_value > low:
+                segment_start_x = fraction_to_x(
+                    _multipv_slider_fraction(tick_value - 1, low, high)
+                )
+            else:
+                segment_start_x = track_rect.x
+            segment_end_x = min(
+                fraction_to_x(
+                    _multipv_slider_fraction(tick_value, low, high)
+                ),
+                groove_rect.x + fill_width - 3,
+            )
+            if segment_end_x <= segment_start_x:
+                continue
+            pulse_t = (
+                phase / (2.0 * math.pi)
+                + tick_index / float(max(1, len(tick_values)))
+            ) % 1.0
+            pulse_x = int(
+                segment_start_x
+                + pulse_t * max(1, segment_end_x - segment_start_x)
+            )
+            pulse_y = track_rect.centery + ((tick_index % 3) - 1) * 3
+            rank_start, _rank_end = _multipv_rank_palette(
+                tick_index + 1
+            )
+            pygame.draw.polygon(
+                screen,
+                _lerp_color(rank_start, (255, 255, 255), 0.52),
+                [
+                    (pulse_x, pulse_y - 3),
+                    (pulse_x + 3, pulse_y),
+                    (pulse_x, pulse_y + 3),
+                    (pulse_x - 3, pulse_y),
+                ],
+            )
+
+    saved_marker_y = socket_rect.y - 4
+    pygame.draw.polygon(
+        screen,
+        (16, 15, 30),
+        [
+            (saved_x, saved_marker_y - 3),
+            (saved_x + 3, saved_marker_y),
+            (saved_x, saved_marker_y + 3),
+            (saved_x - 3, saved_marker_y),
+        ],
+    )
+    pygame.draw.polygon(
+        screen,
+        (246, 245, 255),
+        [
+            (saved_x, saved_marker_y - 2),
+            (saved_x + 2, saved_marker_y),
+            (saved_x, saved_marker_y + 2),
+            (saved_x - 2, saved_marker_y),
+        ],
+    )
+    if is_dirty or abs(draft_x - thumb_x) > 2:
+        needle_colour = (
+            (255, 200, 104)
+            if is_dirty
+            else _lerp_color(accent_draft, (255, 255, 255), 0.34)
+        )
+        pygame.draw.line(
+            screen,
+            needle_colour,
+            (draft_x, socket_rect.y - 1),
+            (draft_x, socket_rect.bottom),
+            1,
+        )
+        pygame.draw.polygon(
+            screen,
+            needle_colour,
+            [
+                (draft_x - 3, socket_rect.bottom + 4),
+                (draft_x + 3, socket_rect.bottom + 4),
+                (draft_x, socket_rect.bottom),
+            ],
+        )
+
+    if hover_amount > 0.01:
+        thumb_glow = pygame.Surface((42, 42), pygame.SRCALPHA)
+        for glow_radius, glow_alpha in ((18, 18), (15, 28), (12, 40)):
+            pygame.draw.circle(
+                thumb_glow,
+                (*accent_display, int(glow_alpha * hover_amount)),
+                (21, 21),
+                glow_radius,
+            )
+        screen.blit(
+            thumb_glow, thumb_glow.get_rect(center=(thumb_x, thumb_y))
+        )
+    thumb_radius = 11 + (
+        1 if is_dragging else int(round(hover_amount))
+    )
+    _draw_multipv_slider_thumb(
+        screen,
+        thumb_x,
+        thumb_y,
+        thumb_radius,
+        hover_amount=hover_amount,
+        dragging=is_dragging,
+        phase=phase,
+        fraction=display_fraction,
+    )
+
+    chip_rect = pygame.Rect(
+        value_rect.x + 3, row_rect.y + 13, value_rect.width - 6, 38
+    )
+    pygame.draw.rect(
+        screen, (12, 11, 24), chip_rect.move(0, 1), border_radius=8
+    )
+    chip_bg = (48, 47, 68) if thumb_hover else (39, 38, 57)
+    chip_border = (
+        (255, 200, 104)
+        if is_dirty
+        else _lerp_color(accent_display, (255, 255, 255), 0.24)
+        if thumb_hover
+        else _lerp_color(accent_display, (109, 106, 132), 0.45)
+    )
+    pygame.draw.rect(screen, chip_bg, chip_rect, border_radius=8)
+    pygame.draw.rect(screen, chip_border, chip_rect, 1, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(chip_border, (255, 255, 255), 0.28),
+        chip_rect.inflate(-3, -3),
+        1,
+        border_radius=6,
+    )
+    value_colour = (
+        TEXT_ACCENT
+        if is_dirty
+        else (255, 255, 255)
+        if thumb_hover or is_dragging
+        else TEXT_COLOR
+    )
+    value_text = str(draft)
+    value_font = font_small
+    value_surface = value_font.render(value_text, True, value_colour)
+    if value_surface.get_width() > chip_rect.width - 10:
+        value_font = font_tiny
+        value_surface = value_font.render(value_text, True, value_colour)
+    screen.blit(
+        value_surface,
+        value_surface.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery - 7)
+        ),
+    )
+    denominator_text = f"of {high}"
+    denominator = font_tiny.render(
+        denominator_text,
+        True,
+        _lerp_color((183, 181, 209), (238, 237, 255), hover_amount),
+    )
+    if denominator.get_width() > chip_rect.width - 8:
+        denominator_text = _elide_text(
+            denominator_text, font_tiny, chip_rect.width - 8
+        )
+        denominator = font_tiny.render(
+            denominator_text,
+            True,
+            _lerp_color(
+                (183, 181, 209), (238, 237, 255), hover_amount
+            ),
+        )
+    screen.blit(
+        denominator,
+        denominator.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery + 11)
+        ),
+    )
+    if is_dirty:
+        badge = (value_rect.right - 6, value_rect.centery - 14)
+        pygame.draw.circle(
+            screen, (43, 29, 9), (badge[0], badge[1] + 1), 4
+        )
+        pygame.draw.circle(screen, (255, 200, 80), badge, 4)
+        pygame.draw.circle(screen, (255, 236, 178), badge, 4, 1)
+        pygame.draw.circle(
+            screen,
+            (255, 255, 255),
+            (badge[0] - 1, badge[1] - 1),
+            1,
+        )
+
+    # Five shrinking rank-arrow lanes in the spare right-hand space,
+    # mirroring the suggestion arrows' colour and emphasis hierarchy.
+    lane_x0 = chip_rect.right + 10
+    lane_x1 = row_rect.right - 15
+    lane_width = lane_x1 - lane_x0 + 1
+    if lane_width >= 34 and tick_values:
+        max_lane_width = min(42, lane_width)
+        lane_centre_span = max(0, (len(tick_values) - 1) * 7)
+        first_lane_y = row_rect.centery - lane_centre_span // 2
+        pygame.draw.line(
+            screen,
+            (16, 15, 30),
+            (lane_x0 - 2, first_lane_y),
+            (lane_x0 - 2, first_lane_y + lane_centre_span),
+            1,
+        )
+        for tick_index, tick_value in enumerate(tick_values):
+            lane_y = first_lane_y + tick_index * 7
+            width_fraction = (
+                1.0
+                if len(tick_values) == 1
+                else 1.0
+                - 0.38 * (tick_index / float(len(tick_values) - 1))
+            )
+            this_lane_width = max(
+                12, int(round(max_lane_width * width_fraction))
+            )
+            lane_tip_x = lane_x0 + this_lane_width - 1
+            rank_amount = _multipv_display_rank_amount(
+                display, tick_value
+            )
+            rank_start, rank_end = _multipv_rank_palette(
+                tick_index + 1
+            )
+            lane_colour = _lerp_color(
+                (54, 53, 70), rank_start, rank_amount
+            )
+            lane_colour = _lerp_color(
+                lane_colour,
+                (255, 255, 255),
+                0.12 * hover_amount * rank_amount,
+            )
+            pygame.draw.line(
+                screen,
+                (12, 11, 24),
+                (lane_x0, lane_y + 1),
+                (lane_tip_x - 4, lane_y + 1),
+                3,
+            )
+            pygame.draw.line(
+                screen,
+                lane_colour,
+                (lane_x0, lane_y),
+                (lane_tip_x - 4, lane_y),
+                3,
+            )
+            pygame.draw.polygon(
+                screen,
+                lane_colour,
+                [
+                    (lane_tip_x - 4, lane_y - 3),
+                    (lane_tip_x, lane_y),
+                    (lane_tip_x - 4, lane_y + 3),
+                ],
+            )
+            pygame.draw.circle(
+                screen,
+                rank_end if rank_amount > 0.03 else (42, 41, 57),
+                (lane_x0, lane_y),
+                1,
+            )
+            if hover_amount > 0.03 and rank_amount > 0.03:
+                lane_pulse_t = (
+                    phase / (2.0 * math.pi)
+                    + tick_index / float(max(1, len(tick_values)))
+                ) % 1.0
+                lane_pulse_x = int(
+                    lane_x0
+                    + lane_pulse_t
+                    * max(1, this_lane_width - 5)
+                )
+                pygame.draw.circle(
+                    screen,
+                    (255, 255, 255),
+                    (lane_pulse_x, lane_y),
+                    1,
+                )
+
+    if thumb_hover or is_dragging:
+        if is_dirty:
+            bubble_text = (
+                f"Unsaved · {_format_multipv_lines(draft)} · "
+                f"saved {saved}"
+            )
+        elif draft <= low:
+            bubble_text = f"MultiPV {draft} · best line only"
+        else:
+            bubble_text = f"MultiPV {draft} · ranks #1-#{draft}"
+        bubble_text = _elide_text(bubble_text, font_tiny, 205)
+        bubble = font_tiny.render(bubble_text, True, TEXT_COLOR)
+        tip_w = bubble.get_width() + 14
+        tip_h = 20
+        min_tip_x = row_rect.x + 116
+        max_tip_x = max(min_tip_x, chip_rect.x - tip_w - 6)
+        tip_x = max(
+            min_tip_x,
+            min(thumb_x - tip_w // 2, max_tip_x),
+        )
+        tip_rect = pygame.Rect(tip_x, row_rect.y + 3, tip_w, tip_h)
+        pygame.draw.rect(
+            screen, (16, 15, 30), tip_rect, border_radius=6
+        )
+        pygame.draw.rect(
+            screen, chip_border, tip_rect, 1, border_radius=6
+        )
+        pointer_x = max(
+            tip_rect.x + 7,
+            min(thumb_x, tip_rect.right - 7),
+        )
+        pygame.draw.polygon(
+            screen,
+            (16, 15, 30),
+            [
+                (pointer_x - 4, tip_rect.bottom - 1),
+                (pointer_x + 4, tip_rect.bottom - 1),
+                (
+                    pointer_x,
+                    min(socket_rect.y - 1, tip_rect.bottom + 5),
+                ),
+            ],
+        )
+        screen.blit(bubble, bubble.get_rect(center=tip_rect.center))
+
+    return thumb_x, thumb_y
+
+
 def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
 
@@ -17031,6 +18123,12 @@ def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
 
         if key == "depth":
             _draw_polished_depth_slider(
+                screen, row_rect, track_rect, value_rect, mx, my
+            )
+            continue
+
+        if key == "multipv":
+            _draw_polished_multipv_slider(
                 screen, row_rect, track_rect, value_rect, mx, my
             )
             continue
