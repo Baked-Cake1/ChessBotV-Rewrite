@@ -1727,12 +1727,28 @@ def _get_check_border_surf():
     return _check_border_surf
 
 
+def _board_square_local_top_left(square):
+    """Board-local top-left for *square*, honouring the flipped view."""
+    file_index = chess.square_file(square)
+    rank_index = chess.square_rank(square)
+    if board_flipped:
+        return (
+            (7 - file_index) * SQUARE_SIZE,
+            rank_index * SQUARE_SIZE,
+        )
+    return (
+        file_index * SQUARE_SIZE,
+        (7 - rank_index) * SQUARE_SIZE,
+    )
+
+
 def draw_check_effect_under(screen, effect, board_ox, board_oy):
     """Soft radial red glow on the king square, drawn beneath the pieces."""
     if not effect.active or effect.king_sq is None:
         return
-    kx = board_ox + chess.square_file(effect.king_sq) * SQUARE_SIZE
-    ky = board_oy + (7 - chess.square_rank(effect.king_sq)) * SQUARE_SIZE
+    local_x, local_y = _board_square_local_top_left(effect.king_sq)
+    kx = board_ox + local_x
+    ky = board_oy + local_y
 
     p = effect.pulse()
     if effect.is_mate:
@@ -1758,14 +1774,9 @@ def draw_check_effect_over(screen, effect, board_ox, board_oy):
     p = effect.pulse()
 
     if effect.origin_sq is not None:
-        ox = (
-            chess.square_file(effect.origin_sq) * SQUARE_SIZE
-            + SQUARE_SIZE // 2
-        )
-        oy = (
-            (7 - chess.square_rank(effect.origin_sq)) * SQUARE_SIZE
-            + SQUARE_SIZE // 2
-        )
+        origin_x, origin_y = _board_square_local_top_left(effect.origin_sq)
+        ox = origin_x + SQUARE_SIZE // 2
+        oy = origin_y + SQUARE_SIZE // 2
         for ring in effect.rings:
             rp = ring["progress"]
             radius = int(SQUARE_SIZE * 0.35 + rp * ring["max_radius"])
@@ -1779,8 +1790,7 @@ def draw_check_effect_over(screen, effect, board_ox, board_oy):
             pygame.draw.circle(overlay, rc, (ox, oy), radius, ring_w)
 
     if effect.king_sq is not None:
-        kx = chess.square_file(effect.king_sq) * SQUARE_SIZE
-        ky = (7 - chess.square_rank(effect.king_sq)) * SQUARE_SIZE
+        kx, ky = _board_square_local_top_left(effect.king_sq)
         b = 22
         s = SQUARE_SIZE
         if effect.is_mate:
@@ -11721,8 +11731,8 @@ def draw_analysis_board_overlays(screen, board):
             _draw_red_plus(
                 screen,
                 (x + SQUARE_SIZE // 2, y + SQUARE_SIZE // 2),
-                arm=21,
-                thickness=8,
+                arm=10,
+                thickness=4,
             )
 
     if analysis_overlay_enabled.get("unprotected_pieces"):
@@ -11947,7 +11957,7 @@ def _draw_analysis_overlay_toggle_icon(screen, icon, centre):
         else:
             _draw_fallback_pin_icon(screen, (cx, cy), 44)
     elif icon == "plus":
-        _draw_red_plus(screen, (cx, cy), arm=16, thickness=7)
+        _draw_red_plus(screen, (cx, cy), arm=10, thickness=4)
     elif icon == "unprotected":
         image = get_analysis_icon("unprotected", 34)
         if image is not None:
