@@ -1621,8 +1621,8 @@ class CheckEffect:
 
     - Under pieces: soft radial red glow on the king square
     - Over pieces:  pulsing corner brackets + expanding ripple rings
-    - Checkmate extras: faster/more rings, brighter brackets, and a
-      pulsing red border around the entire board.
+    - Checkmate uses slower, softer rings/brackets and only a subtle
+      red border around the entire board.
     """
 
     def __init__(self):
@@ -1644,7 +1644,8 @@ class CheckEffect:
         self.rings.clear()
 
     def pulse(self):
-        return (math.sin(self.time * 5.5) + 1.0) / 2.0
+        speed = 2.4 if self.is_mate else 5.5
+        return (math.sin(self.time * speed) + 1.0) / 2.0
 
     def update(self, is_check, is_mate, king_sq):
         if (is_check or is_mate) and king_sq is not None:
@@ -1654,7 +1655,7 @@ class CheckEffect:
                 self.rings.append(
                     {
                         "progress": 0.0,
-                        "max_radius": SQUARE_SIZE * (2.2 if is_mate else 1.6),
+                        "max_radius": SQUARE_SIZE * (1.7 if is_mate else 1.6),
                     }
                 )
             self.is_mate = is_mate
@@ -1663,25 +1664,27 @@ class CheckEffect:
             self.time += 0.016
 
             self.spawn_timer += 0.016
-            interval = 0.42 if is_mate else 0.75
+            interval = 0.9 if is_mate else 0.75
             if self.spawn_timer >= interval:
                 self.spawn_timer = 0.0
                 self.rings.append(
                     {
                         "progress": 0.0,
-                        "max_radius": SQUARE_SIZE * (2.2 if is_mate else 1.6),
+                        "max_radius": SQUARE_SIZE * (1.7 if is_mate else 1.6),
                     }
                 )
 
+            ring_step = 0.014 if is_mate else 0.022
             for ring in self.rings[:]:
-                ring["progress"] += 0.022
+                ring["progress"] += ring_step
                 if ring["progress"] >= 1.0:
                     self.rings.remove(ring)
         else:
             self.king_sq = None
             if self.active:
+                ring_step = 0.014 if self.is_mate else 0.022
                 for ring in self.rings[:]:
-                    ring["progress"] += 0.022
+                    ring["progress"] += ring_step
                     if ring["progress"] >= 1.0:
                         self.rings.remove(ring)
                 if not self.rings:
@@ -1752,7 +1755,7 @@ def draw_check_effect_under(screen, effect, board_ox, board_oy):
 
     p = effect.pulse()
     if effect.is_mate:
-        base_a = int(110 + 100 * p)
+        base_a = int(82 + 42 * p)
     else:
         base_a = int(70 + 80 * p)
 
@@ -1780,8 +1783,8 @@ def draw_check_effect_over(screen, effect, board_ox, board_oy):
         for ring in effect.rings:
             rp = ring["progress"]
             radius = int(SQUARE_SIZE * 0.35 + rp * ring["max_radius"])
-            ring_a = int(220 * (1 - rp))
-            ring_w = max(1, int((5 if effect.is_mate else 3) * (1 - rp * 0.6)))
+            ring_a = int((145 if effect.is_mate else 220) * (1 - rp))
+            ring_w = max(1, int(3 * (1 - rp * 0.6)))
             rc = (
                 (255, 60, 60, ring_a)
                 if effect.is_mate
@@ -1794,9 +1797,9 @@ def draw_check_effect_over(screen, effect, board_ox, board_oy):
         b = 22
         s = SQUARE_SIZE
         if effect.is_mate:
-            ba = min(255, int(200 + 55 * p))
+            ba = min(255, int(158 + 34 * p))
             bc = (255, 80, 80, ba)
-            w = 3
+            w = 2
         else:
             ba = min(255, int(150 + 60 * p))
             bc = (255, 130, 110, ba)
@@ -1834,13 +1837,13 @@ def draw_check_effect_over(screen, effect, board_ox, board_oy):
     screen.blit(overlay, (board_ox, board_oy))
 
     if effect.is_mate:
-        border_a = int(140 + 90 * p)
+        border_a = int(58 + 26 * p)
         border = _get_check_border_surf()
         pygame.draw.rect(
             border,
             (255, 45, 45, border_a),
             (0, 0, BOARD_WIDTH + 12, BOARD_WIDTH + 12),
-            4,
+            2,
             border_radius=3,
         )
         screen.blit(border, (board_ox - 6, board_oy - 6))
@@ -11434,13 +11437,23 @@ def _relative_pin_squares(board, color, target_square):
 
 
 def _king_can_be_checked_next(board, color):
-    """Whether *color*'s king is in check or can be checked in one move."""
+    """Whether *color*'s king can newly be checked in one move.
+
+    A king that is already in check is deliberately excluded, as is every
+    king in a checkmate position: the Checkable King marker is only an
+    advance warning, not another indicator for the current check/mate.
+    """
     king_square = board.king(color)
     if king_square is None:
         return False
+    try:
+        if board.is_checkmate():
+            return False
+    except Exception:
+        pass
     opponent = not color
     if board.is_attacked_by(opponent, king_square):
-        return True
+        return False
     try:
         trial = board.copy(stack=False)
     except Exception:
@@ -24436,4 +24449,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
