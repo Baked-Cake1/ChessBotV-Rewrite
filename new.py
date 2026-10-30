@@ -22967,11 +22967,17 @@ def draw_gui(
         anim_mgr.current_eval,
         mate,
     )
-    # Click hint when hovered. Centre it on the narrow eval bar, but clamp
-    # the whole tooltip inside the window: previously the text was centred
-    # on a 32px-wide bar at either edge, so roughly half of it was clipped
-    # off-screen. A small pointer still indicates which bar it belongs to.
-    if get_eval_bar_rect().collidepoint(mouse_pos):
+    # Click hint when hovered, except while the Settings shell is visible
+    # or animating over the board. Centre it on the narrow eval bar, but
+    # clamp the whole tooltip inside the window: previously the text was
+    # centred on a 32px-wide bar at either edge, so roughly half of it was
+    # clipped off-screen. A small pointer still indicates the bar it owns.
+    if (
+        menu_anim_progress == 0
+        and not menu_anim_opening
+        and not menu_anim_closing
+        and get_eval_bar_rect().collidepoint(mouse_pos)
+    ):
         hint = font_tiny.render("Click to swap side", True, TEXT_COLOR)
         tip_w = hint.get_width() + 18
         tip_h = 24
