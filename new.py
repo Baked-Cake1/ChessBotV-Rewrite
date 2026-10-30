@@ -36,6 +36,8 @@ WIDTH = PADDING + EVAL_BAR_WIDTH + EVAL_BAR_GAP + BOARD_WIDTH + PADDING
 HEIGHT = TOP_BAR_HEIGHT + PADDING + BOARD_WIDTH + INFO_HEIGHT
 
 FPS = 60
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ANALYSIS_ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 
 # Colors
 WHITE = (255, 255, 255)
@@ -296,7 +298,19 @@ MAX_THREADS = max(1, os.cpu_count() or 1)
 RESTART_EXIT_CODE = 42
 
 # --- Loaders ---
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "use_package": 0}
+ANALYSIS_OVERLAY_KEYS = (
+    "pinned_pieces",
+    "checkable_king",
+    "unprotected_pieces",
+    "piece_mobility",
+    "backwards_pawn",
+    "isolated_pawn",
+    "passed_pawn",
+)
+ANALYSIS_OVERLAY_CONFIG_KEYS = {
+    key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
+}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "use_package": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
 _STRING_CONFIG_KEYS = ("theme", "board_theme", "auto_move_color")
 
 
@@ -324,6 +338,8 @@ def _clamp_config_limits(cfg):
     cfg["auto_move_color"] = color if color in ("white", "black", "both") else "both"
     cfg["always_on_top"] = 1 if cfg.get("always_on_top", 1) else 0
     cfg["use_package"] = 1 if cfg.get("use_package", 0) else 0
+    for config_key in ANALYSIS_OVERLAY_CONFIG_KEYS.values():
+        cfg[config_key] = 1 if cfg.get(config_key, 0) else 0
     # Auto-Move's on/off state is deliberately session-only. Even if an
     # older configuration file still contains ``auto_move=1``, startup must
     # ignore it and leave the feature off until the user enables it again.
@@ -396,6 +412,8 @@ def save_config():
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
             f.write(f"autoplay_depth={int(config.get('autoplay_depth', 20))}\n")
             f.write(f"use_package={1 if config.get('use_package', 0) else 0}\n")
+            for config_key in ANALYSIS_OVERLAY_CONFIG_KEYS.values():
+                f.write(f"{config_key}={1 if config.get(config_key, 0) else 0}\n")
     except OSError as e:
         print(f"Failed to save configuration: {e}")
 
@@ -414,10 +432,12 @@ auto_move_depth = 0  # 0 means "use the configured Depth Limit"
 auto_move_arm_reset = False  # main() consumes this to re-arm Auto-Move
 auto_move_status_text = ""  # human-readable arming state for the Analysis page
 use_package_enabled = False  # chess-fen-detector instead of chessbotv_cnn.pth
+analysis_overlay_enabled = {key: False for key in ANALYSIS_OVERLAY_KEYS}
+analysis_overlay_scroll_offset = 0.0
 show_auto_color_dialog = False
 auto_color_dialog_anim = 0.0
 
-# --- Board Detection (Analysis page) ---
+# --- Board Detection (Auto-Play Settings page) ---
 show_board_detection_dialog = False
 board_detection_dialog_anim = 0.0
 board_detection_windows = []
@@ -636,6 +656,19 @@ def set_use_package(enabled, persist=True):
     backend = "chess-fen-detector package" if use_package_enabled else "built-in CNN"
     print(f"Board vision backend for the next detection/scan: {backend}.")
     return use_package_enabled
+
+
+def set_analysis_overlay_enabled(key, enabled, persist=True):
+    """Set and optionally save one Analysis Settings board overlay."""
+    if key not in ANALYSIS_OVERLAY_CONFIG_KEYS:
+        raise KeyError(f"Unknown Analysis overlay: {key!r}")
+    analysis_overlay_enabled[key] = bool(enabled)
+    config[ANALYSIS_OVERLAY_CONFIG_KEYS[key]] = (
+        1 if analysis_overlay_enabled[key] else 0
+    )
+    if persist:
+        save_config()
+    return analysis_overlay_enabled[key]
 
 
 def get_autoplay_depth():
@@ -885,6 +918,10 @@ try:
 except Exception:
     autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
 use_package_enabled = bool(config.get("use_package", 0))
+analysis_overlay_enabled = {
+    key: bool(config.get(ANALYSIS_OVERLAY_CONFIG_KEYS[key], 0))
+    for key in ANALYSIS_OVERLAY_KEYS
+}
 
 # Pieces Style menu layout & scrolling — two columns of visual style cards
 # below a larger live preview. Cards are tall enough to show sample pieces,
@@ -901,7 +938,7 @@ theme_scroll_offset = 0.0
 theme_scroll_speed = 70.0
 
 # Settings menu state — pages form a small hierarchy:
-#   main -> engine_settings / analysis
+#   main -> engine_settings / analysis / autoplay_settings
 #   main -> board -> pieces_style / board_themes
 settings_menu_state = "main"
 settings_menu_target = "pieces_style"
@@ -915,12 +952,14 @@ SETTINGS_PAGE_TITLES = {
     "pieces_style": "Pieces Styles",
     "board_themes": "Board Themes",
     "engine_settings": "Engine Settings",
-    "analysis": "Analysis",
+    "analysis": "Analysis Settings",
+    "autoplay_settings": "Auto-Play Settings",
 }
 SETTINGS_PAGE_PARENT = {
     "main": None,
     "engine_settings": "main",
     "analysis": "main",
+    "autoplay_settings": "main",
     "board": "main",
     "pieces_style": "board",
     "board_themes": "board",
@@ -930,7 +969,14 @@ SETTINGS_MAIN_ITEMS = [
     "Board",
     "Game Controls",
     "Analysis Settings",
+    "Auto-Play Settings",
 ]
+
+
+def _settings_main_start_y(item_count, item_height=50, item_gap=20):
+    """Top of the main Settings rows, leaving room for About below them."""
+    total_height = item_count * item_height + max(0, item_count - 1) * item_gap
+    return max(180, (HEIGHT - total_height) // 2 - 35)
 # Toggle knob animation (0 = off, 1 = on)
 always_on_top_anim = 1.0 if always_on_top_enabled else 0.0
 # Visual-only polish state for the Always on Top row. The enabled flag and
@@ -941,6 +987,10 @@ auto_move_anim = 1.0 if auto_move_enabled else 0.0
 autoplay_anim = 0.0
 advisor_anim = 0.0
 use_package_anim = 1.0 if use_package_enabled else 0.0
+analysis_overlay_anims = {
+    key: (1.0 if analysis_overlay_enabled[key] else 0.0)
+    for key in ANALYSIS_OVERLAY_KEYS
+}
 # Smoothed depth progress-bar fill (0..1 of the target depth)
 depth_bar_fraction = 0.0
 # One-shot opening animation for the in-window title. It advances once per
@@ -1087,11 +1137,11 @@ engine_save_button_pulse_phase = 0.0
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
 board_button_pulse_phase = 0.0
-# Settings main-menu Analysis Settings button polish. Its phase drives the
+# Settings main-menu Auto-Play Settings button polish. Its phase drives the
 # scope sweep/status glints only; Auto-Move, detection and Auto-play state
 # remains owned by their existing runtime variables.
-analysis_settings_button_hover_amount = 0.0
-analysis_settings_button_pulse_phase = 0.0
+autoplay_settings_button_hover_amount = 0.0
+autoplay_settings_button_pulse_phase = 0.0
 
 menu_anim_progress = 0.0
 menu_anim_opening = False
@@ -1243,6 +1293,12 @@ def update_global_anims():
         cur = globals()[name]
         target = 1.0 if on else 0.0
         globals()[name] = target if abs(cur - target) < 0.02 else cur + (target - cur) * 0.25
+    for key in ANALYSIS_OVERLAY_KEYS:
+        cur = analysis_overlay_anims.get(key, 0.0)
+        target = 1.0 if analysis_overlay_enabled.get(key, False) else 0.0
+        analysis_overlay_anims[key] = (
+            target if abs(cur - target) < 0.02 else cur + (target - cur) * 0.25
+        )
 
 # --- Math & Animations ---
 def cubic_ease_in(t):
@@ -11186,6 +11242,881 @@ def draw_toggle_row(screen, rect, label, subtitle, on, anim, hovered):
     return pill
 
 
+# --- Analysis Settings board overlays ---
+_analysis_mobility_font = pygame.font.SysFont("segoeui", 11, bold=True)
+_analysis_icon_cache = {}
+_analysis_overlay_cache_key = None
+_analysis_overlay_cache_data = None
+
+ANALYSIS_MOBILITY_GREEN = (64, 190, 95)
+ANALYSIS_MOBILITY_ORANGE = (240, 150, 45)
+ANALYSIS_MOBILITY_RED = (225, 65, 55)
+
+
+def _chroma_key_white_surface(surface):
+    """Return *surface* with white / near-white pixels made transparent."""
+    try:
+        keyed = surface.convert_alpha()
+    except Exception:
+        keyed = surface.copy()
+    try:
+        with pygame.PixelArray(keyed) as pixels:
+            pixels.replace(
+                (255, 255, 255),
+                (255, 255, 255, 0),
+                distance=0.04,
+            )
+    except Exception:
+        pass
+    try:
+        keyed.set_colorkey((255, 255, 255), pygame.RLEACCEL)
+    except Exception:
+        pass
+    return keyed
+
+
+def get_analysis_icon(name, size):
+    """Load ``icons/<name>.png`` beside this script, white-keyed and cached.
+
+    ``size`` is the largest width/height of the returned image. A missing or
+    unreadable file returns ``None`` so callers can draw a simple fallback;
+    the app therefore still works before the personal icon files are added.
+    """
+    size = max(1, int(size))
+    safe_name = os.path.basename(str(name)).lower().removesuffix(".png")
+    path = os.path.join(ANALYSIS_ICON_DIR, f"{safe_name}.png")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    cache_key = (safe_name, size, path, mtime)
+    if cache_key in _analysis_icon_cache:
+        return _analysis_icon_cache[cache_key]
+
+    icon = None
+    if mtime is not None:
+        try:
+            loaded = pygame.image.load(path)
+            keyed = _chroma_key_white_surface(loaded)
+            width, height = keyed.get_size()
+            if width > 0 and height > 0:
+                scale = min(size / width, size / height)
+                scaled_size = (
+                    max(1, int(round(width * scale))),
+                    max(1, int(round(height * scale))),
+                )
+                icon = (
+                    keyed
+                    if scaled_size == keyed.get_size()
+                    else pygame.transform.smoothscale(keyed, scaled_size)
+                )
+        except Exception as exc:
+            print(f"Analysis icon could not be loaded ({path}): {exc}")
+            icon = None
+    _analysis_icon_cache[cache_key] = icon
+    return icon
+
+
+def _draw_fallback_pin_icon(surface, centre, size):
+    """Simple pushpin used until ``icons/pinned.png`` is supplied."""
+    cx, cy = int(centre[0]), int(centre[1])
+    size = max(12, int(size))
+    radius = max(5, size // 4)
+    head = (cx, cy - size // 7)
+    point = (cx, cy + size // 3)
+    pygame.draw.line(surface, (35, 28, 24), head, point, 5)
+    pygame.draw.line(surface, (240, 196, 96), head, point, 2)
+    pygame.draw.circle(surface, (35, 28, 24), head, radius + 2)
+    pygame.draw.circle(surface, (214, 57, 51), head, radius)
+    pygame.draw.circle(
+        surface,
+        (255, 188, 170),
+        (head[0] - max(1, radius // 3), head[1] - max(1, radius // 3)),
+        max(1, radius // 4),
+    )
+
+
+def _draw_fallback_unprotected_icon(surface, centre, size):
+    """Small broken-shield fallback for ``icons/unprotected.png``."""
+    cx, cy = int(centre[0]), int(centre[1])
+    half = max(5, int(size) // 2)
+    points = [
+        (cx, cy - half),
+        (cx + half, cy - half // 2),
+        (cx + int(half * 0.72), cy + half // 2),
+        (cx, cy + half),
+        (cx - int(half * 0.72), cy + half // 2),
+        (cx - half, cy - half // 2),
+    ]
+    pygame.draw.polygon(surface, (45, 32, 26), [(x, y + 1) for x, y in points])
+    pygame.draw.polygon(surface, (240, 150, 45), points)
+    pygame.draw.polygon(surface, (255, 235, 210), points, 1)
+    pygame.draw.line(
+        surface,
+        (180, 35, 35),
+        (cx - half + 2, cy + half - 2),
+        (cx + half - 2, cy - half + 2),
+        2,
+    )
+
+
+def _draw_red_plus(surface, centre, arm=16, thickness=7):
+    """Draw the red addition-sign marker used for a checkable king."""
+    cx, cy = int(centre[0]), int(centre[1])
+    arm = max(5, int(arm))
+    thickness = max(2, int(thickness))
+    for colour, offset in (((90, 18, 18), 1), ((232, 45, 42), 0)):
+        pygame.draw.line(
+            surface,
+            colour,
+            (cx - arm, cy + offset),
+            (cx + arm, cy + offset),
+            thickness,
+        )
+        pygame.draw.line(
+            surface,
+            colour,
+            (cx, cy - arm + offset),
+            (cx, cy + arm + offset),
+            thickness,
+        )
+
+
+def _relative_pin_squares(board, color, target_square):
+    """Friendly non-king pieces shielding *target_square* from a slider."""
+    pinned = set()
+    target_file = chess.square_file(target_square)
+    target_rank = chess.square_rank(target_square)
+    for file_step, rank_step in (
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+    ):
+        shield_square = None
+        file_index = target_file + file_step
+        rank_index = target_rank + rank_step
+        while 0 <= file_index < 8 and 0 <= rank_index < 8:
+            square = chess.square(file_index, rank_index)
+            piece = board.piece_at(square)
+            if piece is not None:
+                if shield_square is None:
+                    if piece.color != color or piece.piece_type == chess.KING:
+                        break
+                    shield_square = square
+                else:
+                    diagonal = file_step and rank_step
+                    attacks_along_ray = piece.piece_type == chess.QUEEN or (
+                        piece.piece_type == chess.BISHOP
+                        if diagonal
+                        else piece.piece_type == chess.ROOK
+                    )
+                    if piece.color != color and attacks_along_ray:
+                        pinned.add(shield_square)
+                    break
+            file_index += file_step
+            rank_index += rank_step
+    return pinned
+
+
+def _king_can_be_checked_next(board, color):
+    """Whether *color*'s king is in check or can be checked in one move."""
+    king_square = board.king(color)
+    if king_square is None:
+        return False
+    opponent = not color
+    if board.is_attacked_by(opponent, king_square):
+        return True
+    try:
+        trial = board.copy(stack=False)
+    except Exception:
+        trial = board.copy()
+    trial.turn = opponent
+    if board.turn != opponent:
+        trial.ep_square = None
+    try:
+        return any(trial.gives_check(move) for move in trial.legal_moves)
+    except Exception:
+        return False
+
+
+def _legal_destinations_by_square(board):
+    """Legal destination squares for every piece, for either side to move."""
+    destinations = {square: set() for square in board.piece_map()}
+    for color in (chess.WHITE, chess.BLACK):
+        try:
+            trial = board.copy(stack=False)
+        except Exception:
+            trial = board.copy()
+        trial.turn = color
+        if board.turn != color:
+            trial.ep_square = None
+        try:
+            moves = list(trial.legal_moves)
+        except Exception:
+            continue
+        for move in moves:
+            if move.from_square in destinations:
+                destinations[move.from_square].add(move.to_square)
+    return destinations
+
+
+def _empty_board_mobility_max(piece, square):
+    """Distinct destination squares for *piece* alone on an empty board."""
+    file_index = chess.square_file(square)
+    rank_index = chess.square_rank(square)
+
+    def inside(file_value, rank_value):
+        return 0 <= file_value < 8 and 0 <= rank_value < 8
+
+    if piece.piece_type == chess.PAWN:
+        direction = 1 if piece.color == chess.WHITE else -1
+        destinations = set()
+        if inside(file_index, rank_index + direction):
+            destinations.add((file_index, rank_index + direction))
+            start_rank = 1 if piece.color == chess.WHITE else 6
+            if rank_index == start_rank:
+                destinations.add((file_index, rank_index + 2 * direction))
+            for capture_file in (file_index - 1, file_index + 1):
+                if inside(capture_file, rank_index + direction):
+                    destinations.add((capture_file, rank_index + direction))
+        return len(destinations)
+
+    if piece.piece_type in (chess.KNIGHT, chess.KING):
+        offsets = (
+            ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2))
+            if piece.piece_type == chess.KNIGHT
+            else ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))
+        )
+        return sum(
+            1
+            for file_step, rank_step in offsets
+            if inside(file_index + file_step, rank_index + rank_step)
+        )
+
+    directions = []
+    if piece.piece_type in (chess.ROOK, chess.QUEEN):
+        directions.extend(((1, 0), (-1, 0), (0, 1), (0, -1)))
+    if piece.piece_type in (chess.BISHOP, chess.QUEEN):
+        directions.extend(((1, 1), (1, -1), (-1, 1), (-1, -1)))
+    total = 0
+    for file_step, rank_step in directions:
+        next_file = file_index + file_step
+        next_rank = rank_index + rank_step
+        while inside(next_file, next_rank):
+            total += 1
+            next_file += file_step
+            next_rank += rank_step
+    return total
+
+
+def _attacked_by_pawn(board, color, square):
+    return any(
+        (piece := board.piece_at(attacker)) is not None
+        and piece.piece_type == chess.PAWN
+        for attacker in board.attackers(color, square)
+    )
+
+
+def _pawn_is_backwards(board, square, piece):
+    file_index = chess.square_file(square)
+    rank_index = chess.square_rank(square)
+    direction = 1 if piece.color == chess.WHITE else -1
+    stop_rank = rank_index + direction
+    if not 0 <= stop_rank < 8:
+        return False
+    stop_square = chess.square(file_index, stop_rank)
+    if not _attacked_by_pawn(board, not piece.color, stop_square):
+        return False
+    if _attacked_by_pawn(board, piece.color, stop_square):
+        return False
+    neighbouring = [
+        other_square
+        for other_square in board.pieces(chess.PAWN, piece.color)
+        if abs(chess.square_file(other_square) - file_index) == 1
+    ]
+    if not neighbouring:
+        return False
+    if piece.color == chess.WHITE:
+        return all(
+            chess.square_rank(other_square) > rank_index
+            for other_square in neighbouring
+        )
+    return all(
+        chess.square_rank(other_square) < rank_index
+        for other_square in neighbouring
+    )
+
+
+def _pawn_is_isolated(board, square, piece, legal_destinations):
+    file_index = chess.square_file(square)
+    has_neighbouring_pawn = any(
+        abs(chess.square_file(other_square) - file_index) == 1
+        for other_square in board.pieces(chess.PAWN, piece.color)
+    )
+    return not has_neighbouring_pawn or not legal_destinations.get(square)
+
+
+def _pawn_is_passed_close(board, square, piece):
+    file_index = chess.square_file(square)
+    rank_index = chess.square_rank(square)
+    if piece.color == chess.WHITE:
+        if rank_index < 4:
+            return False
+    elif rank_index > 3:
+        return False
+    for enemy_square in board.pieces(chess.PAWN, not piece.color):
+        if abs(chess.square_file(enemy_square) - file_index) > 1:
+            continue
+        enemy_rank = chess.square_rank(enemy_square)
+        if piece.color == chess.WHITE and enemy_rank > rank_index:
+            return False
+        if piece.color == chess.BLACK and enemy_rank < rank_index:
+            return False
+    return True
+
+
+def compute_analysis_overlay_data(board):
+    """Compute the enabled Analysis Settings annotations for *board*."""
+    data = {
+        "pinned_pieces": set(),
+        "checkable_kings": set(),
+        "unprotected_pieces": set(),
+        "piece_mobility": {},
+        "backwards_pawns": set(),
+        "isolated_pawns": set(),
+        "passed_pawns": set(),
+    }
+    if board is None:
+        return data
+    enabled = {
+        key: bool(analysis_overlay_enabled.get(key, False))
+        for key in ANALYSIS_OVERLAY_KEYS
+    }
+    piece_map = board.piece_map()
+
+    if enabled["pinned_pieces"]:
+        for square, piece in piece_map.items():
+            if piece.piece_type == chess.KING:
+                continue
+            try:
+                if board.is_pinned(piece.color, square):
+                    data["pinned_pieces"].add(square)
+            except Exception:
+                pass
+        for color in (chess.WHITE, chess.BLACK):
+            for queen_square in board.pieces(chess.QUEEN, color):
+                data["pinned_pieces"].update(
+                    _relative_pin_squares(board, color, queen_square)
+                )
+
+    if enabled["checkable_king"]:
+        for color in (chess.WHITE, chess.BLACK):
+            king_square = board.king(color)
+            if king_square is not None and _king_can_be_checked_next(board, color):
+                data["checkable_kings"].add(king_square)
+
+    if enabled["unprotected_pieces"]:
+        for square, piece in piece_map.items():
+            if piece.piece_type == chess.KING:
+                continue
+            if not board.is_attacked_by(piece.color, square):
+                data["unprotected_pieces"].add(square)
+
+    needs_legal_destinations = (
+        enabled["piece_mobility"] or enabled["isolated_pawn"]
+    )
+    legal_destinations = (
+        _legal_destinations_by_square(board)
+        if needs_legal_destinations
+        else {}
+    )
+    if enabled["piece_mobility"]:
+        for square, piece in piece_map.items():
+            maximum = _empty_board_mobility_max(piece, square)
+            if maximum <= 0:
+                continue
+            available = len(legal_destinations.get(square, ()))
+            data["piece_mobility"][square] = min(
+                100, int(round(100.0 * available / maximum))
+            )
+
+    if (
+        enabled["backwards_pawn"]
+        or enabled["isolated_pawn"]
+        or enabled["passed_pawn"]
+    ):
+        for square, piece in piece_map.items():
+            if piece.piece_type != chess.PAWN:
+                continue
+            if enabled["backwards_pawn"] and _pawn_is_backwards(
+                board, square, piece
+            ):
+                data["backwards_pawns"].add(square)
+            if enabled["isolated_pawn"] and _pawn_is_isolated(
+                board, square, piece, legal_destinations
+            ):
+                data["isolated_pawns"].add(square)
+            if enabled["passed_pawn"] and _pawn_is_passed_close(
+                board, square, piece
+            ):
+                data["passed_pawns"].add(square)
+    return data
+
+
+def get_analysis_overlay_data(board):
+    """Cached overlay data; recomputed only for a new position/toggles."""
+    global _analysis_overlay_cache_key, _analysis_overlay_cache_data
+    if board is None:
+        return compute_analysis_overlay_data(board)
+    try:
+        position_key = board.fen()
+    except Exception:
+        position_key = None
+    enabled_key = tuple(
+        bool(analysis_overlay_enabled.get(key, False))
+        for key in ANALYSIS_OVERLAY_KEYS
+    )
+    cache_key = (position_key, enabled_key)
+    if cache_key != _analysis_overlay_cache_key:
+        _analysis_overlay_cache_data = compute_analysis_overlay_data(board)
+        _analysis_overlay_cache_key = cache_key
+    return _analysis_overlay_cache_data
+
+
+def _mobility_colour(percent):
+    if percent >= 75:
+        return ANALYSIS_MOBILITY_GREEN
+    if percent >= 25:
+        return ANALYSIS_MOBILITY_ORANGE
+    return ANALYSIS_MOBILITY_RED
+
+
+def draw_analysis_board_overlays(screen, board):
+    """Draw every enabled Analysis Settings marker over the board pieces."""
+    if board is None or not any(
+        analysis_overlay_enabled.get(key, False)
+        for key in ANALYSIS_OVERLAY_KEYS
+    ):
+        return
+    data = get_analysis_overlay_data(board)
+
+    if analysis_overlay_enabled.get("pinned_pieces"):
+        icon = get_analysis_icon("pinned", 44)
+        for square in sorted(data["pinned_pieces"]):
+            x, y = square_to_screen(square)
+            centre = (x + SQUARE_SIZE // 2, y + SQUARE_SIZE // 2)
+            if icon is not None:
+                screen.blit(icon, icon.get_rect(center=centre))
+            else:
+                _draw_fallback_pin_icon(screen, centre, 44)
+
+    if analysis_overlay_enabled.get("checkable_king"):
+        for square in sorted(data["checkable_kings"]):
+            x, y = square_to_screen(square)
+            _draw_red_plus(
+                screen,
+                (x + SQUARE_SIZE // 2, y + SQUARE_SIZE // 2),
+                arm=21,
+                thickness=8,
+            )
+
+    if analysis_overlay_enabled.get("unprotected_pieces"):
+        icon = get_analysis_icon("unprotected", 22)
+        for square in sorted(data["unprotected_pieces"]):
+            x, y = square_to_screen(square)
+            if icon is not None:
+                rect = icon.get_rect()
+                rect.topright = (x + SQUARE_SIZE - 4, y + 4)
+                screen.blit(icon, rect)
+            else:
+                _draw_fallback_unprotected_icon(
+                    screen, (x + SQUARE_SIZE - 13, y + 13), 22
+                )
+
+    if analysis_overlay_enabled.get("piece_mobility"):
+        for square, percent in sorted(data["piece_mobility"].items()):
+            if percent <= 0:
+                continue
+            x, y = square_to_screen(square)
+            centre = (x + 15, y + SQUARE_SIZE - 15)
+            colour = _mobility_colour(percent)
+            pygame.draw.circle(screen, (24, 28, 34), (centre[0], centre[1] + 1), 13)
+            pygame.draw.circle(screen, colour, centre, 12)
+            pygame.draw.circle(screen, (245, 250, 252), centre, 12, 1)
+            label = str(int(percent))
+            text = _analysis_mobility_font.render(label, True, (255, 255, 255))
+            shadow = _analysis_mobility_font.render(label, True, (25, 30, 36))
+            text_rect = text.get_rect(center=centre)
+            screen.blit(shadow, text_rect.move(0, 1))
+            screen.blit(text, text_rect)
+
+    pawn_markers = {}
+    marker_specs = (
+        ("backwards_pawn", "backwards_pawns", ANALYSIS_MOBILITY_RED),
+        ("isolated_pawn", "isolated_pawns", ANALYSIS_MOBILITY_ORANGE),
+        ("passed_pawn", "passed_pawns", ANALYSIS_MOBILITY_GREEN),
+    )
+    for enabled_key, data_key, colour in marker_specs:
+        if not analysis_overlay_enabled.get(enabled_key):
+            continue
+        for square in data[data_key]:
+            pawn_markers.setdefault(square, []).append(colour)
+    for square, colours in pawn_markers.items():
+        x, y = square_to_screen(square)
+        centre_y = y + SQUARE_SIZE - 11
+        rightmost_x = x + SQUARE_SIZE - 11
+        for index, colour in enumerate(colours):
+            centre = (rightmost_x - index * 13, centre_y)
+            pygame.draw.circle(screen, (24, 28, 34), (centre[0], centre[1] + 1), 6)
+            pygame.draw.circle(screen, colour, centre, 5)
+            pygame.draw.circle(screen, (245, 250, 252), centre, 5, 1)
+
+
+# The new Analysis page deliberately uses very large rows and scrolling
+# instead of reducing seven separate board overlays to cramped controls.
+ANALYSIS_OVERLAY_ROW_WIDTH = 600
+ANALYSIS_OVERLAY_ROW_HEIGHT = 112
+ANALYSIS_OVERLAY_ROW_GAP = 18
+ANALYSIS_OVERLAY_HEADER_HEIGHT = 52
+ANALYSIS_OVERLAY_SECTION_GAP = 26
+ANALYSIS_OVERLAY_SCROLL_SPEED = 96.0
+ANALYSIS_OVERLAY_SECTIONS = (
+    (
+        "Key Elements",
+        (
+            (
+                "pinned_pieces",
+                "Pinned Pieces",
+                "Pin symbol on a piece shielding its king or queen",
+                "pinned",
+            ),
+            (
+                "checkable_king",
+                "Checkable King",
+                "Red plus when a king can be checked next move",
+                "plus",
+            ),
+            (
+                "unprotected_pieces",
+                "Unprotected Pieces",
+                "Small top-right marker on undefended pieces",
+                "unprotected",
+            ),
+            (
+                "piece_mobility",
+                "Piece Mobility",
+                "Legal-move percentage at each piece's lower-left",
+                "percent",
+            ),
+        ),
+    ),
+    (
+        "Passed Pawns",
+        (
+            (
+                "backwards_pawn",
+                "Backwards Pawn",
+                "Red lower-right dot on backwards pawns",
+                "backwards_dot",
+            ),
+            (
+                "isolated_pawn",
+                "Isolated Pawn",
+                "Orange lower-right dot on isolated or blocked pawns",
+                "isolated_dot",
+            ),
+            (
+                "passed_pawn",
+                "Passed Pawn",
+                "Green lower-right dot on advanced passed pawns",
+                "passed_dot",
+            ),
+        ),
+    ),
+)
+
+
+def _analysis_overlay_layout(offset_x=0, offset_y=0):
+    """Shared draw/click/scroll geometry for the large Analysis rows."""
+    global analysis_overlay_scroll_offset
+    viewport = pygame.Rect(
+        22 + offset_x,
+        92 + offset_y,
+        WIDTH - 44,
+        HEIGHT - 114,
+    )
+    row_x = (WIDTH - ANALYSIS_OVERLAY_ROW_WIDTH) // 2 + offset_x
+
+    total_height = 6
+    for section_index, (_title, items) in enumerate(ANALYSIS_OVERLAY_SECTIONS):
+        total_height += ANALYSIS_OVERLAY_HEADER_HEIGHT
+        total_height += len(items) * ANALYSIS_OVERLAY_ROW_HEIGHT
+        total_height += max(0, len(items) - 1) * ANALYSIS_OVERLAY_ROW_GAP
+        total_height += (
+            ANALYSIS_OVERLAY_SECTION_GAP
+            if section_index < len(ANALYSIS_OVERLAY_SECTIONS) - 1
+            else 12
+        )
+    max_scroll = max(0, total_height - viewport.height)
+    try:
+        scroll = float(analysis_overlay_scroll_offset)
+    except Exception:
+        scroll = 0.0
+    scroll = max(0.0, min(scroll, float(max_scroll)))
+    analysis_overlay_scroll_offset = scroll
+
+    sections = []
+    cursor_y = viewport.y - int(round(scroll)) + 6
+    for section_index, (title, items) in enumerate(ANALYSIS_OVERLAY_SECTIONS):
+        header_rect = pygame.Rect(
+            row_x,
+            cursor_y,
+            ANALYSIS_OVERLAY_ROW_WIDTH,
+            ANALYSIS_OVERLAY_HEADER_HEIGHT,
+        )
+        cursor_y += ANALYSIS_OVERLAY_HEADER_HEIGHT
+        item_layout = []
+        for item_index, (key, label, description, icon) in enumerate(items):
+            rect = pygame.Rect(
+                row_x,
+                cursor_y,
+                ANALYSIS_OVERLAY_ROW_WIDTH,
+                ANALYSIS_OVERLAY_ROW_HEIGHT,
+            )
+            item_layout.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "description": description,
+                    "icon": icon,
+                    "rect": rect,
+                }
+            )
+            cursor_y += ANALYSIS_OVERLAY_ROW_HEIGHT
+            if item_index < len(items) - 1:
+                cursor_y += ANALYSIS_OVERLAY_ROW_GAP
+        sections.append(
+            {
+                "title": title,
+                "header_rect": header_rect,
+                "items": item_layout,
+            }
+        )
+        cursor_y += (
+            ANALYSIS_OVERLAY_SECTION_GAP
+            if section_index < len(ANALYSIS_OVERLAY_SECTIONS) - 1
+            else 12
+        )
+    return viewport, sections, total_height, max_scroll, scroll
+
+
+def _analysis_overlay_item_at(pos):
+    viewport, sections, _total, _max_scroll, _scroll = _analysis_overlay_layout()
+    if not viewport.collidepoint(pos):
+        return None
+    for section in sections:
+        for item in section["items"]:
+            if item["rect"].collidepoint(pos):
+                return item["key"]
+    return None
+
+
+def scroll_analysis_overlay(delta):
+    """Move the Analysis page scroll offset, clamped to its content."""
+    global analysis_overlay_scroll_offset
+    _viewport, _sections, _total, max_scroll, scroll = _analysis_overlay_layout()
+    try:
+        delta = float(delta)
+    except Exception:
+        delta = 0.0
+    analysis_overlay_scroll_offset = max(0.0, min(float(max_scroll), scroll + delta))
+    return analysis_overlay_scroll_offset
+
+
+def _draw_analysis_overlay_toggle_icon(screen, icon, centre):
+    cx, cy = int(centre[0]), int(centre[1])
+    if icon == "pinned":
+        image = get_analysis_icon("pinned", 44)
+        if image is not None:
+            screen.blit(image, image.get_rect(center=(cx, cy)))
+        else:
+            _draw_fallback_pin_icon(screen, (cx, cy), 44)
+    elif icon == "plus":
+        _draw_red_plus(screen, (cx, cy), arm=16, thickness=7)
+    elif icon == "unprotected":
+        image = get_analysis_icon("unprotected", 34)
+        if image is not None:
+            screen.blit(image, image.get_rect(center=(cx, cy)))
+        else:
+            _draw_fallback_unprotected_icon(screen, (cx, cy), 34)
+    elif icon == "percent":
+        text = font_large.render("%", True, (64, 165, 245))
+        shadow = font_large.render("%", True, (18, 34, 54))
+        rect = text.get_rect(center=(cx, cy))
+        screen.blit(shadow, rect.move(0, 1))
+        screen.blit(text, rect)
+    else:
+        colour = {
+            "backwards_dot": ANALYSIS_MOBILITY_RED,
+            "isolated_dot": ANALYSIS_MOBILITY_ORANGE,
+            "passed_dot": ANALYSIS_MOBILITY_GREEN,
+        }.get(icon, TEXT_MUTED)
+        pygame.draw.circle(screen, (24, 28, 34), (cx, cy + 1), 12)
+        pygame.draw.circle(screen, colour, (cx, cy), 11)
+        pygame.draw.circle(screen, (245, 250, 252), (cx, cy), 11, 1)
+
+
+def _draw_analysis_overlay_toggle_row(screen, item, hovered):
+    """One intentionally large, simple Analysis Settings toggle row."""
+    rect = item["rect"]
+    key = item["key"]
+    enabled = bool(analysis_overlay_enabled.get(key, False))
+    anim = analysis_overlay_anims.get(key, 1.0 if enabled else 0.0)
+
+    background = (72, 72, 102) if hovered else (56, 58, 68)
+    border = (150, 170, 255) if hovered else MENU_BORDER_COLOR
+    pygame.draw.rect(screen, background, rect, border_radius=16)
+    pygame.draw.rect(screen, border, rect, 2, border_radius=16)
+
+    _draw_analysis_overlay_toggle_icon(
+        screen, item["icon"], (rect.x + 43, rect.centery)
+    )
+
+    text_x = rect.x + 82
+    title = font_large.render(item["label"], True, TEXT_COLOR)
+    screen.blit(title, (text_x, rect.y + 20))
+    description = _elide_text(
+        item["description"], font_tiny, rect.width - 250
+    )
+    subtitle = font_tiny.render(description, True, TEXT_MUTED)
+    screen.blit(subtitle, (text_x, rect.y + 62))
+
+    pill_width, pill_height = 84, 40
+    pill = pygame.Rect(
+        rect.right - 22 - pill_width,
+        rect.centery - pill_height // 2,
+        pill_width,
+        pill_height,
+    )
+    eased = cubic_ease_in_out(max(0.0, min(1.0, anim)))
+    off_colour = (95, 95, 105)
+    on_colour = (72, 175, 105)
+    pill_colour = tuple(
+        int(off_colour[index] + (on_colour[index] - off_colour[index]) * eased)
+        for index in range(3)
+    )
+    pygame.draw.rect(screen, pill_colour, pill, border_radius=pill_height // 2)
+    pygame.draw.rect(screen, (35, 35, 40), pill, 1, border_radius=pill_height // 2)
+    knob_radius = 15
+    knob_x = int(
+        pill.x
+        + 5
+        + knob_radius
+        + eased * (pill_width - 10 - knob_radius * 2)
+    )
+    pygame.draw.circle(
+        screen, (235, 235, 240), (knob_x, pill.centery), knob_radius
+    )
+    try:
+        pygame.gfxdraw.aacircle(
+            screen, knob_x, pill.centery, knob_radius, (235, 235, 240)
+        )
+    except Exception:
+        pass
+
+    state = font_small.render(
+        "On" if enabled else "Off",
+        True,
+        (140, 230, 160) if enabled else TEXT_MUTED,
+    )
+    screen.blit(
+        state,
+        (
+            pill.x - state.get_width() - 12,
+            rect.centery - state.get_height() // 2,
+        ),
+    )
+    return pill
+
+
+def draw_analysis_content(screen, offset_x=0, offset_y=0):
+    """Draw the scrollable Analysis Settings page and its two sections."""
+    mx, my = pygame.mouse.get_pos()
+    idle = menu_transition_direction == "none"
+    viewport, sections, total_height, max_scroll, scroll = (
+        _analysis_overlay_layout(offset_x, offset_y)
+    )
+
+    previous_clip = screen.get_clip()
+    screen.set_clip(viewport)
+    try:
+        for section in sections:
+            header_rect = section["header_rect"]
+            if header_rect.bottom >= viewport.y and header_rect.y <= viewport.bottom:
+                title = font_large.render(section["title"], True, TEXT_COLOR)
+                screen.blit(
+                    title,
+                    (
+                        header_rect.x,
+                        header_rect.centery - title.get_height() // 2,
+                    ),
+                )
+                enabled_count = sum(
+                    1
+                    for item in section["items"]
+                    if analysis_overlay_enabled.get(item["key"], False)
+                )
+                count_text = font_tiny.render(
+                    f"{enabled_count} of {len(section['items'])} on",
+                    True,
+                    TEXT_MUTED,
+                )
+                screen.blit(
+                    count_text,
+                    (
+                        header_rect.right - count_text.get_width(),
+                        header_rect.centery - count_text.get_height() // 2,
+                    ),
+                )
+                pygame.draw.line(
+                    screen,
+                    MENU_BORDER_COLOR,
+                    (header_rect.x, header_rect.bottom - 7),
+                    (header_rect.right, header_rect.bottom - 7),
+                    2,
+                )
+            for item in section["items"]:
+                rect = item["rect"]
+                if rect.bottom < viewport.y or rect.y > viewport.bottom:
+                    continue
+                hovered = bool(
+                    idle
+                    and viewport.collidepoint(mx, my)
+                    and rect.collidepoint(mx, my)
+                )
+                _draw_analysis_overlay_toggle_row(screen, item, hovered)
+    finally:
+        screen.set_clip(previous_clip)
+
+    if max_scroll > 0:
+        track = pygame.Rect(viewport.right - 14, viewport.y + 4, 7, viewport.height - 8)
+        pygame.draw.rect(screen, (42, 46, 58), track, border_radius=4)
+        thumb_height = max(
+            54,
+            int(viewport.height * viewport.height / max(1, total_height)),
+        )
+        thumb_height = min(track.height, thumb_height)
+        travel = max(0, track.height - thumb_height)
+        thumb_y = track.y + int(round(travel * (scroll / max_scroll)))
+        thumb = pygame.Rect(track.x, thumb_y, track.width, thumb_height)
+        pygame.draw.rect(screen, (150, 162, 188), thumb, border_radius=4)
+
+
 def get_always_on_top_rect(offset_x=0, offset_y=0):
     return pygame.Rect(WIDTH // 2 - 200 + offset_x, HEIGHT - 56 + offset_y, 400, 40)
 
@@ -11945,7 +12876,7 @@ def get_advisor_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(WIDTH // 2 - 220 + offset_x, 106 + offset_y, 440, 40)
 
 
-def _analysis_settings_button_summary():
+def _autoplay_settings_button_summary():
     """Read-only Analysis status summary for the Settings main menu.
 
     This mirrors the Analysis page's *shown* Auto-Move/Auto-play states,
@@ -12103,7 +13034,7 @@ def _analysis_settings_button_summary():
     }
 
 
-def _analysis_settings_status_fraction(state, phase, index=0):
+def _autoplay_settings_status_fraction(state, phase, index=0):
     """Small status-rail fill for one Analysis feature state."""
     if state in ("off", "idle"):
         return 0.14
@@ -12122,7 +13053,7 @@ def _analysis_settings_status_fraction(state, phase, index=0):
     return 0.14
 
 
-def _analysis_settings_status_colour(key, state, hover_amount=0.0):
+def _autoplay_settings_status_colour(key, state, hover_amount=0.0):
     """Stable per-feature colour, with setup/error kept unmistakable."""
     colours = {
         "auto_move": (100, 220, 145),
@@ -12141,7 +13072,7 @@ def _analysis_settings_status_colour(key, state, hover_amount=0.0):
     )
 
 
-def _draw_analysis_settings_status_marker(surface, centre, key, colour):
+def _draw_autoplay_settings_status_marker(surface, centre, key, colour):
     """Tiny feature glyph at the start of one Analysis status rail."""
     cx, cy = int(centre[0]), int(centre[1])
     pygame.draw.circle(surface, (17, 25, 34), (cx, cy + 1), 4)
@@ -12167,7 +13098,7 @@ def _draw_analysis_settings_status_marker(surface, centre, key, colour):
         pygame.draw.circle(surface, colour, (cx, cy), 2)
 
 
-def _draw_analysis_settings_icon(
+def _draw_autoplay_settings_icon(
     surface,
     cx,
     cy,
@@ -12335,8 +13266,8 @@ def _draw_analysis_settings_icon(
     pygame.draw.circle(surface, (225, 250, 255), glint_centre, 1)
 
 
-def _draw_analysis_settings_chevron(surface, centre, colour, scale=1.0):
-    """Small two-stroke navigation chevron for the Analysis menu row."""
+def _draw_autoplay_settings_chevron(surface, centre, colour, scale=1.0):
+    """Small two-stroke navigation chevron for the Auto-Play menu row."""
     cx, cy = centre
     arm = max(4.0, 7.0 * scale)
     points = [(cx - arm * 0.55, cy - arm), (cx + arm, cy), (cx - arm * 0.55, cy + arm)]
@@ -12344,35 +13275,35 @@ def _draw_analysis_settings_chevron(surface, centre, colour, scale=1.0):
     pygame.draw.aalines(surface, colour, False, points)
 
 
-def draw_polished_analysis_settings_button(screen, rect, hovered):
-    """Draw the Settings-main Analysis Settings navigation row.
+def draw_polished_autoplay_settings_button(screen, rect, hovered):
+    """Draw the Settings-main Auto-Play Settings navigation row.
 
     The caller supplies the original 400x50 row, including entrance and
     page-transition offsets, and retains click/navigation behaviour. This
     renderer only reads Auto-Move, Board Detection and Auto-play state so
     its scope, subtitle and three status rails can summarise that page.
     """
-    global analysis_settings_button_hover_amount
-    global analysis_settings_button_pulse_phase
+    global autoplay_settings_button_hover_amount
+    global autoplay_settings_button_pulse_phase
 
     try:
         pressed = bool(hovered and pygame.mouse.get_pressed()[0])
     except Exception:
         pressed = False
 
-    summary = _analysis_settings_button_summary()
+    summary = _autoplay_settings_button_summary()
     status_by_key = {
         status["key"]: status for status in summary["statuses"]
     }
 
     hover_target = 1.0 if hovered else 0.0
-    analysis_settings_button_hover_amount += (
-        hover_target - analysis_settings_button_hover_amount
+    autoplay_settings_button_hover_amount += (
+        hover_target - autoplay_settings_button_hover_amount
     ) * 0.22
-    if abs(hover_target - analysis_settings_button_hover_amount) < 0.01:
-        analysis_settings_button_hover_amount = hover_target
+    if abs(hover_target - autoplay_settings_button_hover_amount) < 0.01:
+        autoplay_settings_button_hover_amount = hover_target
     hover_amount = max(
-        0.0, min(1.0, analysis_settings_button_hover_amount)
+        0.0, min(1.0, autoplay_settings_button_hover_amount)
     )
     if hovered or summary["animated"]:
         if pressed:
@@ -12381,10 +13312,10 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
             phase_step = 0.082
         else:
             phase_step = 0.055
-        analysis_settings_button_pulse_phase = (
-            analysis_settings_button_pulse_phase + phase_step
+        autoplay_settings_button_pulse_phase = (
+            autoplay_settings_button_pulse_phase + phase_step
         ) % (2.0 * math.pi)
-    phase = analysis_settings_button_pulse_phase
+    phase = autoplay_settings_button_pulse_phase
 
     visual_rect = rect.move(0, 1 if pressed else 0)
 
@@ -12569,7 +13500,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     icon_hover_amount = max(
         hover_amount, 0.28 if summary["active"] else 0.0
     )
-    _draw_analysis_settings_icon(
+    _draw_autoplay_settings_icon(
         screen,
         icon_centre[0],
         icon_centre[1],
@@ -12596,8 +13527,8 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         )
 
     # Two-line centred label: destination above, highest-priority live
-    # Analysis state below (or the page's three features when all idle).
-    label = "Analysis Settings"
+    # Auto-Play state below (or the page's three features when all idle).
+    label = "Auto-Play Settings"
     title_colour = _lerp_color(
         (237, 247, 248), (255, 255, 255), hover_amount
     )
@@ -12626,17 +13557,17 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
     screen.blit(subtitle, subtitle_rect)
 
-    # Three read-only status rails, top-to-bottom in Analysis-page order:
+    # Three read-only status rails, top-to-bottom in Auto-Play-page order:
     # Auto-Move, Board Detection, then external Auto-play.
     detail_x = visual_rect.right - 96
     rail_x = detail_x + 11
     rail_width = 31
     for index, status in enumerate(summary["statuses"]):
         rail_y = visual_rect.centery + (index - 1) * 14
-        colour = _analysis_settings_status_colour(
+        colour = _autoplay_settings_status_colour(
             status["key"], status["state"], hover_amount
         )
-        _draw_analysis_settings_status_marker(
+        _draw_autoplay_settings_status_marker(
             screen, (detail_x + 3, rail_y), status["key"], colour
         )
         pygame.draw.line(
@@ -12653,7 +13584,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
             (rail_x + rail_width, rail_y),
             3,
         )
-        fraction = _analysis_settings_status_fraction(
+        fraction = _autoplay_settings_status_fraction(
             status["state"], phase, index
         )
         endpoint_x = int(round(rail_x + fraction * rail_width))
@@ -12691,7 +13622,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         + int(round(2 * hover_amount))
         - (1 if pressed else 0)
     )
-    _draw_analysis_settings_chevron(
+    _draw_autoplay_settings_chevron(
         screen,
         (chevron_x, visual_rect.centery),
         chevron_colour,
@@ -12734,7 +13665,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 
-def draw_analysis_content(screen, offset_x=0, offset_y=0):
+def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
     intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
@@ -21082,8 +22013,7 @@ def draw_settings_menu(screen):
         if page_state == "main":
             menu_items = SETTINGS_MAIN_ITEMS
             item_height = 50
-            total_menu_height = len(menu_items) * item_height + (len(menu_items) - 1) * 20
-            start_y = (HEIGHT - total_menu_height) // 2
+            start_y = _settings_main_start_y(len(menu_items), item_height, 20)
 
             for i, item in enumerate(menu_items):
                 # Rows cascade in on open and collect back out in reverse
@@ -21100,7 +22030,12 @@ def draw_settings_menu(screen):
                     item_height,
                 )
 
-                is_interactive = item in ("Board", "Engine Settings", "Analysis Settings")
+                is_interactive = item in (
+                    "Board",
+                    "Engine Settings",
+                    "Analysis Settings",
+                    "Auto-Play Settings",
+                )
                 is_hovered = (
                     is_interactive
                     and transition_idle
@@ -21114,8 +22049,8 @@ def draw_settings_menu(screen):
                     draw_polished_board_button(
                         screen, item_rect, is_hovered
                     )
-                elif item == "Analysis Settings":
-                    draw_polished_analysis_settings_button(
+                elif item == "Auto-Play Settings":
+                    draw_polished_autoplay_settings_button(
                         screen, item_rect, is_hovered
                     )
                 else:
@@ -21169,6 +22104,8 @@ def draw_settings_menu(screen):
             draw_engine_settings_content(screen, offset_x, open_slide)
         elif page_state == "analysis":
             draw_analysis_content(screen, offset_x, open_slide)
+        elif page_state == "autoplay_settings":
+            draw_autoplay_settings_content(screen, offset_x, open_slide)
 
     for idx, (page_state, page_off) in enumerate(pages_to_draw):
         # The page on top rides in on a "sheet" that occludes the page
@@ -21254,6 +22191,15 @@ def handle_menu_click(mx, my):
             return True
 
     if settings_menu_state == "analysis":
+        analysis_key = _analysis_overlay_item_at((mx, my))
+        if analysis_key is not None:
+            set_analysis_overlay_enabled(
+                analysis_key,
+                not analysis_overlay_enabled.get(analysis_key, False),
+            )
+            return True
+
+    elif settings_menu_state == "autoplay_settings":
         if get_advisor_toggle_rect().collidepoint(mx, my):
             toggle_advisor()
             return True
@@ -21351,8 +22297,7 @@ def handle_menu_click(mx, my):
     elif settings_menu_state == "main":
         menu_items = SETTINGS_MAIN_ITEMS
         item_height = 50
-        total_menu_height = len(menu_items) * item_height + (len(menu_items) - 1) * 20
-        start_y = (HEIGHT - total_menu_height) // 2
+        start_y = _settings_main_start_y(len(menu_items), item_height, 20)
 
         for i, item in enumerate(menu_items):
             item_rect = pygame.Rect(
@@ -21368,6 +22313,8 @@ def handle_menu_click(mx, my):
                     navigate_to("engine_settings", forward=True)
                 elif item == "Analysis Settings":
                     navigate_to("analysis", forward=True)
+                elif item == "Auto-Play Settings":
+                    navigate_to("autoplay_settings", forward=True)
                 return True
 
         if get_always_on_top_rect().collidepoint(mx, my):
@@ -21909,6 +22856,10 @@ def draw_gui(
 
     # Check/Checkmate brackets, rings, and mate border, OVER the pieces
     draw_check_effect_over(screen, check_effect, board_ox, BOARD_OY)
+
+    # Analysis Settings annotations sit above settled pieces and arrows,
+    # while a piece currently being dragged still renders above them.
+    draw_analysis_board_overlays(screen, board)
 
     # 5b. Dragged piece — follows cursor on top of everything
     if dragging and drag_sq is not None and drag_offset is not None:
@@ -23346,6 +24297,14 @@ def main():
                         move_board_detection_page(1)
                     elif event.y > 0:
                         move_board_detection_page(-1)
+                elif (
+                    settings_menu_open
+                    and settings_menu_state == "analysis"
+                    and menu_transition_direction == "none"
+                ):
+                    scroll_analysis_overlay(
+                        -event.y * ANALYSIS_OVERLAY_SCROLL_SPEED
+                    )
                 elif (
                     settings_menu_open
                     and settings_menu_state == "pieces_style"
