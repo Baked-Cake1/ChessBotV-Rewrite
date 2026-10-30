@@ -59,6 +59,18 @@ ARROW_GRAD_END = (0, 70, 210)
 # Mate arrow gradient (red) — pulse when forced mate detected
 ARROW_MATE_START = (255, 110, 110)
 ARROW_MATE_END = (190, 0, 0)
+# Polished MultiPV suggestion-arrow palettes. Rank #1 remains the familiar
+# royal-blue best move; later lines keep distinct hues while their width
+# and opacity step down in _suggestion_arrow_style(), making the hierarchy
+# readable even where arrows overlap.
+SUGGESTION_ARROW_PALETTES = {
+    1: ((96, 165, 250), (29, 78, 216)),
+    2: ((45, 212, 191), (15, 118, 110)),
+    3: ((192, 132, 252), (126, 34, 206)),
+    4: ((251, 146, 60), (194, 65, 12)),
+    5: ((74, 222, 128), (21, 128, 61)),
+}
+SUGGESTION_ARROW_MATE_PALETTE = ((248, 113, 113), (185, 28, 28))
 BG_COLOR = (40, 40, 40)
 TEXT_COLOR = (220, 220, 220)
 TEXT_MUTED = (150, 150, 150)
@@ -2732,96 +2744,715 @@ def _lerp_color(c1, c2, t):
     )
 
 
-def draw_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_mate=False):
-    start = pygame.Vector2(start_pos)
-    end = pygame.Vector2(end_pos)
+def _suggestion_arrow_rgb(value, fallback):
+    """Return a sanitised RGB tuple for an arrow colour."""
 
-    v = end - start
-    length = v.length()
-    if length < 1:
-        return
-
-    # Subtle pulse for mate arrows (red) — not too noticeable
-    if is_mate:
-        pulse = math.sin(pygame.time.get_ticks() * 0.005) * 0.07  # ~7% pulse
-        width = width * (1 + pulse * 0.5)
-        alpha = max(0, min(255, int(alpha * (1 + pulse * 0.3))))
-    v_unit = v / length
-
-    head_length = width * 3
-    head_width = width * 2.5
-    shaft_half = width / 2.0
-    perp_unit = pygame.Vector2(-v_unit.y, v_unit.x)
-    head_base = end - v_unit * head_length
-    # Point well inside the head triangle: the gradient shaft runs to here,
-    # so it is always buried in (and welded to) the filled head below.
-    joint = end - v_unit * (head_length * 0.45)
-
-    a = max(0, min(255, int(alpha)))
-    if a <= 1:
-        return
-
-    grad_start = ARROW_MATE_START if is_mate else ARROW_GRAD_START
-    grad_end = ARROW_MATE_END if is_mate else ARROW_GRAD_END
-
-    # Shaft and head as ONE silhouette. The previous version stopped the
-    # shaft 80% into a separately-drawn triangle; integer truncation of the
-    # two shapes could leave a hairline seam where they met. A single
-    # polygon cannot have a gap between "body" and "head".
-    silhouette = [
-        start + perp_unit * shaft_half,
-        head_base + perp_unit * shaft_half,
-        head_base + perp_unit * (head_width / 2),
-        end,
-        head_base - perp_unit * (head_width / 2),
-        head_base - perp_unit * shaft_half,
-        start - perp_unit * shaft_half,
-    ]
-    xs = [p.x for p in silhouette] + [start.x, end.x]
-    ys = [p.y for p in silhouette] + [start.y, end.y]
-    pad = int(width) + 6
-    min_x = int(min(xs)) - pad
-    min_y = int(min(ys)) - pad
-    max_x = int(max(xs)) + pad
-    max_y = int(max(ys)) + pad
-    w = max(1, max_x - min_x)
-    h = max(1, max_y - min_y)
-
-    # Draw everything fully opaque onto a scratch surface, then apply the
-    # requested alpha once at the end. Overlapping shapes therefore merge
-    # with no double-alpha seam at the head/shaft junction.
-    surf = pygame.Surface((w, h), pygame.SRCALPHA)
-    offset = pygame.Vector2(min_x, min_y)
-    pts = [(int(p.x - offset.x), int(p.y - offset.y)) for p in silhouette]
-    pygame.draw.polygon(surf, (*grad_end, 255), pts)
     try:
-        pygame.gfxdraw.filled_polygon(surf, pts, (*grad_end, 255))
-        pygame.gfxdraw.aapolygon(surf, pts, (*grad_end, 255))
+        channels = tuple(
+            max(0, min(255, int(round(float(channel)))))
+            for channel in value[:3]
+        )
+        if len(channels) != 3:
+            raise ValueError("expected an RGB colour")
+        return channels
     except Exception:
-        pass
+        return tuple(fallback[:3])
 
-    # Gradient along the shaft, running into the head up to `joint`.
-    joint_frac = max(0.0, min(1.0, (joint - start).length() / length))
-    segs = 24 if is_mate else 20
-    line_w = max(1, int(width))
-    for i in range(segs):
-        t0 = i / segs
-        t1 = (i + 1) / segs
-        c = _lerp_color(grad_start, grad_end, t0 * joint_frac)
-        rgba = (*c, 255)
-        p0 = start + (joint - start) * t0
-        p1 = start + (joint - start) * t1
-        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, line_w)
-        pygame.draw.circle(surf, rgba, (int(p0.x - offset.x), int(p0.y - offset.y)), max(1, int(shaft_half)))
 
-    # Weld discs: rounded tail and a solid joint where shaft meets head.
-    pygame.draw.circle(surf, (*grad_start, 255), (int(start.x - offset.x), int(start.y - offset.y)), max(1, int(shaft_half)))
-    pygame.draw.circle(surf, (*grad_end, 255), (int(head_base.x - offset.x), int(head_base.y - offset.y)), max(1, int(shaft_half)))
-    pygame.draw.circle(surf, (*grad_end, 255), (int(joint.x - offset.x), int(joint.y - offset.y)), max(1, int(shaft_half)))
+def _suggestion_arrow_style(rank=1, is_mate=False, gradient_colors=None):
+    """Visual hierarchy for one engine-suggestion arrow.
 
-    if a < 255:
-        surf.fill((255, 255, 255, a), special_flags=pygame.BLEND_RGBA_MULT)
-    screen.blit(surf, (min_x, min_y))
+    The caller still owns the fade/morph alpha and nominal width. This
+    helper only chooses the gradient and modest rank-based emphasis so
+    the best line remains unmistakable when several MultiPV arrows cross.
+    """
+
+    try:
+        rank = int(rank)
+    except Exception:
+        rank = 1
+    rank = max(1, rank)
+
+    default_palette = (
+        SUGGESTION_ARROW_MATE_PALETTE
+        if is_mate
+        else SUGGESTION_ARROW_PALETTES.get(
+            rank, SUGGESTION_ARROW_PALETTES[1]
+        )
+    )
+    if gradient_colors is not None:
+        try:
+            raw_start, raw_end = gradient_colors
+        except Exception:
+            raw_start, raw_end = default_palette
+        start = _suggestion_arrow_rgb(raw_start, default_palette[0])
+        end = _suggestion_arrow_rgb(raw_end, default_palette[1])
+    else:
+        start, end = default_palette
+
+    width_scale = {
+        1: 1.50,
+        2: 1.30,
+        3: 1.18,
+        4: 1.08,
+        5: 1.00,
+    }.get(rank, 0.95)
+    alpha_scale = {
+        1: 1.52,
+        2: 1.30,
+        3: 1.16,
+        4: 1.06,
+        5: 0.98,
+    }.get(rank, 0.92)
+    if is_mate:
+        width_scale *= 1.08
+        alpha_scale *= 1.12
+
+    flow_strength = (
+        0.85 if rank == 1 else 0.45 if rank == 2 else 0.24
+    )
+    if is_mate:
+        flow_strength = max(flow_strength, 0.80)
+
+    return {
+        "rank": rank,
+        "start": start,
+        "end": end,
+        # A deep blue-slate casing works over both board colours and
+        # separates the translucent body from detailed piece artwork.
+        "casing": _lerp_color(end, (3, 8, 20), 0.72),
+        "highlight": _lerp_color(start, (255, 255, 255), 0.62),
+        "badge": _lerp_color(end, (7, 12, 24), 0.24),
+        "width_scale": width_scale,
+        "alpha_scale": alpha_scale,
+        "flow_strength": flow_strength,
+    }
+
+
+def _clean_suggestion_arrow_points(points):
+    cleaned = []
+    for raw_point in points:
+        try:
+            point = pygame.Vector2(raw_point)
+        except Exception:
+            continue
+        if not cleaned or (point - cleaned[-1]).length_squared() > 0.01:
+            cleaned.append(point)
+    return cleaned
+
+
+def _suggestion_arrow_path_lengths(points):
+    cumulative = [0.0]
+    for start, end in zip(points, points[1:]):
+        cumulative.append(cumulative[-1] + (end - start).length())
+    return cumulative
+
+
+def _suggestion_arrow_point_at(points, cumulative, distance):
+    """Return ``(point, unit_direction)`` at a distance along a path."""
+
+    if not points:
+        return pygame.Vector2(), pygame.Vector2(1, 0)
+    if len(points) == 1:
+        return points[0].copy(), pygame.Vector2(1, 0)
+    total = cumulative[-1] if cumulative else 0.0
+    distance = max(0.0, min(float(distance), total))
+    for index in range(len(points) - 1):
+        segment_start = cumulative[index]
+        segment_end = cumulative[index + 1]
+        if distance <= segment_end or index == len(points) - 2:
+            segment = points[index + 1] - points[index]
+            segment_length = segment.length()
+            if segment_length <= 0.001:
+                continue
+            local = (distance - segment_start) / segment_length
+            local = max(0.0, min(1.0, local))
+            return (
+                points[index] + segment * local,
+                segment / segment_length,
+            )
+    tail = points[-1] - points[-2]
+    if tail.length_squared() <= 0.001:
+        tail = pygame.Vector2(1, 0)
+    return points[-1].copy(), tail.normalize()
+
+
+def _trim_suggestion_arrow_path(points, cumulative, distance):
+    if not points:
+        return []
+    total = cumulative[-1] if cumulative else 0.0
+    distance = max(0.0, min(float(distance), total))
+    trimmed = [points[0].copy()]
+    for index in range(1, len(points)):
+        if cumulative[index] < distance:
+            trimmed.append(points[index].copy())
+        else:
+            break
+    end_point, _direction = _suggestion_arrow_point_at(
+        points, cumulative, distance
+    )
+    if (end_point - trimmed[-1]).length_squared() > 0.01:
+        trimmed.append(end_point)
+    return trimmed
+
+
+def _rounded_suggestion_arrow_path(points, radius):
+    """Round interior corners (the knight elbow) with quadratic curves."""
+
+    points = _clean_suggestion_arrow_points(points)
+    if len(points) < 3:
+        return points
+    rounded = [points[0].copy()]
+    for index in range(1, len(points) - 1):
+        previous = points[index - 1]
+        corner = points[index]
+        following = points[index + 1]
+        in_vector = corner - previous
+        out_vector = following - corner
+        in_length = in_vector.length()
+        out_length = out_vector.length()
+        if in_length <= 0.001 or out_length <= 0.001:
+            rounded.append(corner.copy())
+            continue
+        cut = min(float(radius), in_length * 0.45, out_length * 0.45)
+        if cut <= 0.5:
+            rounded.append(corner.copy())
+            continue
+        in_point = corner - in_vector / in_length * cut
+        out_point = corner + out_vector / out_length * cut
+        rounded.append(in_point)
+        # Quadratic Bézier through the original corner as control point.
+        for step in range(1, 8):
+            t = step / 8.0
+            one_minus = 1.0 - t
+            rounded.append(
+                in_point * (one_minus * one_minus)
+                + corner * (2.0 * one_minus * t)
+                + out_point * (t * t)
+            )
+        rounded.append(out_point)
+    rounded.append(points[-1].copy())
+    return _clean_suggestion_arrow_points(rounded)
+
+
+def _draw_suggestion_arrow_path(
+    screen,
+    raw_points,
+    color,
+    width=7,
+    alpha=255,
+    is_mate=False,
+    rank=1,
+    gradient_colors=None,
+    time_ms=None,
+):
+    """Draw one layered, tapered suggestion arrow along a path.
+
+    All overlapping pieces are composed on a scratch surface and the
+    caller's fade alpha is applied once, at the end.
+    That preserves the old no-seam shaft/head junction while adding a
+    soft shadow, dark casing, glossy centre and travelling highlight.
+    """
+
+    points = _clean_suggestion_arrow_points(raw_points)
+    if len(points) < 2:
+        return
+    cumulative = _suggestion_arrow_path_lengths(points)
+    total_length = cumulative[-1]
+    if total_length < 4.0:
+        return
+
+    # Honour a genuinely custom base colour, while the app's usual
+    # ENGINE_ARROW_COLOR sentinel selects the rank palette.
+    if gradient_colors is None:
+        custom = _suggestion_arrow_rgb(color, ENGINE_ARROW_COLOR)
+        sentinel = _suggestion_arrow_rgb(
+            ENGINE_ARROW_COLOR, (0, 100, 255)
+        )
+        if custom != sentinel:
+            gradient_colors = (
+                _lerp_color(custom, (255, 255, 255), 0.42),
+                custom,
+            )
+    style = _suggestion_arrow_style(rank, is_mate, gradient_colors)
+    rank = style["rank"]
+
+    try:
+        nominal_width = float(width)
+    except Exception:
+        nominal_width = 7.0
+    nominal_width = max(1.0, nominal_width)
+    try:
+        raw_alpha = float(alpha)
+    except Exception:
+        raw_alpha = 255.0
+
+    if time_ms is None:
+        try:
+            time_ms = pygame.time.get_ticks()
+        except Exception:
+            time_ms = 0
+    try:
+        time_ms = float(time_ms)
+    except Exception:
+        time_ms = 0.0
+
+    width_pulse = 1.0
+    alpha_pulse = 1.0
+    if is_mate:
+        pulse = math.sin(time_ms * 0.005) * 0.07
+        width_pulse += pulse * 0.50
+        alpha_pulse += pulse * 0.35
+    effective_width = max(
+        3.0, nominal_width * style["width_scale"] * width_pulse
+    )
+    effective_alpha = int(
+        max(
+            0,
+            min(
+                255,
+                raw_alpha * style["alpha_scale"] * alpha_pulse,
+            ),
+        )
+    )
+    if effective_alpha <= 1:
+        return
+
+    end = points[-1].copy()
+    _end_point, end_direction = _suggestion_arrow_point_at(
+        points, cumulative, total_length
+    )
+    end_perp = pygame.Vector2(-end_direction.y, end_direction.x)
+
+    if total_length < 18.0:
+        head_length = total_length * 0.52
+    else:
+        head_length = max(
+            10.0,
+            min(effective_width * 2.75, total_length * 0.42),
+        )
+    shaft_distance = max(1.0, total_length - head_length * 0.42)
+    shaft_points = _trim_suggestion_arrow_path(
+        points, cumulative, shaft_distance
+    )
+    corner_radius = max(6.0, min(20.0, effective_width * 1.75))
+    centreline = _rounded_suggestion_arrow_path(
+        shaft_points, corner_radius
+    )
+    if len(centreline) < 2:
+        centreline = shaft_points
+    centre_cumulative = _suggestion_arrow_path_lengths(centreline)
+    shaft_length = max(1.0, centre_cumulative[-1])
+
+    sample_step = max(10.0, effective_width * 1.30)
+    sample_count = max(2, int(math.ceil(shaft_length / sample_step)) + 1)
+    samples = []
+    for sample_index in range(sample_count):
+        distance = shaft_length * sample_index / (sample_count - 1)
+        point, direction = _suggestion_arrow_point_at(
+            centreline, centre_cumulative, distance
+        )
+        fraction = distance / shaft_length
+        smooth = fraction * fraction * (3.0 - 2.0 * fraction)
+        half_width = effective_width * (0.38 + 0.13 * smooth)
+        samples.append(
+            {
+                "point": point,
+                "direction": direction,
+                "perp": pygame.Vector2(-direction.y, direction.x),
+                "distance": distance,
+                "half": half_width,
+            }
+        )
+    head_half = max(
+        samples[-1]["half"] + 3.0, effective_width * 1.42
+    )
+    head_base = end - end_direction * head_length
+    notch_centre = end - end_direction * (head_length * 0.64)
+    notch_half = samples[-1]["half"] * 0.96
+
+    def shaft_polygon(extra=0.0, offset=(0.0, 0.0)):
+        shift = pygame.Vector2(offset)
+        left = [
+            sample["point"]
+            + sample["perp"] * (sample["half"] + extra)
+            + shift
+            for sample in samples
+        ]
+        right = [
+            sample["point"]
+            - sample["perp"] * (sample["half"] + extra)
+            + shift
+            for sample in reversed(samples)
+        ]
+        return left + right
+
+    def head_polygon(extra=0.0, offset=(0.0, 0.0)):
+        shift = pygame.Vector2(offset)
+        tip = end + end_direction * extra + shift
+        wing_centre = (
+            end
+            - end_direction * (head_length + extra * 0.35)
+            + shift
+        )
+        notch = (
+            end
+            - end_direction * (head_length * 0.64 + extra * 0.20)
+            + shift
+        )
+        return [
+            wing_centre + end_perp * (head_half + extra),
+            tip,
+            wing_centre - end_perp * (head_half + extra),
+            notch - end_perp * (notch_half + extra),
+            notch + end_perp * (notch_half + extra),
+        ]
+
+    target_bounds_radius = effective_width * 1.92
+    bounds_points = []
+    bounds_points.extend(shaft_polygon(3.0, (2.0, 3.0)))
+    bounds_points.extend(head_polygon(3.0, (2.0, 3.0)))
+    bounds_points.extend(
+        [
+            end + pygame.Vector2(target_bounds_radius, 0),
+            end - pygame.Vector2(target_bounds_radius, 0),
+            end + pygame.Vector2(0, target_bounds_radius),
+            end - pygame.Vector2(0, target_bounds_radius),
+            samples[0]["point"]
+            + pygame.Vector2(effective_width, effective_width),
+            samples[0]["point"]
+            - pygame.Vector2(effective_width, effective_width),
+        ]
+    )
+    pad = 7
+    min_x = int(math.floor(min(point.x for point in bounds_points))) - pad
+    min_y = int(math.floor(min(point.y for point in bounds_points))) - pad
+    max_x = int(math.ceil(max(point.x for point in bounds_points))) + pad
+    max_y = int(math.ceil(max(point.y for point in bounds_points))) + pad
+    surface_width = max(1, max_x - min_x)
+    surface_height = max(1, max_y - min_y)
+
+    scale = 1
+    scratch = pygame.Surface(
+        (surface_width * scale, surface_height * scale),
+        pygame.SRCALPHA,
+    )
+
+    def local(point):
+        return (
+            int(round((point.x - min_x) * scale)),
+            int(round((point.y - min_y) * scale)),
+        )
+
+    def draw_polygon(points_to_draw, colour):
+        # Inline the coordinate transform: long arrows call this for
+        # dozens of gradient quads every frame.
+        pygame.draw.polygon(
+            scratch,
+            colour,
+            [
+                (
+                    int(round((point.x - min_x) * scale)),
+                    int(round((point.y - min_y) * scale)),
+                )
+                for point in points_to_draw
+            ],
+        )
+
+    def draw_circle(point, radius, colour, outline=0):
+        pygame.draw.circle(
+            scratch,
+            colour,
+            local(point),
+            max(1, int(round(radius * scale))),
+            max(0, int(round(outline * scale))) if outline else 0,
+        )
+
+    def draw_line(start, finish, colour, line_width):
+        pygame.draw.line(
+            scratch,
+            colour,
+            local(start),
+            local(finish),
+            max(1, int(round(line_width * scale))),
+        )
+
+    def draw_lines(points_to_draw, colour, line_width):
+        if len(points_to_draw) < 2:
+            return
+        pygame.draw.lines(
+            scratch,
+            colour,
+            False,
+            [
+                (
+                    int(round((point.x - min_x) * scale)),
+                    int(round((point.y - min_y) * scale)),
+                )
+                for point in points_to_draw
+            ],
+            max(1, int(round(line_width * scale))),
+        )
+
+    def draw_aa_polygon_outline(points_to_draw, colour):
+        try:
+            pygame.gfxdraw.aapolygon(
+                scratch,
+                [
+                    (
+                        int(round((point.x - min_x) * scale)),
+                        int(round((point.y - min_y) * scale)),
+                    )
+                    for point in points_to_draw
+                ],
+                colour,
+            )
+        except Exception:
+            pass
+
+    start_colour = style["start"]
+    end_colour = style["end"]
+    casing_colour = style["casing"]
+
+    # One offset silhouette provides the contact shadow.
+    shadow_colour = (5, 10, 22, 48)
+    draw_polygon(
+        shaft_polygon(2.4, (1.8, 2.6)), shadow_colour
+    )
+    draw_polygon(
+        head_polygon(2.4, (1.8, 2.6)), shadow_colour
+    )
+
+    # Dark casing first; the opaque body inside it then has a clean rim
+    # over light/dark squares and both piece colours.
+    casing_rgba = (*casing_colour, 238)
+    casing_shaft = shaft_polygon(1.7)
+    casing_head = head_polygon(1.7)
+    draw_polygon(casing_shaft, casing_rgba)
+    draw_polygon(casing_head, casing_rgba)
+    draw_circle(
+        samples[0]["point"], samples[0]["half"] + 1.7, casing_rgba
+    )
+    # Anti-alias only the casing boundary; drawing this after the body
+    # would expose the swept head's notch edges as a wireframe.
+    casing_aa = (*casing_colour, 255)
+    draw_aa_polygon_outline(casing_shaft, casing_aa)
+    draw_aa_polygon_outline(casing_head, casing_aa)
+
+    gradient_span = shaft_length + head_length * 0.55
+    for first, second in zip(samples, samples[1:]):
+        gradient_t = first["distance"] / max(1.0, gradient_span)
+        segment_colour = _lerp_color(
+            start_colour, end_colour, max(0.0, min(1.0, gradient_t))
+        )
+        quad = [
+            first["point"] + first["perp"] * first["half"],
+            second["point"] + second["perp"] * second["half"],
+            second["point"] - second["perp"] * second["half"],
+            first["point"] - first["perp"] * first["half"],
+        ]
+        draw_polygon(quad, (*segment_colour, 255))
+    draw_circle(
+        samples[-1]["point"],
+        samples[-1]["half"],
+        (*_lerp_color(start_colour, end_colour, 0.78), 255),
+    )
+
+    # Faceted swept head: two wing tones plus a central blade continue
+    # the shaft gradient instead of ending in one flat triangle.
+    head_points = head_polygon()
+    wing_plus, tip_point, wing_minus, notch_minus, notch_plus = head_points
+    draw_polygon(
+        head_points,
+        (*_lerp_color(start_colour, end_colour, 0.82), 255),
+    )
+    draw_polygon(
+        [notch_plus, wing_plus, tip_point, notch_centre],
+        (*_lerp_color(start_colour, end_colour, 0.68), 255),
+    )
+    draw_polygon(
+        [notch_minus, notch_centre, tip_point, wing_minus],
+        (*_lerp_color(start_colour, end_colour, 0.92), 255),
+    )
+    blade_width = samples[-1]["half"] * 0.72
+    draw_polygon(
+        [
+            head_base + end_perp * blade_width,
+            tip_point - end_direction * 1.0,
+            head_base - end_perp * blade_width,
+        ],
+        (*_lerp_color(start_colour, end_colour, 0.86), 255),
+    )
+
+    # Narrow off-centre gloss, drawn as a handful of gradient chunks.
+    # Colours are pre-blended opaque: pygame.draw with an alpha colour
+    # would replace, rather than blend, the scratch surface's alpha.
+    gloss_width = max(1.1, effective_width * 0.17)
+    gloss_points = [
+        sample["point"] - sample["perp"] * sample["half"] * 0.34
+        for sample in samples
+    ]
+    if len(gloss_points) >= 2:
+        chunk_count = 8
+        chunk_size = max(
+            1,
+            int(
+                math.ceil(
+                    (len(gloss_points) - 1) / float(chunk_count)
+                )
+            ),
+        )
+        final_gloss_colour = None
+        for chunk_start in range(
+            0, len(gloss_points) - 1, chunk_size
+        ):
+            chunk_end = min(
+                len(gloss_points), chunk_start + chunk_size + 1
+            )
+            midpoint = samples[
+                (chunk_start + chunk_end - 1) // 2
+            ]
+            gradient_t = midpoint["distance"] / max(
+                1.0, gradient_span
+            )
+            body_colour = _lerp_color(
+                start_colour,
+                end_colour,
+                max(0.0, min(1.0, gradient_t)),
+            )
+            final_gloss_colour = (
+                *_lerp_color(
+                    body_colour, style["highlight"], 0.38
+                ),
+                255,
+            )
+            draw_lines(
+                gloss_points[chunk_start:chunk_end],
+                final_gloss_colour,
+                gloss_width,
+            )
+        gloss_tip = (
+            end
+            - end_direction * head_length * 0.18
+            - end_perp * samples[-1]["half"] * 0.22
+        )
+        draw_line(
+            gloss_points[-1],
+            gloss_tip,
+            final_gloss_colour,
+            gloss_width,
+        )
+
+    # A restrained light packet travels toward the destination. Lower
+    # ranks receive only a faint version, preserving the hierarchy.
+    if effective_alpha > 44 and style["flow_strength"] > 0.0:
+        packet_count = 2 if shaft_length >= 220.0 else 1
+        period_ms = 1500.0 if rank == 1 or is_mate else 1900.0
+        for packet_index in range(packet_count):
+            phase = (
+                time_ms / period_ms
+                + packet_index / packet_count
+                + rank * 0.07
+            ) % 1.0
+            envelope = math.sin(math.pi * phase)
+            if envelope < 0.12:
+                continue
+            packet_point, packet_direction = (
+                _suggestion_arrow_point_at(
+                    centreline,
+                    centre_cumulative,
+                    phase * shaft_length,
+                )
+            )
+            packet_perp = pygame.Vector2(
+                -packet_direction.y, packet_direction.x
+            )
+            packet_body = _lerp_color(
+                start_colour,
+                end_colour,
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (phase * shaft_length)
+                        / max(1.0, gradient_span),
+                    ),
+                ),
+            )
+            packet_light = _lerp_color(
+                style["highlight"], (255, 255, 255), 0.35
+            )
+            packet_colour = (
+                *_lerp_color(
+                    packet_body,
+                    packet_light,
+                    0.18 + 0.52 * style["flow_strength"] * envelope,
+                ),
+                255,
+            )
+            draw_polygon(
+                [
+                    packet_point + packet_direction * 5.0,
+                    packet_point + packet_perp * 2.4,
+                    packet_point - packet_direction * 5.0,
+                    packet_point - packet_perp * 2.4,
+                ],
+                packet_colour,
+            )
+
+    # Rounded origin node underneath the separate MultiPV rank medallion.
+    draw_circle(
+        samples[0]["point"],
+        samples[0]["half"] + 0.8,
+        (*start_colour, 255),
+    )
+    draw_circle(
+        samples[0]["point"],
+        max(1.2, effective_width * 0.13),
+        (*_lerp_color(start_colour, (255, 255, 255), 0.72), 255),
+    )
+
+    rendered = (
+        scratch
+        if scale == 1
+        else pygame.transform.smoothscale(
+            scratch, (surface_width, surface_height)
+        )
+    )
+    # SDL2 multiplies this surface alpha with the scratch layer's
+    # per-pixel alpha during the blit. That gives the same one-pass fade
+    # as a full BLEND_RGBA_MULT fill without rewriting every pixel in a
+    # long diagonal arrow's mostly-empty bounding box.
+    rendered.set_alpha(effective_alpha)
+    screen.blit(rendered, (min_x, min_y))
+
+
+def draw_arrow(
+    screen,
+    start_pos,
+    end_pos,
+    color,
+    width=7,
+    alpha=255,
+    is_mate=False,
+    *,
+    rank=1,
+    gradient_colors=None,
+    time_ms=None,
+):
+    """Draw a polished straight engine-suggestion arrow."""
+
+    _draw_suggestion_arrow_path(
+        screen,
+        (start_pos, end_pos),
+        color,
+        width=width,
+        alpha=alpha,
+        is_mate=is_mate,
+        rank=rank,
+        gradient_colors=gradient_colors,
+        time_ms=time_ms,
+    )
 
 
 def _get_knight_corner(start_pos, end_pos):
@@ -2839,92 +3470,230 @@ def _get_knight_corner(start_pos, end_pos):
         return pygame.Vector2(start.x, end.y)
 
 
-def draw_knight_arrow(screen, start_pos, end_pos, color, width=7, alpha=255, is_mate=False):
-    """L-shaped arrow for knight moves: start -> corner -> end with arrowhead."""
-    start = pygame.Vector2(start_pos)
-    end = pygame.Vector2(end_pos)
-    corner = _get_knight_corner(start, end)
+def draw_knight_arrow(
+    screen,
+    start_pos,
+    end_pos,
+    color,
+    width=7,
+    alpha=255,
+    is_mate=False,
+    *,
+    rank=1,
+    gradient_colors=None,
+    time_ms=None,
+):
+    """Draw a polished knight arrow with a rounded long-leg-first elbow."""
 
-    v = end - corner
-    length = v.length()
-    if length == 0:
-        draw_arrow(screen, start_pos, end_pos, color, width, alpha, is_mate)
-        return
-    if is_mate:
-        pulse = math.sin(pygame.time.get_ticks() * 0.005) * 0.07
-        width = width * (1 + pulse * 0.5)
-        alpha = max(0, min(255, int(alpha * (1 + pulse * 0.3))))
-
-    v_unit = v / length
-    head_length = width * 3
-    head_width = width * 2.5
-    shaft_half = width / 2.0
-    head_base = end - v_unit * head_length
-    # As in draw_arrow: run the shaft into the head and weld it there,
-    # rather than butting two separately-rounded shapes together.
-    joint = end - v_unit * (head_length * 0.45)
-    perp = pygame.Vector2(-v_unit.y, v_unit.x) * (head_width / 2)
-    point1 = end
-    point2 = end - v_unit * head_length + perp
-    point3 = end - v_unit * head_length - perp
-
-    a = max(0, min(255, int(alpha)))
-    if a <= 1:
-        return
-    grad_start = ARROW_MATE_START if is_mate else ARROW_GRAD_START
-    grad_end = ARROW_MATE_END if is_mate else ARROW_GRAD_END
-    xs = (start.x, corner.x, end.x, point1.x, point2.x, point3.x)
-    ys = (start.y, corner.y, end.y, point1.y, point2.y, point3.y)
-    pad = int(width) + 6
-    min_x = int(min(xs)) - pad
-    min_y = int(min(ys)) - pad
-    max_x = int(max(xs)) + pad
-    max_y = int(max(ys)) + pad
-    w = max(1, max_x - min_x)
-    h = max(1, max_y - min_y)
-
-    # Opaque scratch surface + single alpha multiply at the end (see
-    # draw_arrow) so the corner and the head junction have no seam.
-    surf = pygame.Surface((w, h), pygame.SRCALPHA)
-    offset = pygame.Vector2(min_x, min_y)
-
-    head_pts = [(int(p.x - offset.x), int(p.y - offset.y)) for p in (point1, point2, point3)]
-    pygame.draw.polygon(surf, (*grad_end, 255), head_pts)
     try:
-        pygame.gfxdraw.filled_polygon(surf, head_pts, (*grad_end, 255))
-        pygame.gfxdraw.aapolygon(surf, head_pts, (*grad_end, 255))
+        start = pygame.Vector2(start_pos)
+        end = pygame.Vector2(end_pos)
+        corner = _get_knight_corner(start, end)
     except Exception:
-        pass
+        return
+    if (end - corner).length_squared() <= 0.01:
+        draw_arrow(
+            screen,
+            start_pos,
+            end_pos,
+            color,
+            width,
+            alpha,
+            is_mate,
+            rank=rank,
+            gradient_colors=gradient_colors,
+            time_ms=time_ms,
+        )
+        return
+    _draw_suggestion_arrow_path(
+        screen,
+        (start, corner, end),
+        color,
+        width=width,
+        alpha=alpha,
+        is_mate=is_mate,
+        rank=rank,
+        gradient_colors=gradient_colors,
+        time_ms=time_ms,
+    )
 
-    len1 = (corner - start).length()
-    len2 = (joint - corner).length()
-    total = max(1, len1 + len2)
-    line_w = max(1, int(width))
-    segs = 28
-    for i in range(segs):
-        t0 = i / segs
-        t1 = (i + 1) / segs
-        def point_at(t, _len1=len1, _len2=len2, _total=total):
-            if t * _total <= _len1:
-                seg_t = (t * _total) / max(1, _len1)
-                return start + (corner - start) * seg_t
-            seg_t = (t * _total - _len1) / max(1, _len2)
-            return corner + (joint - corner) * seg_t
-        p0 = point_at(t0)
-        p1 = point_at(t1)
-        c = _lerp_color(grad_start, grad_end, t0)
-        rgba = (*c, 255)
-        pygame.draw.line(surf, rgba, p0 - offset, p1 - offset, line_w)
-        pygame.draw.circle(surf, rgba, (int(p0.x - offset.x), int(p0.y - offset.y)), max(1, int(shaft_half)))
 
-    # Weld discs at the tail, the L-bend, and the head junction.
-    corner_c = _lerp_color(grad_start, grad_end, len1 / total)
-    for pos, col in ((start, grad_start), (corner, corner_c), (head_base, grad_end), (joint, grad_end)):
-        pygame.draw.circle(surf, (*col, 255), (int(pos.x - offset.x), int(pos.y - offset.y)), max(1, int(shaft_half)))
+def _draw_suggestion_arrow_badge(
+    screen,
+    rank,
+    start_pos,
+    alpha=255,
+    is_mate=False,
+    gradient_colors=None,
+    end_pos=None,
+    is_knight=False,
+    time_ms=None,
+):
+    """Draw the MultiPV rank medallion beside an arrow's tail.
 
-    if a < 255:
-        surf.fill((255, 255, 255, a), special_flags=pygame.BLEND_RGBA_MULT)
-    screen.blit(surf, (min_x, min_y))
+    The old badge sat directly on the moving piece and stayed opaque
+    while its arrow faded. The medallion now sits behind/beside the
+    first leg, uses the arrow palette, and fades with the arrow.
+    """
+
+    style = _suggestion_arrow_style(rank, is_mate, gradient_colors)
+    rank = style["rank"]
+    try:
+        raw_alpha = float(alpha)
+    except Exception:
+        raw_alpha = 255.0
+    # Badges need a little more presence than the translucent shaft,
+    # but must still disappear on the same fade curve.
+    effective_alpha = int(max(0, min(255, raw_alpha * 1.90)))
+    if effective_alpha <= 2:
+        return
+    try:
+        start = pygame.Vector2(start_pos)
+    except Exception:
+        return
+
+    direction = pygame.Vector2(1, 0)
+    if end_pos is not None:
+        try:
+            end = pygame.Vector2(end_pos)
+            next_point = (
+                _get_knight_corner(start, end) if is_knight else end
+            )
+            delta = next_point - start
+            if delta.length_squared() > 0.01:
+                direction = delta.normalize()
+        except Exception:
+            pass
+    perpendicular = pygame.Vector2(-direction.y, direction.x)
+    centre = (
+        start
+        - direction * (13.0 + (rank - 1) * 1.5)
+        + perpendicular * 14.0
+    )
+    radius = 13 if rank == 1 else 12 if rank == 2 else 11
+
+    if time_ms is None:
+        try:
+            time_ms = pygame.time.get_ticks()
+        except Exception:
+            time_ms = 0
+    try:
+        time_ms = float(time_ms)
+    except Exception:
+        time_ms = 0.0
+    pulse = 0.5 + 0.5 * math.sin(time_ms * 0.005)
+
+    canvas_size = radius * 2 + 18
+    badge_surface = pygame.Surface(
+        (canvas_size, canvas_size), pygame.SRCALPHA
+    )
+    local_centre = (canvas_size // 2, canvas_size // 2)
+
+    if rank == 1 or is_mate:
+        halo_radius = radius + 3 + int(round(1.5 * pulse))
+        try:
+            pygame.gfxdraw.filled_circle(
+                badge_surface,
+                local_centre[0],
+                local_centre[1],
+                halo_radius,
+                (*style["start"], int(34 + 24 * pulse)),
+            )
+            pygame.gfxdraw.aacircle(
+                badge_surface,
+                local_centre[0],
+                local_centre[1],
+                halo_radius,
+                (*style["highlight"], int(70 + 45 * pulse)),
+            )
+        except Exception:
+            pygame.draw.circle(
+                badge_surface,
+                (*style["start"], 45),
+                local_centre,
+                halo_radius,
+            )
+
+    # Contact shadow, casing, two-tone face and a small top gloss.
+    pygame.draw.circle(
+        badge_surface,
+        (5, 10, 20, 105),
+        (local_centre[0], local_centre[1] + 2),
+        radius + 1,
+    )
+    pygame.draw.circle(
+        badge_surface,
+        (*style["casing"], 255),
+        local_centre,
+        radius + 1,
+    )
+    pygame.draw.circle(
+        badge_surface,
+        (*style["badge"], 255),
+        local_centre,
+        radius,
+    )
+    # Pre-blend these face highlights: drawing an alpha colour into a
+    # per-pixel-alpha surface would punch a translucent hole in the
+    # badge instead of lightening the opaque face underneath it.
+    pygame.draw.circle(
+        badge_surface,
+        (*_lerp_color(style["badge"], style["start"], 0.30), 255),
+        (local_centre[0] - 4, local_centre[1] - 4),
+        max(2, radius - 5),
+    )
+    pygame.draw.circle(
+        badge_surface,
+        (*_lerp_color(style["badge"], (255, 255, 255), 0.52), 255),
+        (
+            local_centre[0] - max(2, radius // 2),
+            local_centre[1] - max(3, (radius * 2) // 3),
+        ),
+        max(1, radius // 6),
+    )
+    try:
+        pygame.gfxdraw.aacircle(
+            badge_surface,
+            local_centre[0],
+            local_centre[1],
+            radius,
+            (*style["highlight"], 235),
+        )
+    except Exception:
+        pygame.draw.circle(
+            badge_surface,
+            style["highlight"],
+            local_centre,
+            radius,
+            1,
+        )
+
+    label = f"#{rank}"
+    text_font = font_small
+    text = text_font.render(label, True, (255, 255, 255))
+    if text.get_width() > radius * 2 - 3:
+        text_font = font_tiny
+        text = text_font.render(label, True, (255, 255, 255))
+    if text.get_width() > radius * 2 - 3:
+        label = str(rank)
+        text = text_font.render(label, True, (255, 255, 255))
+    shadow_text = text_font.render(label, True, (5, 10, 20))
+    badge_surface.blit(
+        shadow_text,
+        shadow_text.get_rect(
+            center=(local_centre[0], local_centre[1] + 1)
+        ),
+    )
+    badge_surface.blit(
+        text, text.get_rect(center=local_centre)
+    )
+    badge_surface.set_alpha(effective_alpha)
+    screen.blit(
+        badge_surface,
+        badge_surface.get_rect(
+            center=(int(round(centre.x)), int(round(centre.y)))
+        ),
+    )
 
 
 def draw_gradient_rect(screen, rect, start_color, end_color, vertical=True):
@@ -18227,68 +18996,55 @@ def draw_gui(
             curr_y = sy + (ey - sy) * t
             screen.blit(images[pkey], (curr_x, curr_y))
 
-    # Suggestion arrows — MultiPV: render all with numbers #1 best. Falls back to single arrow.
-    def _multipv_colors(num, is_mate):
-        if is_mate:
-            return ARROW_MATE_START, ARROW_MATE_END
-        palette = {
-            1: (ARROW_GRAD_START, ARROW_GRAD_END),  # blue best
-            2: ((80, 200, 200), (0, 120, 120)),  # teal
-            3: ((180, 120, 255), (80, 0, 180)),  # purple
-            4: ((255, 180, 80), (210, 80, 0)),  # orange
-            5: ((120, 220, 120), (0, 120, 0)),  # green
-        }
-        return palette.get(num, palette[1])
-
-    # Prefer MultiPV arrows if any are active
+    # Suggestion arrows — MultiPV: render all with rank medallions (#1
+    # is widest and most opaque). Falls back to the single arrow below.
+    # Prefer MultiPV arrows if any are active.
     has_multi = any(v.get("alpha", 0) > 1 and v.get("start") is not None for v in getattr(anim_mgr, "multi_arrows", {}).values())
     if has_multi:
-        # Draw in reverse order so #1 is on top
+        arrow_time_ms = pygame.time.get_ticks()
+        visible_arrows = []
+        # Draw in reverse order so #1's body is on top.
         for aid in sorted(anim_mgr.multi_arrows.keys(), reverse=True):
             adata = anim_mgr.multi_arrows[aid]
-            if adata["alpha"] <= 1 or adata["start"] is None or adata["end"] is None:
+            if adata.get("alpha", 0) <= 1 or adata.get("start") is None or adata.get("end") is None:
                 continue
-            c_start, c_end = _multipv_colors(aid, adata.get("is_mate", False))
-            # temporarily override globals for gradient
-            # we pass colors via custom draw that uses gradient override — we monkey-patch globals briefly
-            # instead, we call draw with is_mate flag and custom palette handling inside draw_arrow?
-            # For simplicity, set globals to desired palette for this draw call
-            orig_start, orig_end = ARROW_GRAD_START, ARROW_GRAD_END
-            orig_mate_start, orig_mate_end = ARROW_MATE_START, ARROW_MATE_END
-            try:
-                # if this arrow is mate, it will use mate colors; otherwise use normal
-                # we override normal palette to multipv color
-                globals()["ARROW_GRAD_START"], globals()["ARROW_GRAD_END"] = c_start, c_end
-                # keep mate colors as is (or also override if is_mate)
-                if adata.get("is_knight"):
-                    draw_knight_arrow(screen, adata["start"], adata["end"], ENGINE_ARROW_COLOR, 7, adata["alpha"], is_mate=adata.get("is_mate", False))
-                else:
-                    draw_arrow(screen, adata["start"], adata["end"], ENGINE_ARROW_COLOR, 7, adata["alpha"], is_mate=adata.get("is_mate", False))
-            finally:
-                globals()["ARROW_GRAD_START"], globals()["ARROW_GRAD_END"] = orig_start, orig_end
-                globals()["ARROW_MATE_START"], globals()["ARROW_MATE_END"] = orig_mate_start, orig_mate_end
-            # Number badge at arrow origin (slightly offset)
-            bx, by = int(adata["start"].x), int(adata["start"].y)
-            # badge background
-            badge_r = 11
-            badge_col = (30, 30, 35, 230) if aid != 1 else (25, 60, 160, 240)
-            # outer glow for best
-            if aid == 1:
-                glow = pygame.Surface((badge_r*2+6, badge_r*2+6), pygame.SRCALPHA)
-                pygame.draw.circle(glow, (80, 140, 255, 80), (badge_r+3, badge_r+3), badge_r+3)
-                screen.blit(glow, (bx - badge_r -3, by - badge_r -3))
-            pygame.draw.circle(screen, (20,20,25), (bx, by), badge_r+1)
-            pygame.draw.circle(screen, badge_col[:3], (bx, by), badge_r)
-            pygame.draw.circle(screen, (220,220,240), (bx, by), badge_r, 1)
-            try:
-                pygame.gfxdraw.aacircle(screen, bx, by, badge_r, (220,220,240))
-            except Exception:
-                pass
-            num_txt = font_small.render(f"#{aid}", True, (255,255,255))
-            # use tiny font for badge to fit
-            if num_txt.get_width() > badge_r*2:
-                num_txt = font_tiny.render(f"#{aid}", True, (255,255,255))
-            screen.blit(num_txt, num_txt.get_rect(center=(bx, by)))
+            visible_arrows.append((aid, adata))
+            arrow_kwargs = {
+                "width": 7,
+                "alpha": adata["alpha"],
+                "is_mate": adata.get("is_mate", False),
+                "rank": aid,
+                "time_ms": arrow_time_ms,
+            }
+            if adata.get("is_knight"):
+                draw_knight_arrow(
+                    screen,
+                    adata["start"],
+                    adata["end"],
+                    ENGINE_ARROW_COLOR,
+                    **arrow_kwargs,
+                )
+            else:
+                draw_arrow(
+                    screen,
+                    adata["start"],
+                    adata["end"],
+                    ENGINE_ARROW_COLOR,
+                    **arrow_kwargs,
+                )
+        # Medallions are a separate final pass (again ending with #1),
+        # so an overlapping lower-rank arrow cannot cover a rank label.
+        for aid, adata in visible_arrows:
+            _draw_suggestion_arrow_badge(
+                screen,
+                aid,
+                adata["start"],
+                alpha=adata["alpha"],
+                is_mate=adata.get("is_mate", False),
+                end_pos=adata["end"],
+                is_knight=adata.get("is_knight", False),
+                time_ms=arrow_time_ms,
+            )
     else:
         # Fallback single arrow (when MultiPV=1 or engine hasn't sent multipv yet)
         if (
@@ -18310,10 +19066,29 @@ def draw_gui(
                         single_is_knight = True
             except Exception:
                 pass
+            single_arrow_kwargs = {
+                "width": 7,
+                "alpha": anim_mgr.arrow_alpha,
+                "is_mate": single_is_mate,
+                "rank": 1,
+                "time_ms": pygame.time.get_ticks(),
+            }
             if single_is_knight:
-                draw_knight_arrow(screen, anim_mgr.arrow_start, anim_mgr.arrow_end, ENGINE_ARROW_COLOR, 7, anim_mgr.arrow_alpha, is_mate=single_is_mate)
+                draw_knight_arrow(
+                    screen,
+                    anim_mgr.arrow_start,
+                    anim_mgr.arrow_end,
+                    ENGINE_ARROW_COLOR,
+                    **single_arrow_kwargs,
+                )
             else:
-                draw_arrow(screen, anim_mgr.arrow_start, anim_mgr.arrow_end, ENGINE_ARROW_COLOR, 7, anim_mgr.arrow_alpha, is_mate=single_is_mate)
+                draw_arrow(
+                    screen,
+                    anim_mgr.arrow_start,
+                    anim_mgr.arrow_end,
+                    ENGINE_ARROW_COLOR,
+                    **single_arrow_kwargs,
+                )
 
     # Check/Checkmate brackets, rings, and mate border, OVER the pieces
     draw_check_effect_over(screen, check_effect, board_ox, BOARD_OY)
@@ -18429,12 +19204,11 @@ def draw_gui(
                     lines_copy = dict(engine_thread.info.get("lines", {}))
                 # only show if we have more than 1 line
                 if len(lines_copy) > 1:
-                    # Colors matching arrows
+                    # Colours matching the polished board arrows.
                     mp_colors = {
-                        2: (80, 200, 200),
-                        3: (180, 120, 255),
-                        4: (255, 180, 80),
-                        5: (120, 220, 120),
+                        idx: palette[0]
+                        for idx, palette in SUGGESTION_ARROW_PALETTES.items()
+                        if idx > 1
                     }
                     y_off = rec_y + 22
                     for idx in range(2, min(multipv_val, 5) + 1):
