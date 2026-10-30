@@ -1065,6 +1065,11 @@ skill_slider_pulse_phase = 0.0
 # safe-RAM cap and shared drag mapping remain owned by existing code.
 hash_slider_hover_amount = 0.0
 hash_slider_pulse_phase = 0.0
+# Engine Settings Depth Limit slider polish. Hover/pulse state animates
+# only the search-strata artwork; the 5..40 draft, smoothed display float,
+# staged Save flow and shared drag mapping remain owned by existing code.
+depth_slider_hover_amount = 0.0
+depth_slider_pulse_phase = 0.0
 # Settings main-menu Board button polish. The phase drives only the
 # miniature-board scan/piece bob; Board navigation and themes are unchanged.
 board_button_hover_amount = 0.0
@@ -15986,6 +15991,1016 @@ def _draw_polished_hash_slider(
     return thumb_x, thumb_y
 
 
+def _depth_slider_fraction(value, low, high):
+    """Normalise a Depth Limit value on its established linear scale."""
+
+    try:
+        numeric = float(value)
+        low = float(low)
+        high = float(high)
+    except (TypeError, ValueError):
+        return 0.0
+    if high <= low:
+        return 1.0
+    return max(0.0, min(1.0, (numeric - low) / (high - low)))
+
+
+def _depth_slider_tier(value, low, high):
+    """Return ``(tier_index, label)`` for a Depth Limit value."""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0, "Shallow scan"
+    if high <= low or numeric >= high:
+        return 4, "Maximum depth"
+    fraction = _depth_slider_fraction(numeric, low, high)
+    if fraction >= 0.75:
+        return 3, "Extreme depth"
+    if fraction >= 0.50:
+        return 2, "Deep analysis"
+    if fraction >= 0.25:
+        return 1, "Tactical depth"
+    return 0, "Shallow scan"
+
+
+def _depth_slider_values():
+    """Read staged/saved/display Depth Limit values for its renderer.
+
+    This helper never writes a setting. The chip, subtitle and bubble use
+    the staged integer draft; the thumb/fill/strata use the existing
+    smoothed display float; and the ivory marker uses the saved config.
+    """
+
+    try:
+        low_raw, high_raw = ENGINE_ROW_LIMITS.get("depth", (5, 40))
+        low = int(low_raw)
+        high = int(high_raw)
+    except Exception:
+        low, high = 5, 40
+    high = max(low, high)
+
+    def staged_value(raw, default):
+        try:
+            value = int(round(float(raw)))
+        except (TypeError, ValueError):
+            value = int(default)
+        return max(low, min(high, value))
+
+    saved_default = ENGINE_DEFAULTS.get("depth", 25)
+    saved = staged_value(config.get("depth", saved_default), saved_default)
+    draft = staged_value(engine_draft.get("depth", saved), saved)
+    try:
+        display = float(engine_slider_display.get("depth", float(draft)))
+    except (TypeError, ValueError):
+        display = float(draft)
+    display = max(float(low), min(float(high), display))
+
+    display_fraction = _depth_slider_fraction(display, low, high)
+    draft_fraction = _depth_slider_fraction(draft, low, high)
+    saved_fraction = _depth_slider_fraction(saved, low, high)
+    draft_tier_index, draft_tier = _depth_slider_tier(draft, low, high)
+    display_tier_index, display_tier = _depth_slider_tier(
+        display, low, high
+    )
+    return {
+        "low": low,
+        "high": high,
+        "draft": draft,
+        "saved": saved,
+        "display": display,
+        "dirty": draft != saved,
+        "display_fraction": display_fraction,
+        "draft_fraction": draft_fraction,
+        "saved_fraction": saved_fraction,
+        "draft_tier_index": draft_tier_index,
+        "draft_tier": draft_tier,
+        "display_tier_index": display_tier_index,
+        "display_tier": display_tier,
+    }
+
+
+def _depth_slider_accent(fraction):
+    """Sky-to-teal-to-lime-to-amber-to-rose Depth Limit accent."""
+
+    fraction = max(0.0, min(1.0, float(fraction)))
+    stops = (
+        (0.00, (56, 189, 248)),
+        (0.28, (45, 212, 191)),
+        (0.55, (163, 230, 53)),
+        (0.78, (250, 204, 21)),
+        (1.00, (251, 113, 133)),
+    )
+    if fraction <= stops[0][0]:
+        return stops[0][1]
+    for (start_t, start_colour), (end_t, end_colour) in zip(
+        stops, stops[1:]
+    ):
+        if fraction <= end_t:
+            local = (fraction - start_t) / max(1e-9, end_t - start_t)
+            return _lerp_color(start_colour, end_colour, local)
+    return stops[-1][1]
+
+
+def _depth_slider_tick_values(low, high, max_intervals=40):
+    """Inclusive integer ticks; the 5..40 range normally gets every ply."""
+
+    try:
+        low = int(low)
+        high = int(high)
+        max_intervals = max(1, int(max_intervals))
+    except Exception:
+        return (5, 40)
+    if high <= low:
+        return (low,)
+
+    span = high - low
+    if span <= max_intervals:
+        return tuple(range(low, high + 1))
+
+    raw_step = int(math.ceil(span / float(max_intervals)))
+    step = raw_step
+    for candidate in (
+        1, 2, 4, 5, 8, 10, 16, 20, 25, 32, 50, 64, 100, 128, 200,
+        250, 500, 1000,
+    ):
+        if candidate >= raw_step:
+            step = candidate
+            break
+    values = list(range(low, high + 1, step))
+    if values[-1] != high:
+        values.append(high)
+    return tuple(values)
+
+
+def _draw_depth_strata_icon(
+    surface,
+    cx,
+    cy,
+    size,
+    hover_amount=0.0,
+    phase=0.0,
+    fraction=0.0,
+):
+    """Draw widening search-strata layers around a vertical probe."""
+
+    cx, cy = int(cx), int(cy)
+    size = max(22, int(size))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    fraction = max(0.0, min(1.0, float(fraction)))
+    accent = _depth_slider_accent(fraction)
+
+    probe_top = cy - 13
+    probe_bottom = cy + 13
+    pygame.draw.line(
+        surface,
+        (8, 17, 27),
+        (cx + 1, probe_top + 1),
+        (cx + 1, probe_bottom + 1),
+        2,
+    )
+    pygame.draw.line(
+        surface,
+        _lerp_color((113, 137, 165), accent, 0.35 + 0.30 * hover_amount),
+        (cx, probe_top),
+        (cx, probe_bottom),
+        1,
+    )
+    pygame.draw.circle(
+        surface,
+        _lerp_color(accent, (255, 255, 255), 0.30),
+        (cx, probe_top),
+        2,
+    )
+
+    active_layers = (
+        1
+        if fraction <= 0.0
+        else min(4, max(1, int(math.ceil(fraction * 4.0))))
+    )
+    layer_offsets = (-9, -3, 3, 9)
+    layer_width_fractions = (0.46, 0.62, 0.78, 0.94)
+    for layer_index, (layer_offset, width_fraction) in enumerate(
+        zip(layer_offsets, layer_width_fractions)
+    ):
+        layer_y = cy + layer_offset
+        half_width = max(5, int(round(size * width_fraction * 0.5)))
+        half_height = 3
+        points = [
+            (cx - half_width, layer_y),
+            (cx, layer_y - half_height),
+            (cx + half_width, layer_y),
+            (cx, layer_y + half_height),
+        ]
+        shadow_points = [(px, py + 2) for px, py in points]
+        pygame.draw.polygon(surface, (8, 17, 27), shadow_points)
+
+        layer_accent = _depth_slider_accent((layer_index + 1) / 4.0)
+        layer_active = layer_index < active_layers
+        fill_colour = (
+            _lerp_color(
+                layer_accent,
+                (255, 255, 255),
+                0.10 * hover_amount,
+            )
+            if layer_active
+            else (48, 60, 74)
+        )
+        pygame.draw.polygon(surface, fill_colour, points)
+        pygame.draw.polygon(surface, (10, 22, 34), points, 1)
+        pygame.draw.line(
+            surface,
+            (235, 248, 255) if layer_active else (83, 100, 119),
+            (cx - half_width + 3, layer_y),
+            (cx + half_width - 3, layer_y),
+            1,
+        )
+        pygame.draw.circle(
+            surface,
+            (255, 255, 255) if layer_active else (91, 108, 128),
+            (cx, layer_y),
+            1,
+        )
+
+    if hover_amount > 0.03:
+        probe_t = (phase / (2.0 * math.pi)) % 1.0
+        probe_y = int(
+            probe_top + probe_t * max(1, probe_bottom - probe_top)
+        )
+        pygame.draw.circle(
+            surface,
+            _lerp_color(accent, (255, 255, 255), 0.55),
+            (cx, probe_y),
+            1,
+        )
+
+
+def _draw_depth_slider_thumb(
+    surface,
+    cx,
+    cy,
+    radius,
+    hover_amount=0.0,
+    dragging=False,
+    phase=0.0,
+    fraction=0.0,
+):
+    """Draw the Depth Limit thumb as a sonar/strata medallion."""
+
+    cx, cy = int(cx), int(cy)
+    radius = max(8, int(radius))
+    hover_amount = max(0.0, min(1.0, float(hover_amount)))
+    active_amount = 1.0 if dragging else hover_amount
+    accent = _depth_slider_accent(fraction)
+    rim_colour = _lerp_color(
+        _lerp_color(accent, (219, 239, 255), 0.34),
+        (255, 255, 255),
+        0.26 * active_amount,
+    )
+    face_colour = _lerp_color((49, 65, 84), (64, 83, 104), active_amount)
+    inner_colour = _lerp_color((29, 42, 58), (40, 56, 75), active_amount)
+
+    pygame.draw.circle(surface, (8, 17, 27), (cx, cy + 2), radius)
+    pygame.draw.circle(surface, rim_colour, (cx, cy), radius)
+    pygame.draw.circle(surface, face_colour, (cx, cy), max(2, radius - 2))
+    pygame.draw.circle(surface, inner_colour, (cx, cy), max(1, radius - 3))
+
+    chevron_half = max(3, radius - 6)
+    for chevron_index, chevron_offset in enumerate((-3, 2)):
+        chevron_colour = _lerp_color(
+            _depth_slider_accent((chevron_index + 1) / 2.0),
+            (255, 255, 255),
+            0.18 * active_amount,
+        )
+        points = [
+            (cx - chevron_half, cy + chevron_offset - 2),
+            (cx, cy + chevron_offset + 2),
+            (cx + chevron_half, cy + chevron_offset - 2),
+        ]
+        shadow_points = [(px, py + 1) for px, py in points]
+        pygame.draw.lines(surface, (10, 22, 34), False, shadow_points, 2)
+        pygame.draw.lines(surface, chevron_colour, False, points, 2)
+
+    if active_amount > 0.03:
+        orbit_distance = max(3.0, radius * 0.58)
+        orbit = (
+            int(round(cx + orbit_distance * math.cos(phase - 0.7))),
+            int(round(cy + orbit_distance * math.sin(phase - 0.7))),
+        )
+        pygame.draw.circle(
+            surface,
+            _lerp_color(accent, (255, 255, 255), 0.55),
+            orbit,
+            1,
+        )
+    pygame.draw.circle(
+        surface,
+        (255, 255, 255),
+        (cx - max(1, radius // 3), cy - max(1, radius // 3)),
+        1,
+    )
+    try:
+        pygame.gfxdraw.aacircle(
+            surface, cx, cy, radius, (13, 25, 38, 255)
+        )
+    except Exception:
+        pass
+
+
+def _draw_polished_depth_slider(
+    screen, row_rect, track_rect, value_rect, mx, my
+):
+    """Draw the Engine Settings Depth Limit row inside its original rects.
+
+    Search-strata artwork, ply ticks/pips, markers, chip and bubble are
+    presentation only. ``track_rect`` remains the exact 180x6 track used
+    by the shared click/drag helper; the thumb follows the smoothed
+    display float, labels use the staged draft, and the ivory marker
+    uses the saved config value.
+    """
+
+    global depth_slider_hover_amount, depth_slider_pulse_phase
+
+    values = _depth_slider_values()
+    low = values["low"]
+    high = values["high"]
+    draft = values["draft"]
+    saved = values["saved"]
+    display = values["display"]
+    is_dirty = values["dirty"]
+    display_fraction = values["display_fraction"]
+    draft_fraction = values["draft_fraction"]
+    accent_display = _depth_slider_accent(display_fraction)
+    accent_draft = _depth_slider_accent(draft_fraction)
+    draft_tier = values["draft_tier"]
+    tick_values = _depth_slider_tick_values(low, high)
+
+    thumb_x = track_rect.x + int(display_fraction * track_rect.width)
+    thumb_y = track_rect.centery
+    is_dragging = engine_slider_dragging == "depth"
+    thumb_hover = bool(
+        is_dragging
+        or (abs(mx - thumb_x) < 14 and abs(my - thumb_y) < 14)
+        or track_rect.collidepoint(mx, my)
+    )
+
+    hover_target = 1.0 if thumb_hover else 0.0
+    depth_slider_hover_amount += (
+        hover_target - depth_slider_hover_amount
+    ) * 0.24
+    if abs(hover_target - depth_slider_hover_amount) < 0.01:
+        depth_slider_hover_amount = hover_target
+    hover_amount = max(0.0, min(1.0, depth_slider_hover_amount))
+    if is_dragging:
+        phase_step = 0.16
+    elif thumb_hover:
+        phase_step = 0.11
+    elif is_dirty:
+        phase_step = 0.025
+    else:
+        phase_step = 0.0
+    if phase_step:
+        depth_slider_pulse_phase = (
+            depth_slider_pulse_phase + phase_step
+        ) % (2.0 * math.pi)
+    phase = depth_slider_pulse_phase
+    active_amount = 1.0 if is_dragging else hover_amount
+
+    glow_colour = (255, 196, 92) if is_dirty else accent_display
+    glow_strength = max(hover_amount, 0.20 if is_dirty else 0.0)
+    if glow_strength > 0.01:
+        glow = pygame.Surface(
+            (row_rect.width + 16, row_rect.height + 16), pygame.SRCALPHA
+        )
+        for inset, alpha in ((1, 13), (4, 21), (7, 31)):
+            pygame.draw.rect(
+                glow,
+                (*glow_colour, int(alpha * glow_strength)),
+                (
+                    inset,
+                    inset,
+                    glow.get_width() - inset * 2,
+                    glow.get_height() - inset * 2,
+                ),
+                border_radius=13 - inset,
+            )
+        screen.blit(glow, (row_rect.x - 8, row_rect.y - 8))
+
+    pygame.draw.rect(
+        screen, (9, 19, 29), row_rect.move(0, 2), border_radius=6
+    )
+    if is_dragging:
+        top_colour, bottom_colour = (70, 81, 97), (45, 53, 67)
+        border_colour = _lerp_color(
+            accent_display, (255, 255, 255), 0.34
+        )
+    elif thumb_hover:
+        top_colour, bottom_colour = (76, 87, 103), (49, 58, 73)
+        border_colour = _lerp_color(
+            accent_display, (255, 255, 255), 0.30
+        )
+    else:
+        top_colour, bottom_colour = (63, 71, 84), (41, 48, 60)
+        border_colour = _lerp_color(
+            accent_display, (126, 141, 159), 0.58
+        )
+    if is_dirty:
+        border_colour = _lerp_color(
+            border_colour, (255, 200, 104), 0.38
+        )
+
+    body = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    denom = max(1, row_rect.height - 1)
+    for body_row in range(row_rect.height):
+        colour = _lerp_color(top_colour, bottom_colour, body_row / denom)
+        pygame.draw.line(
+            body,
+            (*colour, 255),
+            (0, body_row),
+            (row_rect.width - 1, body_row),
+        )
+
+    overlay = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        overlay,
+        (255, 255, 255, int(8 + 13 * hover_amount)),
+        [
+            (-18, row_rect.height),
+            (row_rect.width * 0.38, 0),
+            (row_rect.width * 0.56, 0),
+            (row_rect.width * 0.16, row_rect.height),
+        ],
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, int(58 + 40 * hover_amount)),
+        (8, 1),
+        (row_rect.width - 9, 1),
+        1,
+    )
+    pygame.draw.line(
+        overlay,
+        (255, 255, 255, 20),
+        (2, 7),
+        (2, row_rect.height - 8),
+        1,
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 30),
+        (0, row_rect.height - 4, row_rect.width, 4),
+    )
+    pygame.draw.rect(
+        overlay,
+        (0, 0, 0, 23),
+        (row_rect.width - 3, 6, 3, row_rect.height - 12),
+        border_radius=2,
+    )
+    trace_alpha = int(17 + 23 * hover_amount)
+    trace_colour = (
+        *_lerp_color(accent_display, (255, 255, 255), 0.28),
+        trace_alpha,
+    )
+    for trace in (
+        [(112, 9), (136, 9), (145, 16), (169, 16)],
+        [(112, 54), (136, 54), (145, 47), (169, 47)],
+        [(418, 9), (442, 9), (451, 16), (468, 16)],
+    ):
+        pygame.draw.lines(overlay, trace_colour, False, trace, 1)
+        for node in (trace[0], trace[-1]):
+            pygame.draw.circle(overlay, trace_colour, node, 2)
+    # Faint strata boundaries at the five-ply majors behind the track.
+    for tick_value in tick_values:
+        major_tick = (
+            tick_value in (low, high) or (tick_value - low) % 5 == 0
+        )
+        if not major_tick:
+            continue
+        boundary_x = int(
+            150
+            + _depth_slider_fraction(tick_value, low, high) * 180
+        )
+        pygame.draw.line(
+            overlay,
+            (255, 255, 255, int(6 + 8 * hover_amount)),
+            (boundary_x, 8),
+            (boundary_x, row_rect.height - 9),
+            1,
+        )
+    body.blit(overlay, (0, 0))
+
+    mask = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(
+        mask, (255, 255, 255, 255), mask.get_rect(), border_radius=6
+    )
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    screen.blit(body, row_rect.topleft)
+    pygame.draw.rect(screen, border_colour, row_rect, 2, border_radius=6)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(border_colour, (255, 255, 255), 0.30),
+        row_rect.inflate(-3, -3),
+        1,
+        border_radius=5,
+    )
+
+    _draw_depth_strata_icon(
+        screen,
+        row_rect.x + 27,
+        row_rect.centery,
+        31,
+        hover_amount=active_amount,
+        phase=phase,
+        fraction=display_fraction,
+    )
+    label_colour = _lerp_color(
+        (237, 244, 250), (255, 255, 255), hover_amount
+    )
+    label = font_small.render("Depth Limit", True, label_colour)
+    label_rect = label.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery - 10)
+    )
+    label_shadow = font_small.render("Depth Limit", True, (12, 20, 30))
+    screen.blit(label_shadow, label_rect.move(0, 1))
+    screen.blit(label, label_rect)
+
+    subtitle_text = draft_tier
+    subtitle_colour = _lerp_color(
+        (166, 184, 205),
+        _lerp_color(accent_draft, (255, 255, 255), 0.36),
+        hover_amount,
+    )
+    subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
+    subtitle_rect = subtitle.get_rect(
+        midleft=(row_rect.x + 49, row_rect.centery + 13)
+    )
+    subtitle_shadow = font_tiny.render(
+        subtitle_text, True, (12, 20, 30)
+    )
+    screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
+    screen.blit(subtitle, subtitle_rect)
+
+    socket_rect = track_rect.inflate(10, 10)
+    groove_rect = track_rect.inflate(4, 4)
+    pygame.draw.rect(
+        screen,
+        (8, 17, 27),
+        socket_rect.move(0, 1),
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (19, 31, 45), socket_rect, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(
+            (91, 109, 131),
+            accent_display,
+            0.42 + 0.28 * hover_amount,
+        ),
+        socket_rect,
+        1,
+        border_radius=8,
+    )
+    pygame.draw.rect(screen, (32, 45, 60), groove_rect, border_radius=5)
+    pygame.draw.rect(
+        screen, (11, 22, 34), groove_rect, 1, border_radius=5
+    )
+
+    fill_end_x = max(groove_rect.x + 4, thumb_x)
+    fill_width = max(
+        0, min(groove_rect.width, fill_end_x - groove_rect.x)
+    )
+    if fill_width > 0:
+        fill_surface = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_denom = max(1, groove_rect.width - 1)
+        for fill_x in range(groove_rect.width):
+            colour = _depth_slider_accent(fill_x / fill_denom)
+            colour = _lerp_color(
+                colour, (255, 255, 255), 0.10 * hover_amount
+            )
+            pygame.draw.line(
+                fill_surface,
+                (*colour, 255),
+                (fill_x, 0),
+                (fill_x, groove_rect.height - 1),
+            )
+        fill_overlay = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        pygame.draw.line(
+            fill_overlay,
+            (255, 255, 255, int(80 + 45 * hover_amount)),
+            (2, 1),
+            (groove_rect.width - 3, 1),
+            1,
+        )
+        pygame.draw.rect(
+            fill_overlay,
+            (0, 0, 0, 42),
+            (0, groove_rect.height - 3, groove_rect.width, 3),
+        )
+        fill_surface.blit(fill_overlay, (0, 0))
+        fill_mask = pygame.Surface(groove_rect.size, pygame.SRCALPHA)
+        fill_mask.fill((0, 0, 0, 0))
+        pygame.draw.rect(
+            fill_mask,
+            (255, 255, 255, 255),
+            fill_mask.get_rect(),
+            border_radius=5,
+        )
+        fill_surface.blit(
+            fill_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT
+        )
+        screen.blit(
+            fill_surface,
+            groove_rect.topleft,
+            area=pygame.Rect(0, 0, fill_width, groove_rect.height),
+        )
+
+    def fraction_to_x(fraction):
+        return track_rect.x + int(fraction * track_rect.width)
+
+    saved_x = fraction_to_x(values["saved_fraction"])
+    draft_x = fraction_to_x(draft_fraction)
+
+    # Every integer ply gets a pip; five-ply majors also divide the groove.
+    for tick_value in tick_values:
+        tick_fraction = _depth_slider_fraction(tick_value, low, high)
+        tick_x = fraction_to_x(tick_fraction)
+        tick_active = tick_value <= display + 1e-9
+        major_tick = (
+            tick_value in (low, high) or (tick_value - low) % 5 == 0
+        )
+        tick_accent = _depth_slider_accent(tick_fraction)
+        if major_tick:
+            pygame.draw.line(
+                screen,
+                (
+                    _lerp_color(tick_accent, (13, 25, 38), 0.48)
+                    if tick_active
+                    else (79, 95, 112)
+                ),
+                (tick_x, groove_rect.y + 1),
+                (tick_x, groove_rect.bottom - 2),
+                1,
+            )
+        pip_centre = (tick_x, track_rect.centery + 17)
+        pip_radius = 3 if major_tick else 1
+        if major_tick:
+            pygame.draw.circle(
+                screen,
+                (8, 17, 27),
+                (pip_centre[0], pip_centre[1] + 1),
+                pip_radius,
+            )
+        pygame.draw.circle(
+            screen,
+            (
+                _lerp_color(
+                    tick_accent,
+                    (255, 255, 255),
+                    0.18 * hover_amount,
+                )
+                if tick_active
+                else (66, 80, 97)
+            ),
+            pip_centre,
+            pip_radius,
+        )
+
+    if hover_amount > 0.03 and fill_width > 8:
+        for lane in range(3):
+            pulse_t = (
+                phase / (2.0 * math.pi) + lane / 3.0
+            ) % 1.0
+            pulse_x = int(
+                groove_rect.x + 3 + pulse_t * max(1, fill_width - 6)
+            )
+            pulse_y = track_rect.centery + (lane - 1) * 3
+            pulse_fraction = max(
+                0.0,
+                min(
+                    1.0,
+                    (pulse_x - groove_rect.x)
+                    / float(max(1, groove_rect.width - 1)),
+                ),
+            )
+            pygame.draw.polygon(
+                screen,
+                _lerp_color(
+                    _depth_slider_accent(pulse_fraction),
+                    (255, 255, 255),
+                    0.55,
+                ),
+                [
+                    (pulse_x, pulse_y - 3),
+                    (pulse_x + 3, pulse_y),
+                    (pulse_x, pulse_y + 3),
+                    (pulse_x - 3, pulse_y),
+                ],
+            )
+
+    saved_marker_y = socket_rect.y - 4
+    pygame.draw.polygon(
+        screen,
+        (11, 22, 34),
+        [
+            (saved_x, saved_marker_y - 3),
+            (saved_x + 3, saved_marker_y),
+            (saved_x, saved_marker_y + 3),
+            (saved_x - 3, saved_marker_y),
+        ],
+    )
+    pygame.draw.polygon(
+        screen,
+        (242, 248, 255),
+        [
+            (saved_x, saved_marker_y - 2),
+            (saved_x + 2, saved_marker_y),
+            (saved_x, saved_marker_y + 2),
+            (saved_x - 2, saved_marker_y),
+        ],
+    )
+    if is_dirty or abs(draft_x - thumb_x) > 2:
+        needle_colour = (
+            (255, 200, 104)
+            if is_dirty
+            else _lerp_color(accent_draft, (255, 255, 255), 0.34)
+        )
+        pygame.draw.line(
+            screen,
+            needle_colour,
+            (draft_x, socket_rect.y - 1),
+            (draft_x, socket_rect.bottom),
+            1,
+        )
+        pygame.draw.polygon(
+            screen,
+            needle_colour,
+            [
+                (draft_x - 3, socket_rect.bottom + 4),
+                (draft_x + 3, socket_rect.bottom + 4),
+                (draft_x, socket_rect.bottom),
+            ],
+        )
+
+    if hover_amount > 0.01:
+        thumb_glow = pygame.Surface((42, 42), pygame.SRCALPHA)
+        for glow_radius, glow_alpha in ((18, 18), (15, 28), (12, 40)):
+            pygame.draw.circle(
+                thumb_glow,
+                (*accent_display, int(glow_alpha * hover_amount)),
+                (21, 21),
+                glow_radius,
+            )
+        screen.blit(
+            thumb_glow, thumb_glow.get_rect(center=(thumb_x, thumb_y))
+        )
+    thumb_radius = 11 + (
+        1 if is_dragging else int(round(hover_amount))
+    )
+    _draw_depth_slider_thumb(
+        screen,
+        thumb_x,
+        thumb_y,
+        thumb_radius,
+        hover_amount=hover_amount,
+        dragging=is_dragging,
+        phase=phase,
+        fraction=display_fraction,
+    )
+
+    chip_rect = pygame.Rect(
+        value_rect.x + 3, row_rect.y + 13, value_rect.width - 6, 38
+    )
+    pygame.draw.rect(
+        screen, (8, 17, 27), chip_rect.move(0, 1), border_radius=8
+    )
+    chip_bg = (42, 55, 72) if thumb_hover else (34, 45, 60)
+    chip_border = (
+        (255, 200, 104)
+        if is_dirty
+        else _lerp_color(accent_display, (255, 255, 255), 0.24)
+        if thumb_hover
+        else _lerp_color(accent_display, (103, 121, 140), 0.45)
+    )
+    pygame.draw.rect(screen, chip_bg, chip_rect, border_radius=8)
+    pygame.draw.rect(screen, chip_border, chip_rect, 1, border_radius=8)
+    pygame.draw.rect(
+        screen,
+        _lerp_color(chip_border, (255, 255, 255), 0.28),
+        chip_rect.inflate(-3, -3),
+        1,
+        border_radius=6,
+    )
+    value_colour = (
+        TEXT_ACCENT
+        if is_dirty
+        else (255, 255, 255)
+        if thumb_hover or is_dragging
+        else TEXT_COLOR
+    )
+    value_text = str(draft)
+    value_font = font_small
+    value_surface = value_font.render(value_text, True, value_colour)
+    if value_surface.get_width() > chip_rect.width - 10:
+        value_font = font_tiny
+        value_surface = value_font.render(value_text, True, value_colour)
+    screen.blit(
+        value_surface,
+        value_surface.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery - 7)
+        ),
+    )
+    denominator_text = f"of {high}"
+    denominator = font_tiny.render(
+        denominator_text,
+        True,
+        _lerp_color((169, 190, 211), (230, 244, 255), hover_amount),
+    )
+    if denominator.get_width() > chip_rect.width - 8:
+        denominator_text = _elide_text(
+            denominator_text, font_tiny, chip_rect.width - 8
+        )
+        denominator = font_tiny.render(
+            denominator_text,
+            True,
+            _lerp_color(
+                (169, 190, 211), (230, 244, 255), hover_amount
+            ),
+        )
+    screen.blit(
+        denominator,
+        denominator.get_rect(
+            center=(chip_rect.centerx, chip_rect.centery + 11)
+        ),
+    )
+    if is_dirty:
+        badge = (value_rect.right - 6, value_rect.centery - 14)
+        pygame.draw.circle(
+            screen, (43, 29, 9), (badge[0], badge[1] + 1), 4
+        )
+        pygame.draw.circle(screen, (255, 200, 80), badge, 4)
+        pygame.draw.circle(screen, (255, 236, 178), badge, 4, 1)
+        pygame.draw.circle(
+            screen,
+            (255, 255, 255),
+            (badge[0] - 1, badge[1] - 1),
+            1,
+        )
+
+    # Seven widening frontier strata in the spare right-hand space.
+    frontier_x0 = chip_rect.right + 10
+    frontier_x1 = row_rect.right - 15
+    frontier_width = frontier_x1 - frontier_x0 + 1
+    if frontier_width >= 34:
+        frontier_centre_x = (frontier_x0 + frontier_x1) // 2
+        max_bar_width = min(42, frontier_width)
+        bar_height = 3
+        bar_gap = 3
+        layer_count = 7
+        frontier_height = (
+            layer_count * bar_height + (layer_count - 1) * bar_gap
+        )
+        frontier_y0 = row_rect.centery - frontier_height // 2
+        pygame.draw.line(
+            screen,
+            (12, 23, 35),
+            (frontier_centre_x, frontier_y0 - 2),
+            (frontier_centre_x, frontier_y0 + frontier_height + 1),
+            1,
+        )
+        active_layers = (
+            1
+            if display_fraction <= 0.0
+            else min(
+                layer_count,
+                max(
+                    1,
+                    int(math.ceil(display_fraction * layer_count)),
+                ),
+            )
+        )
+        for layer_index in range(layer_count):
+            width_fraction = (
+                1.0
+                if layer_count == 1
+                else 0.42 + 0.58 * (layer_index / (layer_count - 1))
+            )
+            bar_width = max(
+                10, int(round(max_bar_width * width_fraction))
+            )
+            bar_rect = pygame.Rect(
+                frontier_centre_x - bar_width // 2,
+                frontier_y0
+                + layer_index * (bar_height + bar_gap),
+                bar_width,
+                bar_height,
+            )
+            layer_accent = _depth_slider_accent(
+                (layer_index + 1) / float(layer_count)
+            )
+            layer_active = layer_index < active_layers
+            pygame.draw.rect(
+                screen,
+                (8, 17, 27),
+                bar_rect.move(0, 1),
+                border_radius=2,
+            )
+            pygame.draw.rect(
+                screen,
+                (
+                    _lerp_color(
+                        layer_accent,
+                        (255, 255, 255),
+                        0.14 * hover_amount,
+                    )
+                    if layer_active
+                    else (43, 54, 68)
+                ),
+                bar_rect,
+                border_radius=2,
+            )
+            pygame.draw.rect(
+                screen,
+                (11, 22, 34),
+                bar_rect,
+                1,
+                border_radius=2,
+            )
+            pygame.draw.circle(
+                screen,
+                (238, 248, 255) if layer_active else (76, 91, 108),
+                bar_rect.center,
+                1,
+            )
+        contact_y = frontier_y0 + frontier_height + 2
+        pygame.draw.line(
+            screen,
+            (190, 169, 112),
+            (frontier_centre_x - max_bar_width // 2, contact_y),
+            (
+                frontier_centre_x + max_bar_width // 2,
+                contact_y,
+            ),
+            1,
+        )
+        if hover_amount > 0.03:
+            probe_t = (phase / (2.0 * math.pi)) % 1.0
+            probe_y = int(
+                frontier_y0
+                + probe_t * max(1, frontier_height - 1)
+            )
+            pygame.draw.circle(
+                screen,
+                (255, 255, 255),
+                (frontier_centre_x, probe_y),
+                1,
+            )
+
+    if thumb_hover or is_dragging:
+        if is_dirty:
+            bubble_text = (
+                f"Unsaved · {draft} ply · saved {saved}"
+            )
+        else:
+            bubble_text = f"Depth {draft} ply · {draft_tier}"
+        bubble_text = _elide_text(bubble_text, font_tiny, 205)
+        bubble = font_tiny.render(bubble_text, True, TEXT_COLOR)
+        tip_w = bubble.get_width() + 14
+        tip_h = 20
+        min_tip_x = row_rect.x + 116
+        max_tip_x = max(min_tip_x, chip_rect.x - tip_w - 6)
+        tip_x = max(
+            min_tip_x,
+            min(thumb_x - tip_w // 2, max_tip_x),
+        )
+        tip_rect = pygame.Rect(tip_x, row_rect.y + 3, tip_w, tip_h)
+        pygame.draw.rect(
+            screen, (11, 22, 34), tip_rect, border_radius=6
+        )
+        pygame.draw.rect(
+            screen, chip_border, tip_rect, 1, border_radius=6
+        )
+        pointer_x = max(
+            tip_rect.x + 7,
+            min(thumb_x, tip_rect.right - 7),
+        )
+        pygame.draw.polygon(
+            screen,
+            (11, 22, 34),
+            [
+                (pointer_x - 4, tip_rect.bottom - 1),
+                (pointer_x + 4, tip_rect.bottom - 1),
+                (
+                    pointer_x,
+                    min(socket_rect.y - 1, tip_rect.bottom + 5),
+                ),
+            ],
+        )
+        screen.blit(bubble, bubble.get_rect(center=tip_rect.center))
+
+    return thumb_x, thumb_y
+
+
 def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
 
@@ -16010,6 +17025,12 @@ def draw_engine_settings_content(screen, offset_x=0, offset_y=0):
 
         if key == "hash":
             _draw_polished_hash_slider(
+                screen, row_rect, track_rect, value_rect, mx, my
+            )
+            continue
+
+        if key == "depth":
+            _draw_polished_depth_slider(
                 screen, row_rect, track_rect, value_rect, mx, my
             )
             continue
