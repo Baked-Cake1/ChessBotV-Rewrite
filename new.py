@@ -45,6 +45,20 @@ DRAG_GRAB_ANIMATION_MS = 160
 DRAG_GRAB_MAX_LEAN_DEGREES = 5.0
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ANALYSIS_ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
+APP_VERSION = "v2-beta1"
+AUDIO_DIR = os.path.join(SCRIPT_DIR, "audio")
+# Logical move/feedback sounds -> files supplied in ./audio. Missing
+# files are ignored so a checkout without the local MP3s still runs.
+SOUND_FILES = {
+    "move": "move-self.mp3",
+    "capture": "capture.mp3",
+    "castle": "castle.mp3",
+    "check": "move-check.mp3",
+    "promote": "promote.mp3",
+    "game_end": "game-end.mp3",
+    "illegal": "illegal.mp3",
+}
+ILLEGAL_FLASH_MS = 1000
 
 # Colors
 WHITE = (255, 255, 255)
@@ -112,6 +126,57 @@ screen = pygame.display.set_mode((WIDTH, HEIGHT))
 font_large = pygame.font.SysFont("segoeui", 24, bold=True)
 font_small = pygame.font.SysFont("segoeui", 18)
 font_tiny = pygame.font.SysFont("segoeui", 15)
+
+# --- Game sounds ---
+_game_sounds = {}
+_game_sounds_loaded = False
+
+
+def preload_game_sounds():
+    """Load the seven local MP3s from ``audio/`` once, if present.
+
+    Audio is deliberately best-effort: a machine without an output
+    device, an SDL build without MP3 support, or a checkout that does
+    not contain the user's local files should simply play silently
+    rather than fail to start or interrupt a move.
+    """
+    global _game_sounds, _game_sounds_loaded
+    if _game_sounds_loaded:
+        return len(_game_sounds)
+    _game_sounds_loaded = True
+
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+    except Exception:
+        return 0
+
+    loaded = {}
+    for sound_name, filename in SOUND_FILES.items():
+        path = os.path.join(AUDIO_DIR, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            loaded[sound_name] = pygame.mixer.Sound(path)
+        except Exception:
+            continue
+    _game_sounds = loaded
+    if loaded:
+        print(f"Loaded {len(loaded)} game sound(s) from {AUDIO_DIR}.")
+    return len(loaded)
+
+
+def play_sound(sound_name):
+    """Play one logical game sound, returning whether playback started."""
+    preload_game_sounds()
+    sound = _game_sounds.get(sound_name)
+    if sound is None:
+        return False
+    try:
+        sound.play()
+    except Exception:
+        return False
+    return True
 
 
 # --- Ctypes: Always on Top ---
@@ -1386,6 +1451,125 @@ class AnimationManager:
         self.drag_grab_last_mouse_pos = None
         self.drag_grab_lean_degrees = 0.0
 
+        # Illegal-drag feedback: the released sprite flies back to its
+        # origin while that origin square flashes red for one second.
+        self.illegal_return_anim = None
+        self.illegal_flash_square = None
+        self.illegal_flash_started_ms = None
+
+    def clear_illegal_drag_feedback(self):
+        """Drop any in-flight illegal-drag return and red flash."""
+        self.illegal_return_anim = None
+        self.illegal_flash_square = None
+        self.illegal_flash_started_ms = None
+
+    def add_illegal_drag_return(
+        self,
+        piece,
+        origin_sq,
+        release_pos,
+        drag_offset,
+        start_scale=1.0,
+        start_rotation=0.0,
+        now_ms=None,
+    ):
+        """Start returning an illegally dropped piece to its origin.
+
+        ``release_pos`` is the cursor position (the transformed held
+        sprite's grab point), not its top-left corner. Returning that
+        same grab point to ``origin top-left + drag_offset`` makes the
+        enlarged/tilted held pose settle exactly into the square sprite
+        with no positional pop at either end.
+        """
+        if piece is None or origin_sq is None or drag_offset is None:
+            return False
+        if now_ms is None:
+            now_ms = pygame.time.get_ticks()
+        now_ms = int(now_ms)
+        drag_offset = (float(drag_offset[0]), float(drag_offset[1]))
+        start_grab = (float(release_pos[0]), float(release_pos[1]))
+        origin_xy = square_to_screen(origin_sq)
+        end_grab = (
+            float(origin_xy[0]) + drag_offset[0],
+            float(origin_xy[1]) + drag_offset[1],
+        )
+        distance = math.hypot(
+            end_grab[0] - start_grab[0], end_grab[1] - start_grab[1]
+        )
+        # Short hops still read as a deliberate snap-back; a board-wide
+        # return is capped so the piece is not left drifting for ages.
+        duration_ms = int(max(170, min(320, 150 + distance * 0.28)))
+
+        self.illegal_flash_square = origin_sq
+        self.illegal_flash_started_ms = now_ms
+        self.illegal_return_anim = {
+            "piece": piece,
+            "origin_sq": origin_sq,
+            "start_grab": start_grab,
+            "drag_offset": drag_offset,
+            "start_scale": float(start_scale),
+            "start_rotation": float(start_rotation),
+            "started_ms": now_ms,
+            "duration_ms": duration_ms,
+        }
+        self.reset_drag_grab_pose()
+        return True
+
+    def get_illegal_return_pose(self, now_ms=None):
+        """Current illegal-return sprite pose, or ``None`` when landed."""
+        anim = self.illegal_return_anim
+        if anim is None:
+            return None
+        if now_ms is None:
+            now_ms = pygame.time.get_ticks()
+        elapsed = max(0, int(now_ms) - int(anim["started_ms"]))
+        duration = max(1, int(anim["duration_ms"]))
+        if elapsed >= duration:
+            self.illegal_return_anim = None
+            return None
+
+        amount = cubic_ease_in_out(elapsed / duration)
+        origin_xy = square_to_screen(anim["origin_sq"])
+        drag_offset = anim["drag_offset"]
+        end_grab = (
+            float(origin_xy[0]) + drag_offset[0],
+            float(origin_xy[1]) + drag_offset[1],
+        )
+        start_grab = anim["start_grab"]
+        return {
+            "piece": anim["piece"],
+            "origin_sq": anim["origin_sq"],
+            "drag_offset": drag_offset,
+            "current_grab": (
+                start_grab[0] + (end_grab[0] - start_grab[0]) * amount,
+                start_grab[1] + (end_grab[1] - start_grab[1]) * amount,
+            ),
+            "scale": anim["start_scale"]
+            + (1.0 - anim["start_scale"]) * amount,
+            "rotation": anim["start_rotation"] * (1.0 - amount),
+            "progress": elapsed / duration,
+        }
+
+    def get_illegal_flash_alpha(self, now_ms=None):
+        """Red-overlay alpha for the one-second illegal-origin flash."""
+        if (
+            self.illegal_flash_square is None
+            or self.illegal_flash_started_ms is None
+        ):
+            return 0
+        if now_ms is None:
+            now_ms = pygame.time.get_ticks()
+        elapsed = int(now_ms) - int(self.illegal_flash_started_ms)
+        if elapsed < 0:
+            return 155
+        if elapsed >= ILLEGAL_FLASH_MS:
+            self.illegal_flash_square = None
+            self.illegal_flash_started_ms = None
+            return 0
+        if elapsed >= ILLEGAL_FLASH_MS - 150:
+            return int(round(155 * (ILLEGAL_FLASH_MS - elapsed) / 150))
+        return 155
+
     def reset_drag_grab_pose(self):
         """Forget the current held-piece pose ready for the next grab."""
         self.drag_grab_square = None
@@ -1450,6 +1634,13 @@ class AnimationManager:
         return scale, rotation
 
     def update(self):
+        # Time-based illegal-drag states prune themselves in their
+        # getters; call them here too so an expired return cannot linger
+        # if a caller updates animations without drawing the board.
+        _now_ms = pygame.time.get_ticks()
+        self.get_illegal_return_pose(_now_ms)
+        self.get_illegal_flash_alpha(_now_ms)
+
         if self.move_anim:
             self.move_anim["progress"] += self.move_anim["speed"]
             if self.move_anim["progress"] >= 1.0:
@@ -1599,6 +1790,7 @@ class AnimationManager:
         rook_target_sq=None,
         rook_piece=None,
     ):
+        self.clear_illegal_drag_feedback()
         sx, sy = square_to_screen(start_sq)
         ex, ey = square_to_screen(end_sq)
 
@@ -1658,6 +1850,7 @@ class AnimationManager:
         self.move_anim = None
         self.rook_anim = None
         self.board_reset_anims.clear()
+        self.clear_illegal_drag_feedback()
         from collections import defaultdict
         old_groups = defaultdict(list)
         new_groups = defaultdict(list)
@@ -1968,6 +2161,43 @@ def get_game_status(board):
     if board.is_check():
         return ("Check!", TEXT_STATUS, False)
     return (None, None, False)
+
+
+def get_move_sound_name(board_before, move):
+    """Classify a legal move for its one sound effect.
+
+    Priority is game-end, check, castle, promotion, capture, then an
+    ordinary move. Thus a mating capture plays ``game_end`` rather than
+    stacking check/capture sounds, while a non-checking promotion that
+    captures still uses the distinctive promotion sound.
+    """
+    if board_before is None or move is None:
+        return None
+    try:
+        is_capture = board_before.is_capture(move)
+        is_castling = board_before.is_castling(move)
+        board_after = board_before.copy()
+        board_after.push(move)
+    except Exception:
+        return None
+
+    if get_game_status(board_after)[2]:
+        return "game_end"
+    if board_after.is_check():
+        return "check"
+    if is_castling:
+        return "castle"
+    if move.promotion:
+        return "promote"
+    if is_capture:
+        return "capture"
+    return "move"
+
+
+def play_move_sound(board_before, move):
+    """Play the sound for ``move`` from the position before it was made."""
+    sound_name = get_move_sound_name(board_before, move)
+    return play_sound(sound_name) if sound_name else False
 
 
 def get_game_result(board):
@@ -2786,6 +3016,7 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
     move = build_move_with_promotion(board, from_sq, to_sq)
     if move not in board.legal_moves:
         return False
+    board_before = board.copy()
 
     is_castling, rook_start_sq, rook_target_sq, rook_piece = get_castling_info(board, from_sq, to_sq)
 
@@ -2824,6 +3055,7 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
 
     board.push(move)
     engine_thread.update_position(board)
+    play_move_sound(board_before, move)
     return True
 
 
@@ -2883,6 +3115,7 @@ def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_
     move = chess.Move(from_sq, to_sq, promotion=promo_piece)
     if move not in board.legal_moves:
         return False
+    board_before = board.copy()
     is_castling, rook_start_sq, rook_target_sq, rook_piece = get_castling_info(board, from_sq, to_sq)
     captured_piece = board.piece_at(to_sq)
     if captured_piece:
@@ -2891,6 +3124,7 @@ def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_
         anim_mgr.add_move(board.piece_at(from_sq), from_sq, to_sq, is_castling, rook_start_sq, rook_target_sq, rook_piece)
     board.push(move)
     engine_thread.update_position(board)
+    play_move_sound(board_before, move)
     return True
 
 
@@ -22638,7 +22872,7 @@ def draw_settings_menu(screen):
             screen.blit(about_title, about_title.get_rect(center=(WIDTH // 2 + offset_x, about_y)))
 
             version_text = font_small.render(
-                "ChessBotV Rewrite Version 1.5-beta2", True, TEXT_COLOR
+                f"ChessBotV Rewrite Version {APP_VERSION}", True, TEXT_COLOR
             )
             screen.blit(version_text, version_text.get_rect(center=(WIDTH // 2 + offset_x, about_y + 40)))
 
@@ -23146,6 +23380,14 @@ def draw_gui(
                 s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
                 s.fill(HIGHLIGHT_COLOR)
                 screen.blit(s, sq_rect.topleft)
+            if sq == anim_mgr.illegal_flash_square:
+                flash_alpha = anim_mgr.get_illegal_flash_alpha()
+                if flash_alpha > 0:
+                    s = pygame.Surface(
+                        (SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA
+                    )
+                    s.fill((255, 45, 45, flash_alpha))
+                    screen.blit(s, sq_rect.topleft)
 
     # Board border with AA
     pygame.draw.rect(
@@ -23252,6 +23494,18 @@ def draw_gui(
 
     reset_targets = {a["target_sq"] for a in anim_mgr.board_reset_anims} if anim_mgr.board_reset_anims else set()
 
+    illegal_return_pose = anim_mgr.get_illegal_return_pose()
+    if illegal_return_pose is not None and board.piece_at(
+        illegal_return_pose["origin_sq"]
+    ) != illegal_return_pose["piece"]:
+        # The board changed underneath an in-flight return (reset,
+        # import, engine move): never hide or duplicate the new piece.
+        anim_mgr.clear_illegal_drag_feedback()
+        illegal_return_pose = None
+    illegal_return_sq = (
+        illegal_return_pose["origin_sq"] if illegal_return_pose else None
+    )
+
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if not piece:
@@ -23266,6 +23520,8 @@ def draw_gui(
         ):
             continue
         if dragging and sq == drag_sq:
+            continue
+        if sq == illegal_return_sq:
             continue
         if sq in reset_targets:
             continue
@@ -23433,6 +23689,23 @@ def draw_gui(
     # Analysis Settings annotations sit above settled pieces and arrows,
     # while a piece currently being dragged still renders above them.
     draw_analysis_board_overlays(screen, board)
+
+    # Illegal drop: fly the released piece back to its flashing origin,
+    # easing its grabbed scale/tilt back to the settled sprite as it goes.
+    if illegal_return_pose is not None:
+        pkey = get_piece_key(illegal_return_pose["piece"])
+        if pkey in images:
+            returned_image, grab_x, grab_y = _transform_dragged_piece_image(
+                images[pkey],
+                illegal_return_pose["drag_offset"],
+                illegal_return_pose["scale"],
+                illegal_return_pose["rotation"],
+            )
+            current_grab = illegal_return_pose["current_grab"]
+            screen.blit(
+                returned_image,
+                (current_grab[0] - grab_x, current_grab[1] - grab_y),
+            )
 
     # 5b. Dragged piece — follows cursor on top of everything. Ease it
     # into a slightly larger, tilted "grabbed" pose around the clicked
@@ -23640,6 +23913,7 @@ def main():
     # (local CNN or chess-fen-detector) is loaded lazily when Board
     # Detection or Auto-play first needs it.
     preload_piece_images()
+    preload_game_sounds()
 
     selected_sq = None
     dragging = False
@@ -23710,10 +23984,12 @@ def main():
         if not pv or pv[0] not in board.legal_moves:
             return False
         best_move = pv[0]
+        board_before = board.copy()
         add_move_animation_for_move(anim_mgr, board, best_move, reverse=False)
         board.push(best_move)
         note_new_move()
         engine_thread.update_position(board)
+        play_move_sound(board_before, best_move)
         return True
 
     # Auto-Move arming: for a single colour it only starts after that
@@ -23734,10 +24010,12 @@ def main():
         nonlocal auto_seen_ply, auto_fired_key
         if move not in board.legal_moves:
             return False
+        board_before = board.copy()
         add_move_animation_for_move(anim_mgr, board, move, reverse=False)
         board.push(move)
         note_new_move()
         engine_thread.update_position(board)
+        play_move_sound(board_before, move)
         _autoplay["expected_fen"] = board.fen()
         auto_seen_ply = len(board.move_stack)
         auto_fired_key = None
@@ -24349,10 +24627,12 @@ def main():
         nonlocal auto_seen_ply, auto_fired_key
         if move not in board.legal_moves:
             return False
+        board_before = board.copy()
         add_move_animation_for_move(anim_mgr, board, move, reverse=False)
         board.push(move)
         note_new_move()
         engine_thread.update_position(board)
+        play_move_sound(board_before, move)
         _advisor["expected_fen"] = board.fen()
         auto_seen_ply = len(board.move_stack)
         auto_fired_key = None
@@ -24817,7 +25097,7 @@ def main():
             and not board_detection_running
             and promotion_pending is None
             and not dragging
-            and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims)
+            and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim)
             and _result is None
             and auto_pos_frames >= 2
             and _pos_key != auto_fired_key
@@ -24966,7 +25246,7 @@ def main():
                     elif settings_button_rect.collidepoint(mx, my):
                         begin_settings_menu_open()
 
-                    elif not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
+                    elif not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim):
                         if not board.is_game_over(claim_draw=True):
                             sq = get_square_from_pos(event.pos)
                             if sq is not None:
@@ -24994,6 +25274,10 @@ def main():
                                             if piece and piece.color == board.turn:
                                                 selected_sq = sq
                                             else:
+                                                # A genuine click-to-move
+                                                # attempt to a square the
+                                                # selected piece cannot use.
+                                                play_sound("illegal")
                                                 selected_sq = None
                                         dragging = False
                                         drag_sq = None
@@ -25010,7 +25294,7 @@ def main():
                     or menu_anim_opening
                     or menu_anim_closing
                 )
-                if dragging and not menu_active and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims):
+                if dragging and not menu_active and not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.board_reset_anims or anim_mgr.illegal_return_anim):
                     drop_sq = get_square_from_pos(event.pos)
                     if drop_sq is not None and drag_sq is not None and drop_sq != drag_sq:
                         if is_promotion_move(board, drag_sq, drop_sq):
@@ -25025,6 +25309,21 @@ def main():
                             note_new_move()
                             selected_sq = None
                         else:
+                            drag_piece = board.piece_at(drag_sq)
+                            grab_scale, grab_rotation = (
+                                anim_mgr.get_drag_grab_pose(
+                                    drag_sq, event.pos
+                                )
+                            )
+                            anim_mgr.add_illegal_drag_return(
+                                drag_piece,
+                                drag_sq,
+                                event.pos,
+                                drag_offset,
+                                start_scale=grab_scale,
+                                start_rotation=grab_rotation,
+                            )
+                            play_sound("illegal")
                             piece = board.piece_at(drop_sq)
                             if piece and piece.color == board.turn:
                                 selected_sq = drop_sq
@@ -25126,7 +25425,7 @@ def main():
                             begin_settings_menu_close()
                     else:
                         selected_sq = None
-                elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and not show_auto_color_dialog and promotion_pending is None and not dragging and not anim_mgr.board_reset_anims:
+                elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and not show_auto_color_dialog and promotion_pending is None and not dragging and not anim_mgr.board_reset_anims and not anim_mgr.illegal_return_anim:
                     if event.key == pygame.K_LEFT:
                         # Previous move (kept in history_redo for →), played backwards
                         if board.move_stack:
@@ -25145,7 +25444,7 @@ def main():
                     toggle_eval_side()
 
                 elif event.key == pygame.K_SPACE and menu_anim_progress == 0 and not show_auto_color_dialog:
-                    if not (anim_mgr.move_anim or anim_mgr.rook_anim):
+                    if not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.illegal_return_anim):
                         execute_engine_best_move()
 
 

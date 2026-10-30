@@ -1,4 +1,4 @@
-# ChessBotV — Rewrite (v1.5-beta2)
+# ChessBotV — Rewrite (v2-beta1)
 
 A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against **Stockfish** (or any UCI engine), get live evaluation, opening names, and engine suggestions — with smooth animations, board themes, and modern UI.
 
@@ -7,7 +7,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 ## Versions
 
 - **Current stable version:** **v1.0** (Initial release)
-- **Current beta / developer release:** **v1.5-beta2** (active development on this branch)
+- **Current beta / developer release:** **v2-beta1** (active development on this branch)
 
 ---
 
@@ -15,6 +15,8 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
 
 ### Play & Input
 - **Two input modes:** Click piece → green circles, *or* **drag & drop** to any legal square; a held piece smoothly grows to 115% and tilts slightly around the grabbed point, with a little smoothed lean as it moves
+- **Move sounds:** local files in `audio/` distinguish an ordinary move (`move-self.mp3`), capture (`capture.mp3`), castle (`castle.mp3`), promotion (`promote.mp3`), check (`move-check.mp3`), game end (`game-end.mp3`), and illegal move attempt (`illegal.mp3`); overlapping cases use game-end → check → castle → promotion → capture priority, and missing files simply stay silent
+- **Illegal drag feedback:** releasing a dragged piece on a square it cannot use plays the illegal sound, flies the piece back to its origin while its held scale/tilt settles, and flashes the origin square red for one second
 - Handles **castling, en-passant, promotion (choice dialog Q/R/B/N, no pawn/king), captures** and all legal chess rules via `python-chess`
 - **Space** to play the engine's top move instantly
 - **New Game** smoothly animates pieces back to starting squares
@@ -56,7 +58,7 @@ A polished **UCI chess GUI** built with `pygame` + `python-chess`. Play against 
   - **Engine Settings** — its polished indigo main-menu button carries a detailed gear medallion, five miniature tracks mirroring the staged slider values, an amber unsaved-changes badge and a hover values tooltip; its polished Threads slider adds a CPU chip/core-bank track with core pips and parallel lanes, saved/staged markers, a four-core thumb, an `x of y` value chip capped at this PC's logical-thread limit and an in-row hover/drag bubble; its polished Skill Level slider adds a crown medallion, Gentle/Club/Expert/Master/Full-strength tiers, a violet-to-gold rung ladder with level pips, saved/staged markers, a star thumb, an `x of 20` value chip, five ascending mastery bars and an in-row hover/drag bubble; its polished Hash slider adds a RAM-module icon, Compact/Light/Balanced/Deep/Safe-maximum cache tiers, a cyan-to-gold power-of-two step track with stop pips and an eight-cell memory bank, saved/staged markers, a memory-chip thumb, a compact MB/GB value chip and an in-row bubble showing its share of physical RAM; its polished Depth Limit slider adds widening search-strata artwork, Shallow/Tactical/Deep/Extreme/Maximum tiers, a sky-to-rose track with a pip for every ply and five-ply majors, saved/staged markers, a downward-chevron thumb, an `x of 40` value chip, seven widening frontier strata and an in-row hover/drag bubble; its polished MultiPV slider adds a fanning candidate-lines icon, Best-line/2/3/4/5 ranked-lines tiers, a track flowing through the blue/teal/violet/orange/green suggestion-arrow rank palettes, five numbered rank medallions, saved/staged markers, a miniature fan thumb, an `x of 5` value chip, five shrinking rank-arrow lanes and an in-row hover/drag bubble naming the ranks shown; below the sliders, its polished Reset button adds a slate restore medallion with rotating arrows and five default rails, while its polished Save button cross-fades between a disabled saved/check state and an emerald floppy-disk state with an amber badge counting unsaved slider rows; the page itself has sliders for `Threads` (1-1024), `Skill Level` (0-20), `Hash` (16-32768 MB stepped), `Depth Limit` (5-40), and `MultiPV` (1-5), and saving a changed MultiPV value immediately recalculates the current board
   - **Analysis Settings** — a long, mouse-wheel-scrollable page of exceptionally large saved board-overlay toggles. **Key Elements** can place the white-chroma-keyed `icons/pinned.png` on pieces pinned to their king or queen (with a simple drawn fallback until that file is supplied), a small red plus on a king that is not currently in check but can be checked by one legal move (hidden throughout checkmate positions), the white-chroma-keyed `icons/unprotected.png` at the top-right of non-king pieces no friendly piece defends, and bottom-left legal-mobility percentage circles (distinct legal destinations divided by that piece's empty-board destinations from the same square; green at 75-100%, orange at 25-74%, red at 1-24%, hidden at 0%). **Passed Pawns** adds bottom-right dots: red for backwards pawns, orange for isolated or unable-to-move pawns, and green only for passed pawns within three pawn moves of promotion
   - **Auto-Play Settings** — its polished teal-to-violet main-menu button carries a scanning eval-scope medallion, a live priority subtitle and three status rails for Auto-Move, Board Detection and external Auto-play, with a hover tooltip spelling out each state; on the page, its Advisor, Auto-Move, depth, colour-choice, Board Detection, Auto-play and Use Package controls span the same wide 600 px column as the Analysis Settings rows. Internal **Auto-Move** always starts off and its on/off state is never saved. Its separate target-depth control accepts `0-40`; `0` means “use the current Depth Limit”. The same page also hosts a compact session-only **Advisor Mode** toggle, Board Detection, Auto-play and a saved **Use Package** toggle: off uses the local `chessbotv_cnn.pth`, while on sends ChessBotV's already-located full-board crop to the optional `chess-fen-detector` package for the next detection/Auto-play/Advisor scan and that session's changed-square checks
-  - **About** — version `v1.5-beta2` + polished sapphire **GitHub** button with a cat medallion, source-branch traces and an external-link arrow (opens https://github.com/Baked-Cake1/ChessBotV-Rewrite) + polished ruby **Restart** button with a rotating circular-arrow medallion, reboot-status dots and a brief “Restarting…” state (fires `start.bat` via exit code 42 loop); pinned at the bottom is a polished **Always on Top** toggle whose stacked-window icon rises when on, with a status LED, gradient track and tactile sliding knob
+  - **About** — version `v2-beta1` + polished sapphire **GitHub** button with a cat medallion, source-branch traces and an external-link arrow (opens https://github.com/Baked-Cake1/ChessBotV-Rewrite) + polished ruby **Restart** button with a rotating circular-arrow medallion, reboot-status dots and a brief “Restarting…” state (fires `start.bat` via exit code 42 loop); pinned at the bottom is a polished **Always on Top** toggle whose stacked-window icon rises when on, with a status LED, gradient track and tactile sliding knob
 
 ---
 
@@ -131,7 +133,7 @@ python new.py --help
 |---|---|
 | **Left-click** piece | Select, show legal moves (green = quiet, red+ring = capture) |
 | **Left-click** green/red | Move selected piece |
-| **Drag & drop** | Alternative: drag any of your pieces to a legal square; while held, it eases to 115% size with a slight grab tilt/lean |
+| **Drag & drop** | Alternative: drag any of your pieces to a legal square; while held, it eases to 115% size with a slight grab tilt/lean. An illegal drop plays `illegal.mp3`, returns the piece to its origin, and flashes that origin red for one second |
 | **Pawn to last rank** | Promotion dialog — click Q/R/B/N (no pawn/king) |
 | **Space** (menu closed, not animating) | Play engine's `pv[0]` if legal |
 | **Flip** (top bar) or **F** | Flip the board perspective; the brass button's ivory/charcoal arrows ease-swap colours and its tooltip names the side you will view from |
@@ -265,7 +267,7 @@ ChessBotV-Rewrite/
 ├── pieces/              # Board themes
 │   ├── classic/         # bb.png … wp.png (required fallback)
 │   └── chesscom/8_bit/  # Chess.com styles auto-discovered
-└── audio/               # (reserved, currently empty)
+└── audio/               # Local move sounds: move-self/capture/castle/move-check/promote/game-end/illegal.mp3
 ```
 
 - **Layout constants:** `SQUARE_SIZE=80`, `BOARD_WIDTH=640`, `EVAL_BAR_WIDTH=32`, `PADDING=24`, `TOP_BAR_HEIGHT=44`, `INFO_HEIGHT=152`
@@ -287,6 +289,7 @@ ChessBotV-Rewrite/
 - `Engine not found or error` → check `ENGINE_PATH` exists and is executable
 - `engine closed its output stream` → engine crashed; try lower `Hash`/`Threads`
 - No pieces → ensure `pieces/<theme>` has 12 PNGs or fallback colored circles will show
+- No sound → ensure `audio/` beside `new.py` contains `move-self.mp3`, `capture.mp3`, `castle.mp3`, `move-check.mp3`, `promote.mp3`, `game-end.mp3`, and `illegal.mp3`; absent or unreadable files are skipped silently
 - No openings → `openings.json not found.` → place file in repo root
 - Themes missing → falls back to `classic`; if even that missing, uses first found theme
 - Config not saving → check write permission for `configuration.cfg`
@@ -295,7 +298,7 @@ ChessBotV-Rewrite/
 
 ## Roadmap
 
-- Sound settings & audio playback (`audio/` placeholder)
+- Optional sound on/off and volume settings (move audio playback is implemented)
 - Game Controls page (currently inactive in menu)
 - FEN/PGN export and takeback
 - Per-theme board colors
@@ -306,5 +309,5 @@ ChessBotV-Rewrite/
 
 Bug reports / visual issues / ideas → open an **Issue**. Pull requests welcome — keep style close to `new.py` (PEP 8-ish, CRLF ok, 80-col board rendering).
 
-**Version:** `ChessBotV Rewrite Version 1.5-beta2` (about page)
+**Version:** `ChessBotV Rewrite Version v2-beta1` (about page)
 
