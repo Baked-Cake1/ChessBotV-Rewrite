@@ -1,15 +1,22 @@
+import array
 import base64
+import csv
 import ctypes
 import importlib.util
+import io
 import json
 import math
 import os
+import queue
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import wave
 import webbrowser
+from pathlib import Path
 
 import chess
 
@@ -47,6 +54,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ANALYSIS_ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 APP_VERSION = "v2-beta1"
 AUDIO_DIR = os.path.join(SCRIPT_DIR, "audio")
+GAME_REVIEW_OPENING_DIR = os.path.join(SCRIPT_DIR, "opening")
+GAME_REVIEW_PIPER_DIR = os.path.join(SCRIPT_DIR, "piper")
+GAME_REVIEW_PIPER_VOICE_ID = "en_GB-northern_english_male-medium"
+GAME_REVIEW_PIPER_MODEL_FILENAME = f"{GAME_REVIEW_PIPER_VOICE_ID}.onnx"
+GAME_REVIEW_COACH_NAME = "Coach Nolan"
 # Logical move/feedback sounds -> files supplied in ./audio. Missing
 # files are ignored so a checkout without the local MP3s still runs.
 SOUND_FILES = {
@@ -515,6 +527,12 @@ GAME_REVIEW_DEPTH = 12
 GAME_REVIEW_PANEL_HEIGHT = 142
 GAME_REVIEW_BUTTON_HEIGHT = 96
 GAME_REVIEW_RATINGS = {
+    "book": {
+        "label": "Book Move",
+        "filename": "book.png",
+        "colour": (176, 141, 87),
+        "symbol": "B",
+    },
     "best": {
         "label": "Best Move",
         "filename": "best.png",
@@ -555,6 +573,31 @@ GAME_REVIEW_RATINGS = {
 _game_review_lock = threading.Lock()
 _game_review_thread = None
 _game_review_icon_cache = {}
+_game_review_opening_book_lock = threading.Lock()
+_game_review_opening_book_cache = {"signature": None, "book": None}
+_game_review_speech_lock = threading.Lock()
+_game_review_speech_queue = queue.Queue()
+_game_review_speech_thread = None
+_game_review_speech_cache = {}
+_game_review_piper_voice = None
+_game_review_piper_model_path = None
+_game_review_speech_channel = None
+_game_review_speech_sound = None
+_game_review_speech = {
+    "status": "idle",  # idle|queued|loading|downloading|synthesising|ready|playing|finished|unavailable
+    "request_id": 0,
+    "key": None,
+    "text": "",
+    "error": "",
+    "wav_bytes": None,
+    "envelope": [],
+    "bucket_seconds": 0.05,
+    "sample_rate": 0,
+    "duration": 0.0,
+    "requested_at": 0.0,
+    "started_at": 0.0,
+    "voice": GAME_REVIEW_PIPER_VOICE_ID,
+}
 _game_review = {
     "active": False,
     "closing": False,
@@ -2973,8 +3016,12 @@ def game_review_centipawn_loss(before_cp, after_cp, mover_colour):
     return max(0, after_cp - before_cp)
 
 
-def classify_game_review_move(centipawn_loss, is_best_move=False):
-    """Map centipawn loss to one of the six Game Review ratings."""
+def classify_game_review_move(
+    centipawn_loss, is_best_move=False, is_book_move=False
+):
+    """Map centipawn loss to one of the seven Game Review ratings."""
+    if is_book_move:
+        return "book"
     if is_best_move:
         return "best"
     try:
@@ -3043,6 +3090,7 @@ def cancel_game_review(reason=""):
         if float(_game_review.get("anim", 0.0)) <= 0.0:
             _game_review["active"] = False
             _game_review["closing"] = False
+    stop_game_review_speech()
 
 
 def close_game_review():
@@ -3125,6 +3173,291 @@ def _game_review_terminal_evaluation(board):
         "bestmove_uci": None,
         "bestmove_san": "—",
         "depth": GAME_REVIEW_DEPTH,
+    }
+
+
+# --- Game Review opening book (local Lichess TSV dataset) ---
+_GAME_REVIEW_OPENING_FILES = ("a.tsv", "b.tsv", "c.tsv", "d.tsv", "e.tsv")
+
+
+def _game_review_position_key(board):
+    """First four FEN fields, with Lichess-style legal en passant."""
+    try:
+        return " ".join(board.fen(en_passant="legal").split()[:4])
+    except Exception:
+        return " ".join(board.fen().split()[:4])
+
+
+def _game_review_opening_files(directory=None):
+    """Locate a-e.tsv directly in ``opening/`` or in ``opening/dist/``."""
+    base_dir = os.fspath(directory or GAME_REVIEW_OPENING_DIR)
+    for candidate_dir in (base_dir, os.path.join(base_dir, "dist")):
+        files = [
+            os.path.join(candidate_dir, filename)
+            for filename in _GAME_REVIEW_OPENING_FILES
+            if os.path.isfile(os.path.join(candidate_dir, filename))
+        ]
+        if files:
+            return candidate_dir, files
+    return base_dir, []
+
+
+def _game_review_opening_signature(directory=None):
+    _source_dir, files = _game_review_opening_files(directory)
+    signature = []
+    for path in files:
+        try:
+            stat = os.stat(path)
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            signature.append((path, None, None))
+    return tuple(signature)
+
+
+def _parse_game_review_opening_pgn(pgn):
+    """Parse one Lichess source ``pgn`` field into validated UCI moves."""
+    if not pgn:
+        return []
+    text = re.sub(r"\{[^}]*\}", " ", str(pgn))
+    text = re.sub(r";[^\n]*", " ", text)
+    # Lichess rows do not normally contain variations, but stripping a
+    # simple parenthetical keeps user-edited rows from breaking the book.
+    text = re.sub(r"\([^()]*\)", " ", text)
+    board = chess.Board()
+    moves = []
+    for raw_token in text.replace("...", " ").split():
+        token = raw_token.strip()
+        if not token or token in {"1-0", "0-1", "1/2-1/2", "*"}:
+            continue
+        if token.startswith("$"):
+            continue
+        token = re.sub(r"^\d+\.+", "", token)
+        if not token or token.isdigit():
+            continue
+        token = token.rstrip("!?")
+        token = token.replace("0-0-0", "O-O-O").replace("0-0", "O-O")
+        try:
+            move = board.parse_san(token)
+        except Exception:
+            return []
+        moves.append(move.uci())
+        board.push(move)
+    return moves
+
+
+def _parse_game_review_opening_uci(uci_field):
+    """Parse one Lichess ``dist`` ``uci`` field, validating every move."""
+    if not uci_field:
+        return []
+    board = chess.Board()
+    moves = []
+    for token in str(uci_field).replace(",", " ").split():
+        try:
+            move = chess.Move.from_uci(token.strip().lower())
+        except Exception:
+            return []
+        if move not in board.legal_moves:
+            return []
+        moves.append(move.uci())
+        board.push(move)
+    return moves
+
+
+def _game_review_opening_row_sequence(row):
+    sequence = _parse_game_review_opening_uci(row.get("uci", ""))
+    if sequence:
+        return sequence
+    return _parse_game_review_opening_pgn(row.get("pgn", ""))
+
+
+def load_game_review_opening_book(directory=None, force_reload=False):
+    """Load/cache the local Lichess openings from ``opening/a.tsv``-``e.tsv``.
+
+    Both Lichess layouts are accepted:
+
+    * source files: ``eco``, ``name``, ``pgn``;
+    * generated ``dist`` files: those fields plus ``uci`` and ``epd``.
+
+    The returned tree supports three complementary kinds of Book Move
+    detection: exact played move-order prefixes, known continuations from
+    the current position, and reaching any known opening-tree position
+    (which covers transpositions). Files are optional local data; when
+    they have not been supplied yet this simply returns an empty book.
+    """
+    signature = _game_review_opening_signature(directory)
+    with _game_review_opening_book_lock:
+        cached = _game_review_opening_book_cache.get("book")
+        if (
+            not force_reload
+            and cached is not None
+            and _game_review_opening_book_cache.get("signature") == signature
+        ):
+            return cached
+
+        source_dir, files = _game_review_opening_files(directory)
+        book = {
+            "entries": 0,
+            "prefixes": set(),
+            "named_prefixes": {},
+            "positions": set(),
+            "named_positions": {},
+            "continuations": {},
+            "source_dir": source_dir,
+            "files": list(files),
+        }
+        starting_key = _game_review_position_key(chess.Board())
+        book["positions"].add(starting_key)
+
+        for path in files:
+            try:
+                handle = open(path, "r", encoding="utf-8-sig", newline="")
+            except OSError:
+                continue
+            with handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                for raw_row in reader:
+                    if not raw_row:
+                        continue
+                    row = {
+                        str(key).strip().lower(): (
+                            "" if value is None else str(value).strip()
+                        )
+                        for key, value in raw_row.items()
+                        if key is not None
+                    }
+                    sequence = _game_review_opening_row_sequence(row)
+                    metadata = {
+                        "eco": row.get("eco", ""),
+                        "name": row.get("name", ""),
+                    }
+                    row_epd = row.get("epd", "")
+                    if row_epd:
+                        epd_key = " ".join(
+                            row_epd.replace(";", " ").split()[:4]
+                        )
+                        if epd_key and metadata["name"]:
+                            book["named_positions"].setdefault(
+                                epd_key, dict(metadata)
+                            )
+                            book["positions"].add(epd_key)
+                    if not sequence:
+                        continue
+
+                    board = chess.Board()
+                    prefix = []
+                    valid = True
+                    for index, move_uci in enumerate(sequence):
+                        try:
+                            move = chess.Move.from_uci(move_uci)
+                        except Exception:
+                            valid = False
+                            break
+                        if move not in board.legal_moves:
+                            valid = False
+                            break
+                        before_key = _game_review_position_key(board)
+                        book["continuations"].setdefault(before_key, set()).add(
+                            move_uci
+                        )
+                        prefix.append(move_uci)
+                        prefix_key = tuple(prefix)
+                        book["prefixes"].add(prefix_key)
+                        board.push(move)
+                        after_key = _game_review_position_key(board)
+                        book["positions"].add(after_key)
+                        if index == len(sequence) - 1 and metadata["name"]:
+                            book["named_prefixes"].setdefault(
+                                prefix_key, dict(metadata)
+                            )
+                            book["named_positions"].setdefault(
+                                after_key, dict(metadata)
+                            )
+                    if valid:
+                        book["entries"] += 1
+
+        _game_review_opening_book_cache["signature"] = signature
+        _game_review_opening_book_cache["book"] = book
+        if book["entries"]:
+            print(
+                "Loaded "
+                f"{book['entries']} Game Review opening line(s) from {source_dir}."
+            )
+        return book
+
+
+def get_game_review_book_move(board, move, sequence_uci=None, book=None):
+    """Return Book Move metadata for ``move``, or ``None`` if not in book."""
+    if board is None or move is None:
+        return None
+    book = book or load_game_review_opening_book()
+    if not book or not book.get("entries"):
+        return None
+
+    if sequence_uci is None:
+        sequence = [played.uci() for played in board.move_stack]
+        sequence.append(move.uci())
+    else:
+        sequence = [str(item) for item in sequence_uci]
+        if not sequence or sequence[-1] != move.uci():
+            sequence.append(move.uci())
+    sequence_key = tuple(sequence)
+
+    try:
+        after_board = board.copy(stack=False)
+    except Exception:
+        after_board = board.copy()
+    if move not in after_board.legal_moves:
+        return None
+    before_key = _game_review_position_key(board)
+    after_board.push(move)
+    after_key = _game_review_position_key(after_board)
+
+    sequence_match = False
+    if sequence_key in book.get("prefixes", set()):
+        replay = chess.Board()
+        replay_valid = True
+        for item in sequence:
+            try:
+                replay_move = chess.Move.from_uci(item)
+            except Exception:
+                replay_valid = False
+                break
+            if replay_move not in replay.legal_moves:
+                replay_valid = False
+                break
+            replay.push(replay_move)
+        sequence_match = bool(
+            replay_valid and _game_review_position_key(replay) == after_key
+        )
+
+    continuation_match = move.uci() in book.get("continuations", {}).get(
+        before_key, set()
+    )
+    position_match = after_key in book.get("positions", set())
+    if not (sequence_match or continuation_match or position_match):
+        return None
+
+    metadata = book.get("named_positions", {}).get(after_key)
+    if metadata is None and sequence_match:
+        # The deepest named prefix gives the family/variation this line is
+        # still following, even when this particular deeper move-order is
+        # only an intermediate prefix of a longer named line.
+        for length in range(len(sequence), 0, -1):
+            metadata = book.get("named_prefixes", {}).get(sequence_key[:length])
+            if metadata:
+                break
+    metadata = metadata or {}
+    if sequence_match:
+        source = "sequence"
+    elif continuation_match:
+        source = "position"
+    else:
+        source = "transposition"
+    return {
+        "is_book_move": True,
+        "opening_eco": metadata.get("eco", ""),
+        "opening_name": metadata.get("name", ""),
+        "book_source": source,
     }
 
 
@@ -3273,6 +3606,8 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
     try:
         evaluator = evaluator_factory()
         board = chess.Board(root_fen)
+        opening_book = load_game_review_opening_book()
+        played_sequence = []
         before = evaluator.evaluate(board)
         with _game_review_lock:
             if int(_game_review.get("generation", 0)) != int(generation):
@@ -3289,7 +3624,15 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                 raise ValueError(f"review move is no longer legal: {move_uci}")
             mover = board.turn
             move_san = board.san(move)
+            candidate_sequence = played_sequence + [move_uci]
+            book_info = get_game_review_book_move(
+                board,
+                move,
+                candidate_sequence,
+                book=opening_book,
+            )
             board.push(move)
+            played_sequence = candidate_sequence
             after = evaluator.evaluate(board)
             if not _game_review_generation_is_current(generation):
                 return
@@ -3297,13 +3640,25 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                 before.get("cp", 0), after.get("cp", 0), mover
             )
             is_best = before.get("bestmove_uci") == move_uci
-            rating = classify_game_review_move(cpl, is_best_move=is_best)
+            engine_rating = classify_game_review_move(
+                cpl, is_best_move=is_best
+            )
+            rating = classify_game_review_move(
+                cpl,
+                is_best_move=is_best,
+                is_book_move=bool(book_info),
+            )
             result = {
                 "ply": index + 1,
                 "move_uci": move_uci,
                 "move_san": move_san,
                 "mover": "white" if mover == chess.WHITE else "black",
                 "rating": rating,
+                "engine_rating": engine_rating,
+                "is_book_move": bool(book_info),
+                "opening_eco": (book_info or {}).get("opening_eco", ""),
+                "opening_name": (book_info or {}).get("opening_name", ""),
+                "book_source": (book_info or {}).get("book_source", ""),
                 "centipawn_loss": int(cpl),
                 "is_best_move": bool(is_best),
                 "bestmove_uci": before.get("bestmove_uci"),
@@ -3350,6 +3705,7 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
 def start_game_review(board, history_redo=None, evaluator_factory=None):
     """Start (or restart) reviewing the board's full recorded line."""
     global _game_review_thread
+    stop_game_review_speech()
     played = list(board.move_stack)
     future = list(reversed(list(history_redo or [])))
     line = played + future
@@ -3403,6 +3759,582 @@ def start_game_review(board, history_redo=None, evaluator_factory=None):
     )
     _game_review_thread.start()
     return True
+
+
+# --- Game Review Piper speech ---
+def game_review_san_to_speech(san):
+    """Convert SAN such as ``Nf3``, ``exd5`` or ``O-O+`` to spoken words."""
+    text = str(san or "").strip()
+    if not text or text == "—":
+        return "no move"
+    suffix = ""
+    if text.endswith("#"):
+        suffix = ", checkmate"
+        text = text[:-1]
+    elif text.endswith("+"):
+        suffix = ", check"
+        text = text[:-1]
+    text = text.rstrip("!?")
+    if text in {"O-O", "0-0"}:
+        return f"kingside castle{suffix}"
+    if text in {"O-O-O", "0-0-0"}:
+        return f"queenside castle{suffix}"
+
+    promotion = ""
+    if "=" in text:
+        text, promotion_symbol = text.split("=", 1)
+        promotion_name = {
+            "Q": "queen",
+            "R": "rook",
+            "B": "bishop",
+            "N": "knight",
+        }.get(promotion_symbol[:1].upper(), "queen")
+        promotion = f" promotes to {promotion_name}"
+
+    piece_names = {
+        "K": "king",
+        "Q": "queen",
+        "R": "rook",
+        "B": "bishop",
+        "N": "knight",
+    }
+    if text[:1] in piece_names:
+        piece = piece_names[text[:1]]
+        rest = text[1:]
+    else:
+        piece = "pawn"
+        rest = text
+    capture = "x" in rest
+    destination = re.search(r"([a-h])([1-8])$", rest.replace("x", ""))
+    if destination is None:
+        return str(san)
+    square = f"{destination.group(1)} {destination.group(2)}"
+    phrase = f"{piece} takes {square}" if capture else f"{piece} {square}"
+    return f"{phrase}{promotion}{suffix}"
+
+
+def _normalise_game_review_speech_text(text):
+    return " ".join(str(text or "").replace("—", ",").split()).strip()
+
+
+def _game_review_piper_candidate_paths():
+    paths = []
+    seen = set()
+
+    def add_path(path):
+        if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(os.fspath(path)))
+        if os.path.isdir(path):
+            path = os.path.join(path, GAME_REVIEW_PIPER_MODEL_FILENAME)
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    for env_name in ("CHESSBOTV_PIPER_MODEL", "PIPER_MODEL"):
+        add_path(os.environ.get(env_name))
+
+    candidate_dirs = [
+        GAME_REVIEW_PIPER_DIR,
+        SCRIPT_DIR,
+        os.path.join(SCRIPT_DIR, "voices"),
+        os.path.join(GAME_REVIEW_PIPER_DIR, "voices"),
+        os.path.join(os.path.expanduser("~"), "piper"),
+        os.path.join(os.path.expanduser("~"), "Documents", "piper"),
+        os.path.join(os.path.expanduser("~"), ".local", "share", "piper"),
+    ]
+    for env_name in ("LOCALAPPDATA", "APPDATA"):
+        base = os.environ.get(env_name)
+        if base:
+            candidate_dirs.append(os.path.join(base, "piper"))
+    for directory in candidate_dirs:
+        add_path(os.path.join(directory, GAME_REVIEW_PIPER_MODEL_FILENAME))
+    return paths
+
+
+def find_game_review_piper_model():
+    """First usable local ``en_GB-northern_english_male-medium`` model."""
+    for path in _game_review_piper_candidate_paths():
+        config_path = f"{path}.json"
+        try:
+            if (
+                os.path.isfile(path)
+                and os.path.getsize(path) > 0
+                and os.path.isfile(config_path)
+                and os.path.getsize(config_path) > 0
+            ):
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _set_game_review_speech_status(request_id, status):
+    if request_id is None:
+        return
+    with _game_review_speech_lock:
+        if int(_game_review_speech.get("request_id", 0)) == int(request_id):
+            _game_review_speech["status"] = status
+
+
+def _download_game_review_piper_voice(request_id=None):
+    """Download the requested Piper voice into ``piper/`` if possible."""
+    if os.environ.get("CHESSBOTV_PIPER_AUTO_DOWNLOAD", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return None
+    try:
+        # The repository's local ``piper/`` model folder can look like a
+        # namespace package when piper-tts itself is absent; require the
+        # actual downloader submodule before trying to use it.
+        download_spec = importlib.util.find_spec("piper.download_voices")
+    except (ImportError, AttributeError, ValueError):
+        download_spec = None
+    if download_spec is None:
+        return None
+
+    _set_game_review_speech_status(request_id, "downloading")
+    download_dir = os.fspath(GAME_REVIEW_PIPER_DIR)
+    os.makedirs(download_dir, exist_ok=True)
+    print(
+        "Downloading Piper voice "
+        f"{GAME_REVIEW_PIPER_VOICE_ID} to {download_dir}..."
+    )
+    downloaded = False
+    try:
+        module = importlib.import_module("piper.download_voices")
+        download_voice = getattr(module, "download_voice", None)
+        if callable(download_voice):
+            download_voice(GAME_REVIEW_PIPER_VOICE_ID, Path(download_dir))
+            downloaded = True
+    except Exception:
+        downloaded = False
+    if not downloaded:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "piper.download_voices",
+                GAME_REVIEW_PIPER_VOICE_ID,
+                "--download-dir",
+                download_dir,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Piper voice download failed. "
+                + (completed.stdout or "").strip()[-300:]
+            )
+    return find_game_review_piper_model()
+
+
+def _load_game_review_piper_voice(request_id=None):
+    """Load and cache Piper's northern_english_male[medium] voice."""
+    global _game_review_piper_voice, _game_review_piper_model_path
+    model_path = find_game_review_piper_model()
+    if model_path is None:
+        model_path = _download_game_review_piper_voice(request_id)
+    if model_path is None:
+        raise FileNotFoundError(
+            "Piper voice not found: "
+            f"{GAME_REVIEW_PIPER_MODEL_FILENAME} (+ .onnx.json). "
+            "Install piper-tts or place the voice in the piper folder."
+        )
+    if (
+        _game_review_piper_voice is not None
+        and _game_review_piper_model_path == model_path
+    ):
+        return _game_review_piper_voice
+
+    _set_game_review_speech_status(request_id, "loading")
+    try:
+        piper_module = importlib.import_module("piper")
+        piper_voice_class = getattr(piper_module, "PiperVoice", None)
+        if piper_voice_class is None:
+            voice_module = importlib.import_module("piper.voice")
+            piper_voice_class = voice_module.PiperVoice
+    except Exception as exc:
+        raise RuntimeError(
+            "Piper TTS is not installed. Run: pip install piper-tts"
+        ) from exc
+
+    _game_review_piper_voice = piper_voice_class.load(model_path)
+    _game_review_piper_model_path = model_path
+    return _game_review_piper_voice
+
+
+def synthesise_game_review_speech(text, request_id=None):
+    """Use Piper to synthesise ``text`` and return complete WAV bytes."""
+    clean_text = _normalise_game_review_speech_text(text)
+    if not clean_text:
+        raise ValueError("Cannot synthesise empty Game Review speech")
+    voice = _load_game_review_piper_voice(request_id)
+    _set_game_review_speech_status(request_id, "synthesising")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        synthesize_wav = getattr(voice, "synthesize_wav", None)
+        if callable(synthesize_wav):
+            synthesize_wav(clean_text, wav_file)
+        else:
+            # Older piper-tts releases call the WAV-writing method
+            # ``synthesize`` instead of ``synthesize_wav``.
+            voice.synthesize(clean_text, wav_file)
+    wav_bytes = output.getvalue()
+    if len(wav_bytes) <= 44:
+        raise RuntimeError("Piper returned empty speech audio")
+    return wav_bytes
+
+
+# American-spelling alias for callers/tests that expect the Piper verb form.
+synthesize_game_review_speech = synthesise_game_review_speech
+
+
+def game_review_wav_envelope(wav_bytes, bucket_ms=50):
+    """Return ``(mouth levels, duration, sample_rate)`` for WAV bytes."""
+    if not wav_bytes:
+        return [], 0.0, 0
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        sample_rate = int(wav_file.getframerate())
+        sample_width = int(wav_file.getsampwidth())
+        channels = max(1, int(wav_file.getnchannels()))
+        frame_count = int(wav_file.getnframes())
+        raw = wav_file.readframes(frame_count)
+    if sample_rate <= 0 or frame_count <= 0:
+        return [], 0.0, sample_rate
+
+    samples = []
+    if sample_width == 2:
+        values = array.array("h")
+        values.frombytes(raw[: len(raw) - (len(raw) % 2)])
+        if sys.byteorder != "little":
+            values.byteswap()
+        samples = values
+    elif sample_width == 1:
+        samples = array.array("h", ((value - 128) * 128 for value in raw))
+    elif sample_width == 4:
+        values = array.array("i")
+        values.frombytes(raw[: len(raw) - (len(raw) % 4)])
+        if sys.byteorder != "little":
+            values.byteswap()
+        samples = array.array("h", (max(-32768, min(32767, int(v / 65536))) for v in values))
+
+    bucket_frames = max(1, int(sample_rate * max(10, int(bucket_ms)) / 1000.0))
+    envelope = []
+    total_samples = len(samples)
+    for start_frame in range(0, frame_count, bucket_frames):
+        start = start_frame * channels
+        end = min(total_samples, (start_frame + bucket_frames) * channels)
+        if end <= start:
+            envelope.append(0.0)
+            continue
+        squared = 0.0
+        count = 0
+        for value in samples[start:end]:
+            squared += float(value) * float(value)
+            count += 1
+        rms = math.sqrt(squared / max(1, count))
+        envelope.append(max(0.0, min(1.0, (rms / 10000.0) ** 0.6)))
+    return envelope, frame_count / float(sample_rate), sample_rate
+
+
+def _stop_game_review_speech_channel():
+    global _game_review_speech_channel, _game_review_speech_sound
+    channel = _game_review_speech_channel
+    _game_review_speech_channel = None
+    _game_review_speech_sound = None
+    if channel is not None:
+        try:
+            channel.stop()
+        except Exception:
+            pass
+
+
+def stop_game_review_speech():
+    """Stop Coach Nolan and invalidate any queued/synthesising line."""
+    _stop_game_review_speech_channel()
+    with _game_review_speech_lock:
+        _game_review_speech["request_id"] = (
+            int(_game_review_speech.get("request_id", 0)) + 1
+        )
+        _game_review_speech.update(
+            {
+                "status": "idle",
+                "key": None,
+                "text": "",
+                "error": "",
+                "wav_bytes": None,
+                "envelope": [],
+                "sample_rate": 0,
+                "duration": 0.0,
+                "requested_at": 0.0,
+                "started_at": 0.0,
+                "voice": GAME_REVIEW_PIPER_VOICE_ID,
+            }
+        )
+
+
+def reset_game_review_speech_for_tests():
+    """Clear cached Piper voice/audio; used by the headless test suites."""
+    global _game_review_piper_voice, _game_review_piper_model_path
+    stop_game_review_speech()
+    with _game_review_speech_lock:
+        _game_review_speech_cache.clear()
+    _game_review_piper_voice = None
+    _game_review_piper_model_path = None
+
+
+def _game_review_speech_worker():
+    while True:
+        request_id, key, text = _game_review_speech_queue.get()
+        try:
+            with _game_review_speech_lock:
+                if int(_game_review_speech.get("request_id", 0)) != int(request_id):
+                    continue
+                _game_review_speech["status"] = "loading"
+            wav_bytes = synthesise_game_review_speech(text, request_id=request_id)
+            envelope, duration, sample_rate = game_review_wav_envelope(wav_bytes)
+            cache_key = (GAME_REVIEW_PIPER_VOICE_ID, text)
+            with _game_review_speech_lock:
+                _game_review_speech_cache[cache_key] = (
+                    wav_bytes,
+                    list(envelope),
+                    float(duration),
+                    int(sample_rate),
+                )
+                if len(_game_review_speech_cache) > 48:
+                    oldest = next(iter(_game_review_speech_cache))
+                    _game_review_speech_cache.pop(oldest, None)
+                if int(_game_review_speech.get("request_id", 0)) != int(request_id):
+                    continue
+                _game_review_speech.update(
+                    {
+                        "status": "ready",
+                        "key": key,
+                        "text": text,
+                        "error": "",
+                        "wav_bytes": wav_bytes,
+                        "envelope": list(envelope),
+                        "sample_rate": int(sample_rate),
+                        "duration": float(duration),
+                        "voice": GAME_REVIEW_PIPER_VOICE_ID,
+                    }
+                )
+        except Exception as exc:
+            with _game_review_speech_lock:
+                if int(_game_review_speech.get("request_id", 0)) == int(request_id):
+                    _game_review_speech.update(
+                        {
+                            "status": "unavailable",
+                            "key": key,
+                            "text": text,
+                            "error": str(exc),
+                            "wav_bytes": None,
+                            "envelope": [],
+                            "duration": 0.0,
+                        }
+                    )
+            print(f"Game Review Piper speech unavailable: {exc}")
+        finally:
+            _game_review_speech_queue.task_done()
+
+
+def _ensure_game_review_speech_worker():
+    global _game_review_speech_thread
+    if _game_review_speech_thread is not None and _game_review_speech_thread.is_alive():
+        return _game_review_speech_thread
+    _game_review_speech_thread = threading.Thread(
+        target=_game_review_speech_worker,
+        name="ChessBotV-GameReview-Piper",
+        daemon=True,
+    )
+    _game_review_speech_thread.start()
+    return _game_review_speech_thread
+
+
+def request_game_review_speech(key, text):
+    """Queue one coach line; repeated requests for the same key are ignored."""
+    clean_text = _normalise_game_review_speech_text(text)
+    if key is None or not clean_text:
+        return False
+    with _game_review_speech_lock:
+        if _game_review_speech.get("status") == "unavailable":
+            return False
+        if (
+            _game_review_speech.get("key") == key
+            and _game_review_speech.get("text") == clean_text
+            and _game_review_speech.get("status")
+            in {"queued", "loading", "downloading", "synthesising", "ready", "playing"}
+        ):
+            return False
+
+    _stop_game_review_speech_channel()
+    cache_key = (GAME_REVIEW_PIPER_VOICE_ID, clean_text)
+    with _game_review_speech_lock:
+        request_id = int(_game_review_speech.get("request_id", 0)) + 1
+        cached = _game_review_speech_cache.get(cache_key)
+        _game_review_speech.update(
+            {
+                "status": "ready" if cached else "queued",
+                "request_id": request_id,
+                "key": key,
+                "text": clean_text,
+                "error": "",
+                "wav_bytes": cached[0] if cached else None,
+                "envelope": list(cached[1]) if cached else [],
+                "sample_rate": int(cached[3]) if cached else 0,
+                "duration": float(cached[2]) if cached else 0.0,
+                "requested_at": time.monotonic(),
+                "started_at": 0.0,
+                "voice": GAME_REVIEW_PIPER_VOICE_ID,
+            }
+        )
+    if cached:
+        return True
+    _ensure_game_review_speech_worker()
+    _game_review_speech_queue.put((request_id, key, clean_text))
+    return True
+
+
+def update_game_review_speech():
+    """Start/finish coach playback. Call only from the pygame main thread."""
+    global _game_review_speech_channel, _game_review_speech_sound
+    with _game_review_speech_lock:
+        status = _game_review_speech.get("status")
+        request_id = int(_game_review_speech.get("request_id", 0))
+        wav_bytes = _game_review_speech.get("wav_bytes")
+
+    if status == "ready" and wav_bytes:
+        try:
+            preload_game_sounds()
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            sound = pygame.mixer.Sound(io.BytesIO(wav_bytes))
+            channel = pygame.mixer.find_channel(True)
+            if channel is None:
+                raise RuntimeError("No pygame mixer channel is available")
+            with _game_review_speech_lock:
+                if int(_game_review_speech.get("request_id", 0)) != request_id:
+                    return get_game_review_speech_snapshot()
+                _game_review_speech["status"] = "playing"
+                _game_review_speech["started_at"] = time.monotonic()
+            _game_review_speech_sound = sound
+            _game_review_speech_channel = channel
+            channel.play(sound)
+        except Exception as exc:
+            with _game_review_speech_lock:
+                if int(_game_review_speech.get("request_id", 0)) == request_id:
+                    _game_review_speech.update(
+                        {"status": "unavailable", "error": str(exc)}
+                    )
+            print(f"Game Review speech playback unavailable: {exc}")
+        return get_game_review_speech_snapshot()
+
+    if status == "playing":
+        channel = _game_review_speech_channel
+        busy = False
+        if channel is not None:
+            try:
+                busy = bool(channel.get_busy())
+            except Exception:
+                busy = False
+        if not busy:
+            _stop_game_review_speech_channel()
+            with _game_review_speech_lock:
+                if int(_game_review_speech.get("request_id", 0)) == request_id:
+                    # Keep the key in a distinct finished state so sync does
+                    # not immediately replay the same line every frame.
+                    _game_review_speech["status"] = "finished"
+                    _game_review_speech["wav_bytes"] = None
+                    _game_review_speech["started_at"] = 0.0
+            mark_game_review_advanced()
+    return get_game_review_speech_snapshot()
+
+
+def get_game_review_speech_snapshot():
+    """Current Piper status plus a 0..1 mouth-open amount for this frame."""
+    with _game_review_speech_lock:
+        snapshot = dict(_game_review_speech)
+        snapshot["envelope"] = list(_game_review_speech.get("envelope", []))
+        snapshot.pop("wav_bytes", None)
+
+    mouth_open = 0.0
+    elapsed = 0.0
+    speaking = snapshot.get("status") == "playing"
+    if speaking:
+        started_at = float(snapshot.get("started_at") or 0.0)
+        elapsed = max(0.0, time.monotonic() - started_at) if started_at else 0.0
+        envelope = snapshot.get("envelope") or []
+        bucket_seconds = float(snapshot.get("bucket_seconds") or 0.05)
+        if envelope:
+            index = min(len(envelope) - 1, int(elapsed / max(0.01, bucket_seconds)))
+            mouth_open = float(envelope[index])
+            # Smooth a little into the next bucket so the jaw does not step
+            # abruptly every 50 ms.
+            if index + 1 < len(envelope):
+                fraction = (elapsed / max(0.01, bucket_seconds)) - index
+                mouth_open += (float(envelope[index + 1]) - mouth_open) * max(
+                    0.0, min(1.0, fraction)
+                )
+        else:
+            mouth_open = 0.35 + 0.45 * abs(math.sin(elapsed * 13.0))
+            mouth_open += 0.15 * abs(math.sin(elapsed * 29.0 + 0.7))
+    duration = float(snapshot.get("duration") or 0.0)
+    snapshot.update(
+        {
+            "speaking": bool(speaking),
+            "mouth_open": max(0.0, min(1.0, float(mouth_open))),
+            "elapsed": float(elapsed),
+            "progress": (
+                max(0.0, min(1.0, elapsed / duration)) if duration > 0 else 0.0
+            ),
+            "available": snapshot.get("status") != "unavailable",
+        }
+    )
+    return snapshot
+
+
+def game_review_speech_is_busy(max_wait_seconds=6.0):
+    """Whether auto-play should hold for the current coach line."""
+    snapshot = get_game_review_speech_snapshot()
+    status = snapshot.get("status")
+    if status in {"playing", "ready"}:
+        return True
+    if status in {"queued", "loading", "downloading", "synthesising"}:
+        requested_at = float(snapshot.get("requested_at") or 0.0)
+        if requested_at <= 0:
+            return True
+        return (time.monotonic() - requested_at) < float(max_wait_seconds)
+    return False
+
+
+def sync_game_review_speech(board, allow_new=True):
+    """Make Piper follow the dialogue for the currently displayed ply."""
+    if board is None:
+        return None
+    update_game_review_speech()
+    dialogue = get_game_review_dialogue(board)
+    if not dialogue:
+        stop_game_review_speech()
+        return None
+    speech_key = dialogue.get("speech_key")
+    with _game_review_speech_lock:
+        current_key = _game_review_speech.get("key")
+    if allow_new:
+        if dialogue.get("speak"):
+            if current_key != speech_key:
+                request_game_review_speech(speech_key, dialogue.get("spoken_text", ""))
+        elif current_key not in (None, speech_key):
+            stop_game_review_speech()
+    update_game_review_speech()
+    return dialogue
 
 
 # --- Main App ---
@@ -13172,8 +14104,66 @@ def draw_game_review_rating_icon(surface, rating, centre, size=26):
         max(1, radius // 5),
     )
     symbol = spec["symbol"]
-    # Draw the three positive symbols geometrically: star/check/exclamation
-    # glyph coverage varies too much between system fonts for a fallback.
+    # Draw positive/book symbols geometrically: system-font glyph coverage
+    # varies too much for a dependable fallback badge.
+    if rating == "book":
+        book_w = radius * 1.45
+        book_h = radius * 1.05
+        left = centre[0] - book_w / 2
+        right = centre[0] + book_w / 2
+        top = centre[1] - book_h / 2
+        bottom = centre[1] + book_h / 2
+        spine_x = centre[0]
+        cover = [
+            (left - 1, top + 1),
+            (spine_x, top - 2),
+            (right + 1, top + 1),
+            (right + 1, bottom + 1),
+            (spine_x, bottom - 2),
+            (left - 1, bottom + 1),
+        ]
+        pygame.draw.polygon(
+            surface, (25, 30, 36), [(x, y + 1) for x, y in cover]
+        )
+        pygame.draw.polygon(surface, (112, 72, 42), cover)
+        left_page = [
+            (left, top + 2),
+            (spine_x - 1, top),
+            (spine_x - 1, bottom - 2),
+            (left, bottom),
+        ]
+        right_page = [
+            (spine_x + 1, top),
+            (right, top + 2),
+            (right, bottom),
+            (spine_x + 1, bottom - 2),
+        ]
+        pygame.draw.polygon(surface, (250, 244, 220), left_page)
+        pygame.draw.polygon(surface, (255, 252, 240), right_page)
+        pygame.draw.line(
+            surface,
+            (112, 72, 42),
+            (spine_x, top),
+            (spine_x, bottom - 1),
+            max(1, radius // 5),
+        )
+        for line_index in range(2):
+            line_y = top + book_h * (0.32 + 0.22 * line_index)
+            pygame.draw.line(
+                surface,
+                (150, 132, 100),
+                (left + 2, line_y),
+                (spine_x - 3, line_y - 1),
+                1,
+            )
+            pygame.draw.line(
+                surface,
+                (150, 132, 100),
+                (spine_x + 3, line_y - 1),
+                (right - 2, line_y),
+                1,
+            )
+        return
     if rating == "best":
         points = []
         for index in range(10):
@@ -13294,18 +14284,25 @@ def _game_review_eval_text(cp, mate=None):
         return "+0.00"
 
 
-def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
-    """Draw Coach Nova as a polished supersampled vector bust.
+def _draw_game_review_coach_character(
+    surface, rect, reaction, time_ms=None, mouth_open=0.0
+):
+    """Draw Coach Nolan as a polished supersampled vector bust.
 
-    Eyes, brows, mouth, hair highlights, hands and small props all change
-    with the rating. The character is rendered at 3x and downscaled so
-    the curves stay smooth at both the settings-button and dock sizes.
+    Eyes, brows, mouth, hair, hands and small props all change with the
+    rating. ``mouth_open`` (0..1) is driven by Piper's live loudness
+    envelope while Nolan is speaking. The character is rendered at 3x and
+    downscaled so curves stay smooth at settings-button and dock sizes.
     """
     if rect.width < 24 or rect.height < 24:
         return
     if time_ms is None:
         time_ms = pygame.time.get_ticks()
     reaction = reaction if reaction in GAME_REVIEW_RATINGS else "thinking"
+    try:
+        mouth_open = max(0.0, min(1.0, float(mouth_open)))
+    except Exception:
+        mouth_open = 0.0
     supersample = 3
     canvas_w = max(24, rect.width * supersample)
     canvas_h = max(24, rect.height * supersample)
@@ -13351,11 +14348,16 @@ def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
         )
 
     bob_speed = 420 if reaction in ("best", "excellent") else 720
-    bob = math.sin(time_ms / bob_speed) * (1.2 if reaction == "best" else 0.7)
+    speaking_bob = 0.35 * mouth_open * math.sin(time_ms / 95.0)
+    bob = (
+        math.sin(time_ms / bob_speed) * (1.2 if reaction == "best" else 0.7)
+        + speaking_bob
+    )
     shake = 0.0
     if reaction == "blunder":
         shake = math.sin(time_ms / 55.0) * 0.8
     tilt = {
+        "book": -1.0,
         "best": -1.2,
         "excellent": -0.8,
         "good": 0.0,
@@ -13401,34 +14403,74 @@ def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
     line((130, 88, 24), [(82, 104 + bob * 0.25), (82, 112 + bob * 0.25)], 1.2)
     line((130, 88, 24), [(79.5, 107 + bob * 0.25), (84.5, 107 + bob * 0.25)], 1.2)
 
-    # Neck and ears.
-    pygame.draw.rect(canvas, skin_shadow, r(head_cx - 7, 83 + head_y, 14, 17), border_radius=int(4 * sx))
+    # Neck and ears. Nolan's broader neck/jaw match his male Piper voice.
+    pygame.draw.rect(canvas, skin_shadow, r(head_cx - 8, 83 + head_y, 16, 17), border_radius=int(4 * sx))
     circle(skin, (head_cx - 29, 58 + head_y), 6)
     circle(skin, (head_cx + 29, 58 + head_y), 6)
     circle(skin_shadow, (head_cx - 29, 58 + head_y), 2.5)
     circle(skin_shadow, (head_cx + 29, 58 + head_y), 2.5)
 
-    # Hair: a full back mass, bun, sweeping fringe and glossy strands.
-    ellipse(hair_dark, (head_cx - 34, 11 + head_y, 68, 72))
-    circle(hair, (head_cx + 27, 17 + head_y), 10)
-    circle(hair_light, (head_cx + 24, 14 + head_y), 3)
+    # Hair: a short swept-back cap with sideburns and glossy strands (no
+    # bun/long back mass). A squarer lower face sits underneath it.
+    ellipse(hair_dark, (head_cx - 33, 10 + head_y, 66, 54))
     ellipse(skin, (head_cx - 27, 27 + head_y, 54, 65))
+    pygame.draw.polygon(
+        canvas,
+        skin,
+        [
+            p(head_cx - 23, 72 + head_y),
+            p(head_cx + 23, 72 + head_y),
+            p(head_cx + 18, 91 + head_y),
+            p(head_cx - 18, 91 + head_y),
+        ],
+    )
+    # Short stubble along the jaw/chin, kept translucent so expressions and
+    # the speaking mouth remain readable at dock size.
+    stubble = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+    pygame.draw.polygon(
+        stubble,
+        (92, 62, 48, 54),
+        [
+            p(head_cx - 22, 68 + head_y),
+            p(head_cx + 22, 68 + head_y),
+            p(head_cx + 17, 91 + head_y),
+            p(head_cx - 17, 91 + head_y),
+        ],
+    )
+    pygame.draw.ellipse(
+        stubble,
+        (92, 62, 48, 34),
+        r(head_cx - 19, 76 + head_y, 38, 18),
+    )
+    canvas.blit(stubble, (0, 0))
     pygame.draw.polygon(
         canvas,
         hair,
         [
-            p(head_cx - 29, 52 + head_y),
-            p(head_cx - 31, 27 + head_y),
-            p(head_cx - 17, 15 + head_y),
-            p(head_cx + 6, 17 + head_y),
-            p(head_cx + 29, 29 + head_y),
-            p(head_cx + 24, 42 + head_y),
-            p(head_cx + 10, 32 + head_y),
-            p(head_cx - 7, 38 + head_y),
-            p(head_cx - 20, 34 + head_y),
+            p(head_cx - 30, 48 + head_y),
+            p(head_cx - 31, 26 + head_y),
+            p(head_cx - 18, 13 + head_y),
+            p(head_cx + 8, 13 + head_y),
+            p(head_cx + 30, 27 + head_y),
+            p(head_cx + 26, 40 + head_y),
+            p(head_cx + 12, 30 + head_y),
+            p(head_cx - 6, 36 + head_y),
+            p(head_cx - 21, 32 + head_y),
         ],
     )
-    for start_x, control_y in ((-18, 25), (-5, 21), (9, 24)):
+    pygame.draw.rect(
+        canvas,
+        hair,
+        r(head_cx - 30, 42 + head_y, 5, 17),
+        border_radius=int(2 * sx),
+    )
+    pygame.draw.rect(
+        canvas,
+        hair,
+        r(head_cx + 25, 42 + head_y, 5, 17),
+        border_radius=int(2 * sx),
+    )
+    for start_x, control_y in ((-18, 24), (-5, 20), (9, 23)):
         line(
             hair_light,
             [
@@ -13441,6 +14483,7 @@ def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
 
     blink = (int(time_ms) % 3600) < 110 and reaction not in ("blunder", "best")
     gaze = {
+        "book": (-0.6, 1.3),
         "best": (0.8, -0.7),
         "excellent": (1.0, -0.3),
         "good": (0.5, 0.0),
@@ -13484,6 +14527,23 @@ def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
         line(hair_dark, [(head_cx + 7, brow_y - 1), (head_cx + 18, brow_y)], 2)
 
     line(skin_shadow, [(head_cx + 1, 61 + head_y), (head_cx - 1.5, 68 + head_y), (head_cx + 2, 69 + head_y)], 1.2)
+    if reaction == "book":
+        # Reading glasses for the opening-theory reaction.
+        for side in (-1, 1):
+            circle((45, 48, 64), (head_cx + side * 12, 56 + head_y), 7.2, 1.5)
+            line(
+                (45, 48, 64),
+                [
+                    (head_cx + side * 19, 54 + head_y),
+                    (head_cx + side * 28, 51 + head_y),
+                ],
+                1.2,
+            )
+        line(
+            (45, 48, 64),
+            [(head_cx - 5, 55 + head_y), (head_cx + 5, 55 + head_y)],
+            1.4,
+        )
     if reaction in ("best", "excellent", "good"):
         for side in (-1, 1):
             blush = pygame.Surface((int(16 * sx), int(9 * sy)), pygame.SRCALPHA)
@@ -13491,7 +14551,76 @@ def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
             canvas.blit(blush, p(head_cx + side * 20 - 8, 66 + head_y))
 
     mouth_y = 76 + head_y
-    if reaction == "best":
+    if mouth_open > 0.03:
+        # Speaking mouth: Piper's RMS envelope opens the jaw while the
+        # corners retain the current reaction's smile/frown direction.
+        corner_lift = {
+            "book": -1.2,
+            "best": -2.2,
+            "excellent": -1.7,
+            "good": -1.2,
+            "inaccuracy": 0.8,
+            "mistake": 1.8,
+            "blunder": 1.2,
+            "thinking": 0.0,
+        }.get(reaction, 0.0)
+        mouth_w = 17.0 - 4.0 * mouth_open
+        mouth_h = 3.0 + 11.0 * mouth_open
+        ellipse(
+            (126, 55, 48),
+            (
+                head_cx - mouth_w / 2,
+                mouth_y - mouth_h / 2,
+                mouth_w,
+                mouth_h,
+            ),
+        )
+        ellipse(
+            (83, 35, 34),
+            (
+                head_cx - mouth_w * 0.32,
+                mouth_y - mouth_h * 0.22,
+                mouth_w * 0.64,
+                mouth_h * 0.62,
+            ),
+        )
+        if mouth_open > 0.18:
+            ellipse(
+                (255, 255, 255),
+                (
+                    head_cx - mouth_w * 0.36,
+                    mouth_y - mouth_h * 0.46,
+                    mouth_w * 0.72,
+                    max(1.5, mouth_h * 0.22),
+                ),
+            )
+        if mouth_open > 0.35:
+            ellipse(
+                (196, 91, 86),
+                (
+                    head_cx - mouth_w * 0.27,
+                    mouth_y + mouth_h * 0.12,
+                    mouth_w * 0.54,
+                    mouth_h * 0.28,
+                ),
+            )
+        line(
+            (126, 55, 48),
+            [
+                (head_cx - mouth_w * 0.62, mouth_y + corner_lift),
+                (head_cx - mouth_w * 0.38, mouth_y - mouth_h * 0.18),
+            ],
+            1.4,
+        )
+        line(
+            (126, 55, 48),
+            [
+                (head_cx + mouth_w * 0.38, mouth_y - mouth_h * 0.18),
+                (head_cx + mouth_w * 0.62, mouth_y + corner_lift),
+            ],
+            1.4,
+        )
+    elif reaction == "best":
         ellipse((126, 55, 48), (head_cx - 9, mouth_y - 3, 18, 12))
         ellipse((255, 255, 255), (head_cx - 7, mouth_y - 3, 14, 5))
         ellipse(skin, (head_cx - 10, mouth_y - 8, 20, 6))
@@ -13504,11 +14633,45 @@ def _draw_game_review_coach_character(surface, rect, reaction, time_ms=None):
     elif reaction == "blunder":
         ellipse((126, 55, 48), (head_cx - 5, mouth_y - 5, 10, 13))
         ellipse((83, 35, 34), (head_cx - 3, mouth_y - 2, 6, 8))
+    elif reaction == "book":
+        pygame.draw.arc(canvas, (126, 55, 48), r(head_cx - 7, mouth_y - 6, 14, 11), math.pi * 1.1, math.pi * 1.9, max(1, int(1.8 * sx)))
     else:  # thinking
         line((126, 55, 48), [(head_cx - 5, mouth_y + 1), (head_cx + 6, mouth_y)], 1.8)
 
     # Hands/props reinforce each reaction without needing a full body.
-    if reaction in ("best", "excellent"):
+    if reaction == "book":
+        # An open opening book held low in front of the jacket.
+        book_y = 103 + bob * 0.25
+        cover_points = [
+            (18, book_y + 4),
+            (39, book_y),
+            (60, book_y + 4),
+            (60, book_y + 25),
+            (39, book_y + 20),
+            (18, book_y + 25),
+        ]
+        pygame.draw.polygon(canvas, (74, 45, 28), [p(x, y) for x, y in cover_points])
+        left_page = [
+            (21, book_y + 6),
+            (39, book_y + 3),
+            (39, book_y + 20),
+            (21, book_y + 23),
+        ]
+        right_page = [
+            (41, book_y + 3),
+            (57, book_y + 6),
+            (57, book_y + 23),
+            (41, book_y + 20),
+        ]
+        pygame.draw.polygon(canvas, (246, 238, 214), [p(x, y) for x, y in left_page])
+        pygame.draw.polygon(canvas, (255, 252, 238), [p(x, y) for x, y in right_page])
+        line((112, 72, 42), [(40, book_y + 2), (40, book_y + 21)], 1.5)
+        for line_offset in (8, 12, 16):
+            line((165, 145, 105), [(24, book_y + line_offset), (36, book_y + line_offset - 2)], 0.9)
+            line((165, 145, 105), [(44, book_y + line_offset - 2), (54, book_y + line_offset)], 0.9)
+        circle(skin, (58, book_y + 20), 4.5)
+        circle(skin, (20, book_y + 20), 4.0)
+    elif reaction in ("best", "excellent"):
         line(jacket_dark, [(84, 108 + bob * 0.25), (98, 94 + head_y)], 7)
         circle(skin, (100, 91 + head_y), 6)
         pygame.draw.rect(canvas, skin, r(97, 80 + head_y, 5, 10), border_radius=int(2 * sx))
@@ -13607,7 +14770,7 @@ def _draw_game_review_button(screen, rect, hovered):
 
     if snapshot.get("active") and snapshot.get("status") == "analysing":
         subtitle_text = (
-            f"Coach Nova is analysing · {snapshot.get('analysed_positions', 0)}/"
+            f"{GAME_REVIEW_COACH_NAME} is analysing · {snapshot.get('analysed_positions', 0)}/"
             f"{snapshot.get('total_positions', 0)} positions"
         )
     elif snapshot.get("active") and snapshot.get("status") == "complete":
@@ -13621,10 +14784,10 @@ def _draw_game_review_button(screen, rect, hovered):
         draw_game_review_rating_icon(
             screen,
             rating,
-            (visual.x + 116 + index * 28, visual.bottom - 17),
+            (visual.x + 112 + index * 24, visual.bottom - 17),
             20,
         )
-    pill = pygame.Rect(visual.x + 282, visual.bottom - 30, 96, 24)
+    pill = pygame.Rect(visual.x + 286, visual.bottom - 30, 96, 24)
     pygame.draw.rect(screen, (255, 209, 92), pill, border_radius=12)
     pygame.draw.rect(screen, (146, 104, 28), pill, 1, border_radius=12)
     pill_text = _game_review_font(13, True).render(
@@ -13676,6 +14839,11 @@ def game_review_control_at(pos):
 
 
 _GAME_REVIEW_LINES = {
+    "book": (
+        "Book move — still following known opening theory.",
+        "Straight from the opening book.",
+        "Theory. That one has been played many times before.",
+    ),
     "best": (
         "That's the engine's top choice — beautifully played.",
         "Perfect. You found the strongest move.",
@@ -13707,6 +14875,141 @@ _GAME_REVIEW_LINES = {
         "Yikes — the evaluation swings hard after that.",
     ),
 }
+
+
+def _game_review_result_spoken_text(result, display_speech):
+    """Build the Piper line for one rated move from its bubble text."""
+    move_speech = game_review_san_to_speech(result.get("move_san", ""))
+    rating = result.get("rating", "good")
+    label = GAME_REVIEW_RATINGS.get(rating, {}).get("label", "Move")
+    main_text = str(display_speech or "").strip()
+    best_clause = ""
+    marker = " Best was "
+    if marker in main_text:
+        main_text = main_text.split(marker, 1)[0].rstrip()
+        if main_text and main_text[-1] not in ".!?":
+            main_text += "."
+        best_clause = (
+            " Best was "
+            + game_review_san_to_speech(result.get("bestmove_san", ""))
+            + "."
+        )
+    return f"{move_speech.capitalize()}. {label}. {main_text}{best_clause}".strip()
+
+
+def get_game_review_dialogue(board, snapshot=None):
+    """Dialogue/reaction for the displayed Game Review position.
+
+    The dock renderer and Piper speech share this helper, so Coach Nolan
+    speaks the same line that is shown in his speech bubble. ``speak`` is
+    deliberately false for transient "still analysing" states; Piper waits
+    for the actual rating instead of interrupting himself moments later.
+    """
+    if board is None:
+        return None
+    snapshot = snapshot or get_game_review_snapshot()
+    if not snapshot.get("active"):
+        return None
+
+    moves_uci = snapshot.get("moves_uci", [])
+    total_moves = len(moves_uci)
+    current_ply = len(board.move_stack)
+    result = None
+    if 0 < current_ply <= total_moves and [
+        move.uci() for move in board.move_stack
+    ] == moves_uci[:current_ply]:
+        result = snapshot.get("results", {}).get(current_ply)
+
+    status = snapshot.get("status", "idle")
+    if result:
+        reaction = result.get("rating", "thinking")
+        if reaction not in GAME_REVIEW_RATINGS:
+            reaction = "thinking"
+    elif status == "error":
+        reaction = "mistake"
+    else:
+        reaction = "thinking"
+
+    if result:
+        ply = int(result.get("ply", current_ply))
+        move_number = (ply + 1) // 2
+        dots = "." if result.get("mover") == "white" else "..."
+        rating_label = GAME_REVIEW_RATINGS.get(reaction, {}).get(
+            "label", "Move"
+        )
+        title_text = (
+            f"{move_number}{dots} {result.get('move_san', '')} — {rating_label}"
+        )
+        lines = _GAME_REVIEW_LINES.get(reaction, ())
+        speech = lines[(ply - 1) % len(lines)] if lines else ""
+        if reaction == "book" and result.get("opening_name"):
+            opening_name = str(result.get("opening_name")).strip()
+            book_variants = (
+                f"Book move — this is {opening_name}.",
+                f"Still in the book: {opening_name}.",
+                f"Opening theory — {opening_name}.",
+            )
+            speech = book_variants[(ply - 1) % len(book_variants)]
+        elif (
+            reaction != "book"
+            and not result.get("is_best_move")
+            and result.get("bestmove_san")
+            not in (None, "", result.get("move_san"))
+        ):
+            speech += f" Best was {result.get('bestmove_san')}."
+        spoken_text = _game_review_result_spoken_text(result, speech)
+        speak = True
+    elif status == "empty":
+        title_text = GAME_REVIEW_COACH_NAME
+        speech = "Play at least one move, then I'll happily review the game with you."
+        spoken_text = speech
+        speak = True
+    elif status == "error":
+        title_text = f"{GAME_REVIEW_COACH_NAME} hit a snag"
+        speech = snapshot.get("error") or (
+            "The review engine could not start. "
+            "Check the Stockfish path and try again."
+        )
+        spoken_text = "Sorry, I hit a snag while reviewing that game."
+        speak = True
+    elif current_ply == 0:
+        title_text = f"{GAME_REVIEW_COACH_NAME} · Game Review"
+        speech = "Let's look at your game together. I'm checking every move at depth 12."
+        spoken_text = speech
+        speak = status in {"analysing", "complete", "idle"}
+    elif status == "analysing":
+        title_text = f"{GAME_REVIEW_COACH_NAME} is thinking…"
+        speech = "I'm still checking this move. The rest of the review is on its way."
+        spoken_text = speech
+        speak = False
+    else:
+        title_text = f"{GAME_REVIEW_COACH_NAME} · Game Review"
+        speech = "Use the arrows or play button and I'll react to each move."
+        spoken_text = speech
+        speak = False
+
+    # Do not include ``status`` in the key: a result already being spoken
+    # should not restart merely because background analysis of later plies
+    # changes the review from "analysing" to "complete".
+    speech_key = (
+        int(snapshot.get("generation", 0)),
+        int(current_ply),
+        reaction,
+        spoken_text,
+    )
+    return {
+        "snapshot": snapshot,
+        "status": status,
+        "current_ply": int(current_ply),
+        "total_moves": int(total_moves),
+        "result": result,
+        "reaction": reaction,
+        "title": title_text,
+        "speech": speech,
+        "spoken_text": spoken_text,
+        "speak": bool(speak and not snapshot.get("closing")),
+        "speech_key": speech_key,
+    }
 
 
 def _draw_game_review_control(screen, name, rect, hovered, snapshot, current_ply, total_moves):
@@ -13748,22 +15051,15 @@ def draw_game_review_coach(screen, board, mouse_pos):
     if not snapshot.get("active") or float(snapshot.get("anim", 0.0)) <= 0.0:
         return
     panel = get_game_review_panel_rect()
-    moves_uci = snapshot.get("moves_uci", [])
-    total_moves = len(moves_uci)
-    current_ply = len(board.move_stack)
-    result = None
-    if 0 < current_ply <= total_moves and [
-        move.uci() for move in board.move_stack
-    ] == moves_uci[:current_ply]:
-        result = snapshot.get("results", {}).get(current_ply)
-
-    status = snapshot.get("status", "idle")
-    if result:
-        reaction = result.get("rating", "thinking")
-    elif status == "error":
-        reaction = "mistake"
-    else:
-        reaction = "thinking"
+    dialogue = get_game_review_dialogue(board, snapshot)
+    if dialogue is None:
+        return
+    total_moves = dialogue["total_moves"]
+    current_ply = dialogue["current_ply"]
+    result = dialogue["result"]
+    status = dialogue["status"]
+    reaction = dialogue["reaction"]
+    speech_snapshot = get_game_review_speech_snapshot()
     spec = GAME_REVIEW_RATINGS.get(reaction, {})
     accent = spec.get("colour", (120, 150, 255))
 
@@ -13788,38 +15084,22 @@ def draw_game_review_coach(screen, board, mouse_pos):
     pygame.draw.line(screen, accent, (panel.x + 18, panel.y + 2), (panel.right - 18, panel.y + 2), 2)
 
     coach_rect = pygame.Rect(panel.x + 8, panel.y + 5, 116, panel.height - 5)
-    _draw_game_review_coach_character(screen, coach_rect, reaction)
+    _draw_game_review_coach_character(
+        screen,
+        coach_rect,
+        reaction,
+        mouth_open=speech_snapshot.get("mouth_open", 0.0),
+    )
 
     bubble = pygame.Rect(panel.x + 132, panel.y + 10, panel.width - 190, 78)
     pygame.draw.polygon(screen, (250, 248, 239), [(bubble.x + 2, bubble.y + 43), (bubble.x - 12, bubble.y + 53), (bubble.x + 2, bubble.y + 62)])
     pygame.draw.rect(screen, (250, 248, 239), bubble, border_radius=16)
     pygame.draw.rect(screen, (205, 207, 220), bubble, 1, border_radius=16)
 
+    title_text = dialogue["title"]
+    speech = dialogue["speech"]
     if result:
-        ply = int(result.get("ply", current_ply))
-        move_number = (ply + 1) // 2
-        dots = "." if result.get("mover") == "white" else "..."
-        title_text = f"{move_number}{dots} {result.get('move_san', '')} — {GAME_REVIEW_RATINGS[reaction]['label']}"
-        lines = _GAME_REVIEW_LINES.get(reaction, ())
-        speech = lines[(ply - 1) % len(lines)] if lines else ""
-        if not result.get("is_best_move") and result.get("bestmove_san") not in (None, "", result.get("move_san")):
-            speech += f" Best was {result.get('bestmove_san')}."
         draw_game_review_rating_icon(screen, reaction, (bubble.x + 25, bubble.y + 24), 34)
-    elif status == "empty":
-        title_text = "Coach Nova"
-        speech = "Play at least one move, then I'll happily review the game with you."
-    elif status == "error":
-        title_text = "Coach Nova hit a snag"
-        speech = snapshot.get("error") or "The review engine could not start. Check the Stockfish path and try again."
-    elif current_ply == 0:
-        title_text = "Coach Nova · Game Review"
-        speech = "Let's look at your game together. I'm checking every move at depth 12."
-    elif status == "analysing":
-        title_text = "Coach Nova is thinking…"
-        speech = "I'm still checking this move. The rest of the review is on its way."
-    else:
-        title_text = "Coach Nova · Game Review"
-        speech = "Use the arrows or play button and I'll react to each move."
 
     title = _game_review_font(19, True).render(
         _elide_text(title_text, _game_review_font(19, True), bubble.width - 62),
@@ -13833,6 +15113,23 @@ def draw_game_review_coach(screen, board, mouse_pos):
     ):
         rendered = speech_font.render(line, True, (72, 76, 92))
         screen.blit(rendered, (bubble.x + 50, bubble.y + 36 + index * 18))
+    if speech_snapshot.get("speaking"):
+        equaliser_x = bubble.right - 48
+        equaliser_y = bubble.y + 22
+        mouth_level = float(speech_snapshot.get("mouth_open", 0.0))
+        for bar_index in range(4):
+            phase = pygame.time.get_ticks() / 130.0 + bar_index * 0.9
+            bar_height = max(
+                3,
+                int(4 + 10 * mouth_level * (0.55 + 0.45 * abs(math.sin(phase)))),
+            )
+            bar_rect = pygame.Rect(
+                equaliser_x + bar_index * 8,
+                equaliser_y + (14 - bar_height) // 2,
+                4,
+                bar_height,
+            )
+            pygame.draw.rect(screen, accent, bar_rect, border_radius=2)
 
     analysed = int(snapshot.get("analysed_positions", 0))
     total_positions = max(1, int(snapshot.get("total_positions", 1)))
@@ -13855,7 +15152,15 @@ def draw_game_review_coach(screen, board, mouse_pos):
         pygame.draw.rect(screen, accent, (bar.x, bar.y, int(bar.width * progress), bar.height), border_radius=4)
     pygame.draw.rect(screen, (105, 112, 145), bar, 1, border_radius=4)
 
-    if result:
+    if result and result.get("rating") == "book" and result.get("opening_name"):
+        opening_prefix = (
+            f"{result.get('opening_eco')} " if result.get("opening_eco") else ""
+        )
+        detail_text = (
+            f"Move {current_ply}/{total_moves} · "
+            f"{opening_prefix}{result.get('opening_name')}"
+        )
+    elif result:
         detail_text = (
             f"Move {current_ply}/{total_moves} · -{result.get('centipawn_loss', 0)} cp · "
             f"Eval {_game_review_eval_text(result.get('eval_before_cp'), result.get('mate_before'))} to "
@@ -15435,7 +16740,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     The caller owns the original 400x50 row, hover gating and navigation.
     This visual-only renderer summarises the seven board overlays and the
     Game Review coach with a magnified-board medallion, live eval trace and
-    the six coach rating badges on the right.
+    the seven coach rating badges on the right.
     """
     global analysis_settings_button_hover_amount
     global analysis_settings_button_pulse_phase
@@ -15699,21 +17004,21 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
     screen.blit(subtitle, subtitle_rect)
 
-    # Right-hand detail: all six coach badges in a compact 3 x 2 cluster.
+    # Right-hand detail: all seven coach badges in a compact 4 x 2 cluster.
     for index, rating in enumerate(GAME_REVIEW_RATINGS):
-        col = index % 3
-        row = index // 3
+        col = index % 4
+        row = index // 4
         draw_game_review_rating_icon(
             screen,
             rating,
             (
-                visual_rect.right - 98 + col * 24,
+                visual_rect.right - 104 + col * 19,
                 visual_rect.centery - 11 + row * 22,
             ),
-            17,
+            16,
         )
     if review_live:
-        live_dot = (visual_rect.right - 98, visual_rect.y + 8)
+        live_dot = (visual_rect.right - 104, visual_rect.y + 8)
         live_radius = 3 + int(round(hover_amount))
         pygame.draw.circle(screen, (110, 210, 255), live_dot, live_radius)
         pygame.draw.circle(screen, (255, 255, 255), live_dot, live_radius + 1, 1)
@@ -25736,6 +27041,12 @@ def main():
         if not game_review_line_matches(board, history_redo):
             cancel_game_review()
             return
+        sync_game_review_speech(
+            board,
+            allow_new=(
+                anim_mgr.move_anim is None and menu_anim_progress <= 0.01
+            ),
+        )
         if not snapshot.get("playing"):
             return
         if (
@@ -25748,6 +27059,8 @@ def main():
             or show_advisor_side_dialog
             or anim_mgr.move_anim is not None
         ):
+            return
+        if game_review_speech_is_busy():
             return
         total_moves = len(snapshot.get("moves_uci", []))
         current_ply = len(board.move_stack)
@@ -26821,7 +28134,7 @@ def main():
         if _result is not None:
             _term_key = (board.fen(), len(board.move_stack))
             if game_review_is_active():
-                # Coach Nova narrates the finish; do not cover the dock
+                # Coach Nolan narrates the finish; do not cover the dock
                 # with the modal (and do not reopen it on review close).
                 show_game_over = False
                 game_over_seen_key = _term_key
