@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 
+# Downloaded/local Piper voice models (the folder placeholder stays tracked)
+piper/*
+!piper/.gitkeep
+
 # Legacy board-vision CNN dataset/assistant output
 board_debug/
 board_vision_assistant/
