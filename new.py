@@ -394,8 +394,42 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "use_package": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
-_STRING_CONFIG_KEYS = ("theme", "board_theme", "auto_move_color")
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
+_STRING_CONFIG_KEYS = (
+    "theme",
+    "board_theme",
+    "auto_move_color",
+    "autoplay_side",
+    "autoplay_broadcast_mode",
+    "autoplay_broadcast_kind",
+    "autoplay_broadcast_title",
+    "autoplay_broadcast_process",
+    "autoplay_broadcast_screen_device",
+)
+
+
+def _normalise_autoplay_side_preference(value):
+    """Return Auto-play's saved side choice: ``ask``, ``white`` or ``black``."""
+    side = str(value or "ask").strip().lower()
+    return side if side in ("ask", "white", "black") else "ask"
+
+
+def _normalise_autoplay_broadcast_mode(value):
+    """Return whether Auto-play asks for a source or reuses the saved one."""
+    mode = str(value or "ask").strip().lower()
+    return mode if mode in ("ask", "saved") else "ask"
+
+
+def _normalise_autoplay_broadcast_kind(value):
+    """Return a saved Auto-play capture-source kind (blank means none)."""
+    kind = str(value or "").strip().lower()
+    return kind if kind in ("window", "screen") else ""
+
+
+def _clean_config_text(value, limit=240):
+    """One-line, length-limited text safe for the simple config file."""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    return " ".join(text.split())[: int(limit)]
 
 
 def _snap_hash_down(value):
@@ -436,6 +470,45 @@ def _clamp_config_limits(cfg):
         cfg["autoplay_depth"] = max(1, min(int(cfg.get("autoplay_depth", 20)), 40))
     except Exception:
         cfg["autoplay_depth"] = 20
+    # Auto-play remains session-only, but its side and broadcast source are
+    # ordinary setup preferences. ``ask`` preserves the established
+    # window/screen -> side questions on every fresh start.
+    cfg["autoplay_side"] = _normalise_autoplay_side_preference(
+        cfg.get("autoplay_side", "ask")
+    )
+    cfg["autoplay_broadcast_mode"] = _normalise_autoplay_broadcast_mode(
+        cfg.get("autoplay_broadcast_mode", "ask")
+    )
+    cfg["autoplay_broadcast_kind"] = _normalise_autoplay_broadcast_kind(
+        cfg.get("autoplay_broadcast_kind", "")
+    )
+    cfg["autoplay_broadcast_title"] = _clean_config_text(
+        cfg.get("autoplay_broadcast_title", "")
+    )
+    cfg["autoplay_broadcast_process"] = _clean_config_text(
+        cfg.get("autoplay_broadcast_process", ""), 80
+    )
+    cfg["autoplay_broadcast_screen_device"] = _clean_config_text(
+        cfg.get("autoplay_broadcast_screen_device", ""), 80
+    )
+    try:
+        cfg["autoplay_broadcast_screen_index"] = int(
+            cfg.get("autoplay_broadcast_screen_index", -1)
+        )
+    except Exception:
+        cfg["autoplay_broadcast_screen_index"] = -1
+    if cfg["autoplay_broadcast_screen_index"] < -1:
+        cfg["autoplay_broadcast_screen_index"] = -1
+    for config_key in (
+        "autoplay_broadcast_left",
+        "autoplay_broadcast_top",
+        "autoplay_broadcast_right",
+        "autoplay_broadcast_bottom",
+    ):
+        try:
+            cfg[config_key] = int(cfg.get(config_key, 0))
+        except Exception:
+            cfg[config_key] = 0
     return cfg
 
 
@@ -495,6 +568,50 @@ def save_config():
             f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
             f.write(f"autoplay_depth={int(config.get('autoplay_depth', 20))}\n")
+            f.write(
+                "autoplay_side="
+                f"{_normalise_autoplay_side_preference(config.get('autoplay_side', 'ask'))}\n"
+            )
+            f.write(
+                "autoplay_broadcast_mode="
+                f"{_normalise_autoplay_broadcast_mode(config.get('autoplay_broadcast_mode', 'ask'))}\n"
+            )
+            f.write(
+                "autoplay_broadcast_kind="
+                f"{_normalise_autoplay_broadcast_kind(config.get('autoplay_broadcast_kind', ''))}\n"
+            )
+            f.write(
+                "autoplay_broadcast_title="
+                f"{_clean_config_text(config.get('autoplay_broadcast_title', ''))}\n"
+            )
+            f.write(
+                "autoplay_broadcast_process="
+                f"{_clean_config_text(config.get('autoplay_broadcast_process', ''), 80)}\n"
+            )
+            try:
+                broadcast_screen_index = int(
+                    config.get("autoplay_broadcast_screen_index", -1)
+                )
+            except Exception:
+                broadcast_screen_index = -1
+            f.write(
+                f"autoplay_broadcast_screen_index={broadcast_screen_index}\n"
+            )
+            f.write(
+                "autoplay_broadcast_screen_device="
+                f"{_clean_config_text(config.get('autoplay_broadcast_screen_device', ''), 80)}\n"
+            )
+            for config_key in (
+                "autoplay_broadcast_left",
+                "autoplay_broadcast_top",
+                "autoplay_broadcast_right",
+                "autoplay_broadcast_bottom",
+            ):
+                try:
+                    broadcast_value = int(config.get(config_key, 0))
+                except Exception:
+                    broadcast_value = 0
+                f.write(f"{config_key}={broadcast_value}\n")
             f.write(f"use_package={1 if config.get('use_package', 0) else 0}\n")
             for config_key in ANALYSIS_OVERLAY_CONFIG_KEYS.values():
                 f.write(f"{config_key}={1 if config.get(config_key, 0) else 0}\n")
@@ -660,11 +777,11 @@ board_detection_result_ready = False
 board_detection_last_summary = ""
 _board_detection_thread = None
 _win32_capture_libs_cache = None
-board_detection_picker_purpose = "detect"  # "detect" | "autoplay" | "advisor"
+board_detection_picker_purpose = "detect"  # detect | autoplay | autoplay_source | advisor
 
 # --- Auto-play (Analysis page) ---
-# One mutable session dict keeps the external-window sync state together:
-# the chosen window/side, the located board rectangle, the last accepted
+# One mutable session dict keeps the external-source sync state together:
+# the chosen screen/window and side, the located board rectangle, the last accepted
 # board-only screenshot/grid, and any move awaiting verification after a
 # real mouse drag.
 AUTOPLAY_DEFAULT_DEPTH = 20
@@ -674,6 +791,11 @@ AUTOPLAY_DEPTH = AUTOPLAY_DEFAULT_DEPTH
 AUTOPLAY_DEPTH_MIN = 1
 AUTOPLAY_DEPTH_MAX = 40
 autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
+# Saved setup defaults. ``ask`` keeps the long-standing modal questions;
+# a saved side/source lets a fresh Auto-play start skip one or both.
+autoplay_side_preference = "ask"
+autoplay_broadcast_mode = "ask"
+autoplay_broadcast_target = None
 AUTOPLAY_POLL_SECONDS = 0.4
 AUTOPLAY_DRAG_SECONDS = 0.38
 AUTOPLAY_STOP_VK = 0x77  # F8: universal Auto-play toggle (Windows VK_F8)
@@ -929,6 +1051,401 @@ def set_autoplay_depth(depth, persist=True):
     return autoplay_depth
 
 
+def _autoplay_target_kind(window_info):
+    """Normalised capture kind for an Auto-play source dictionary."""
+    if not isinstance(window_info, dict):
+        return "window"
+    kind = (
+        window_info.get("capture_kind")
+        or window_info.get("kind")
+        or window_info.get("source_kind")
+        or "window"
+    )
+    return _normalise_autoplay_broadcast_kind(kind) or "window"
+
+
+def _autoplay_target_rect(window_info):
+    """Return a source's ``(left, top, right, bottom)`` rect, if usable."""
+    if not isinstance(window_info, dict):
+        return (0, 0, 0, 0)
+    rect = (
+        window_info.get("screen_rect")
+        if _autoplay_target_kind(window_info) == "screen"
+        else window_info.get("rect")
+    )
+    if rect is None:
+        rect = window_info.get("rect") or window_info.get("screen_rect")
+    try:
+        values = tuple(int(value) for value in list(rect)[:4])
+    except Exception:
+        return (0, 0, 0, 0)
+    return values if len(values) == 4 else (0, 0, 0, 0)
+
+
+def _autoplay_broadcast_snapshot(window_info):
+    """Serializable identity for a selected Auto-play screen/window.
+
+    HWNDs and preview surfaces are deliberately omitted: an HWND is only
+    meaningful for the current Windows session, while the title/process
+    (or monitor device/index and rectangle) can find the same source on
+    a later launch.
+    """
+    if not isinstance(window_info, dict):
+        return None
+    kind = _autoplay_target_kind(window_info)
+    rect = _autoplay_target_rect(window_info)
+    title = _clean_config_text(
+        window_info.get("title")
+        or window_info.get("window_title")
+        or ("Screen" if kind == "screen" else "Selected window")
+    )
+    try:
+        screen_index = int(window_info.get("screen_index", -1))
+    except Exception:
+        screen_index = -1
+    snapshot = {
+        "capture_kind": kind,
+        "kind": kind,
+        "hwnd": 0,
+        "title": title,
+        "process_name": _clean_config_text(
+            window_info.get("process_name", ""), 80
+        ),
+        "screen_index": screen_index if kind == "screen" else -1,
+        "screen_device": _clean_config_text(
+            window_info.get("screen_device", ""), 80
+        ) if kind == "screen" else "",
+        "rect": rect,
+        "thumbnail": None,
+    }
+    if kind == "screen":
+        snapshot["screen_rect"] = rect
+        if (
+            not snapshot["screen_device"]
+            and screen_index < 0
+            and not (rect[2] > rect[0] and rect[3] > rect[1])
+        ):
+            return None
+    elif not title and not snapshot["process_name"]:
+        return None
+    return snapshot
+
+
+def _autoplay_broadcast_target_from_config(cfg=None):
+    """Rebuild the saved broadcast-source identity from config values."""
+    cfg = config if cfg is None else cfg
+    kind = _normalise_autoplay_broadcast_kind(
+        cfg.get("autoplay_broadcast_kind", "")
+    )
+    if not kind:
+        return None
+    try:
+        rect = (
+            int(cfg.get("autoplay_broadcast_left", 0)),
+            int(cfg.get("autoplay_broadcast_top", 0)),
+            int(cfg.get("autoplay_broadcast_right", 0)),
+            int(cfg.get("autoplay_broadcast_bottom", 0)),
+        )
+    except Exception:
+        rect = (0, 0, 0, 0)
+    try:
+        screen_index = int(cfg.get("autoplay_broadcast_screen_index", -1))
+    except Exception:
+        screen_index = -1
+    target = {
+        "capture_kind": kind,
+        "kind": kind,
+        "hwnd": 0,
+        "title": _clean_config_text(cfg.get("autoplay_broadcast_title", "")),
+        "process_name": _clean_config_text(
+            cfg.get("autoplay_broadcast_process", ""), 80
+        ),
+        "screen_index": screen_index,
+        "screen_device": _clean_config_text(
+            cfg.get("autoplay_broadcast_screen_device", ""), 80
+        ),
+        "rect": rect,
+        "thumbnail": None,
+    }
+    if kind == "screen":
+        target["screen_rect"] = rect
+        if (
+            not target["screen_device"]
+            and screen_index < 0
+            and not (rect[2] > rect[0] and rect[3] > rect[1])
+        ):
+            return None
+    elif not target["title"] and not target["process_name"]:
+        return None
+    return target
+
+
+def _autoplay_setup_preferences_locked():
+    """True while changing setup defaults could confuse a live session."""
+    return bool(
+        _autoplay.get("enabled")
+        or _autoplay.get("running")
+        or _autoplay.get("scan_running")
+        or _autoplay.get("drag_running")
+        or show_autoplay_side_dialog
+        or show_autoplay_gameover_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "autoplay"
+        )
+    )
+
+
+def _forget_retained_autoplay_session_for_preferences():
+    """Make a changed setup default win over F8's retained-session rescan."""
+    if _autoplay_setup_preferences_locked():
+        return False
+    _autoplay.update({
+        "window": None,
+        "pending_window": None,
+        "scan_ready": False,
+        "scan_result": None,
+        "session_ready": False,
+        "awaiting_f8_restart": False,
+        "game_result": None,
+    })
+    if _autoplay.get("state") in ("game_over", "stopped"):
+        _autoplay["state"] = "idle"
+    return True
+
+
+def set_autoplay_side_preference(side, persist=True, forget_retained=False):
+    """Set whether fresh Auto-play starts ask for, or reuse, a side."""
+    global autoplay_side_preference
+    new_side = _normalise_autoplay_side_preference(side)
+    changed = new_side != autoplay_side_preference
+    autoplay_side_preference = new_side
+    config["autoplay_side"] = new_side
+    if forget_retained and changed:
+        _forget_retained_autoplay_session_for_preferences()
+    if persist:
+        save_config()
+    return autoplay_side_preference
+
+
+def _write_autoplay_broadcast_target_to_config(target):
+    """Mirror a source snapshot (or its absence) into ``config``."""
+    if not target:
+        config.update({
+            "autoplay_broadcast_kind": "",
+            "autoplay_broadcast_title": "",
+            "autoplay_broadcast_process": "",
+            "autoplay_broadcast_screen_index": -1,
+            "autoplay_broadcast_screen_device": "",
+            "autoplay_broadcast_left": 0,
+            "autoplay_broadcast_top": 0,
+            "autoplay_broadcast_right": 0,
+            "autoplay_broadcast_bottom": 0,
+        })
+        return
+    rect = _autoplay_target_rect(target)
+    config.update({
+        "autoplay_broadcast_kind": _autoplay_target_kind(target),
+        "autoplay_broadcast_title": _clean_config_text(target.get("title", "")),
+        "autoplay_broadcast_process": _clean_config_text(
+            target.get("process_name", ""), 80
+        ),
+        "autoplay_broadcast_screen_index": int(
+            target.get("screen_index", -1)
+        ),
+        "autoplay_broadcast_screen_device": _clean_config_text(
+            target.get("screen_device", ""), 80
+        ),
+        "autoplay_broadcast_left": int(rect[0]),
+        "autoplay_broadcast_top": int(rect[1]),
+        "autoplay_broadcast_right": int(rect[2]),
+        "autoplay_broadcast_bottom": int(rect[3]),
+    })
+
+
+def set_autoplay_broadcast_mode(mode, persist=True, forget_retained=False):
+    """Set whether Auto-play asks for, or reuses, its broadcast source."""
+    global autoplay_broadcast_mode
+    new_mode = _normalise_autoplay_broadcast_mode(mode)
+    if new_mode == "saved" and not autoplay_broadcast_target:
+        new_mode = "ask"
+    changed = new_mode != autoplay_broadcast_mode
+    autoplay_broadcast_mode = new_mode
+    config["autoplay_broadcast_mode"] = new_mode
+    if forget_retained and changed:
+        _forget_retained_autoplay_session_for_preferences()
+    if persist:
+        save_config()
+    return autoplay_broadcast_mode
+
+
+def set_autoplay_broadcast_target(
+    window_info, persist=True, make_default=False, forget_retained=False
+):
+    """Remember an Auto-play screen/window, optionally as the default."""
+    global autoplay_broadcast_target, autoplay_broadcast_mode
+    snapshot = (
+        _autoplay_broadcast_snapshot(window_info)
+        if window_info is not None else None
+    )
+    if window_info is not None and snapshot is None:
+        return None
+    changed = snapshot != autoplay_broadcast_target
+    autoplay_broadcast_target = dict(snapshot) if snapshot else None
+    _write_autoplay_broadcast_target_to_config(autoplay_broadcast_target)
+    if make_default and snapshot:
+        autoplay_broadcast_mode = "saved"
+        config["autoplay_broadcast_mode"] = "saved"
+    elif not snapshot:
+        autoplay_broadcast_mode = "ask"
+        config["autoplay_broadcast_mode"] = "ask"
+    if forget_retained and changed:
+        _forget_retained_autoplay_session_for_preferences()
+    if persist:
+        save_config()
+    return autoplay_broadcast_target
+
+
+def _autoplay_broadcast_target_label(target=None):
+    """Short source name for settings/status text."""
+    target = autoplay_broadcast_target if target is None else target
+    if not target:
+        return "Not saved"
+    title = _clean_config_text(
+        target.get("title") or target.get("window_title") or ""
+    )
+    if title:
+        return title
+    if _autoplay_target_kind(target) == "screen":
+        try:
+            index = int(target.get("screen_index", -1))
+        except Exception:
+            index = -1
+        return f"Screen {index + 1}" if index >= 0 else "Saved screen"
+    return target.get("process_name") or "Saved window"
+
+
+def _autoplay_side_preference_label():
+    """Human-readable saved Auto-play side choice."""
+    return {
+        "ask": "Ask each time",
+        "white": "White",
+        "black": "Black",
+    }[_normalise_autoplay_side_preference(autoplay_side_preference)]
+
+
+def _autoplay_broadcast_preference_label():
+    """Human-readable saved Auto-play broadcast-source choice."""
+    if _normalise_autoplay_broadcast_mode(autoplay_broadcast_mode) != "saved":
+        return "Ask each time"
+    return _autoplay_broadcast_target_label()
+
+
+def _autoplay_target_text_tokens(text):
+    return set(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def _autoplay_broadcast_match_score(saved_target, candidate):
+    """Score how confidently a live source is the saved source."""
+    saved = _autoplay_broadcast_snapshot(saved_target)
+    live = _autoplay_broadcast_snapshot(candidate)
+    if not saved or not live or saved["kind"] != live["kind"]:
+        return 0
+
+    saved_rect = _autoplay_target_rect(saved)
+    live_rect = _autoplay_target_rect(live)
+    saved_size = (saved_rect[2] - saved_rect[0], saved_rect[3] - saved_rect[1])
+    live_size = (live_rect[2] - live_rect[0], live_rect[3] - live_rect[1])
+
+    if saved["kind"] == "screen":
+        score = 0
+        if (
+            saved.get("screen_device")
+            and saved["screen_device"] == live.get("screen_device")
+        ):
+            score += 80
+        if (
+            int(saved.get("screen_index", -1)) >= 0
+            and saved.get("screen_index") == live.get("screen_index")
+        ):
+            score += 35
+        if saved_rect == live_rect and saved_size[0] > 0:
+            score += 25
+        elif saved_size == live_size and saved_size[0] > 0:
+            score += 10
+        return score
+
+    saved_title = _clean_config_text(saved.get("title", "")).lower()
+    live_title = _clean_config_text(live.get("title", "")).lower()
+    score = 0
+    if saved_title and saved_title == live_title:
+        score += 75
+    else:
+        saved_tokens = _autoplay_target_text_tokens(saved_title)
+        live_tokens = _autoplay_target_text_tokens(live_title)
+        if saved_tokens and live_tokens:
+            overlap = len(saved_tokens & live_tokens)
+            score += round(45 * (2 * overlap) / (len(saved_tokens) + len(live_tokens)))
+    saved_process = str(saved.get("process_name", "") or "").lower()
+    live_process = str(live.get("process_name", "") or "").lower()
+    if saved_process and saved_process == live_process:
+        score += 25
+    if saved_size == live_size and saved_size[0] > 0:
+        score += 8
+    if saved_rect == live_rect and saved_size[0] > 0:
+        score += 5
+    return score
+
+
+def _match_autoplay_broadcast_target(candidates, target=None):
+    """Best confident live match for the saved broadcast source, if any."""
+    target = autoplay_broadcast_target if target is None else target
+    if not target:
+        return None
+    best = None
+    best_score = 0
+    best_count = 0
+    threshold = 55 if _autoplay_target_kind(target) == "screen" else 60
+    for candidate in candidates or []:
+        try:
+            candidate_hwnd = int(candidate.get("hwnd") or 0)
+            target_hwnd = int(target.get("hwnd") or 0)
+        except Exception:
+            candidate_hwnd = target_hwnd = 0
+        score = (
+            1000
+            if candidate_hwnd and candidate_hwnd == target_hwnd
+            else _autoplay_broadcast_match_score(target, candidate)
+        )
+        if score > best_score:
+            best = candidate
+            best_score = score
+            best_count = 1
+        elif score == best_score and 0 < score < 1000:
+            # Two equally plausible live sources are not a confident
+            # saved-source match; let the caller ask instead of guessing.
+            best_count += 1
+    if best is None or best_score < threshold or best_count != 1:
+        return None
+    return dict(best)
+
+
+def _resolve_saved_autoplay_broadcast_target():
+    """Find the saved screen/window among the sources open right now."""
+    if not autoplay_broadcast_target:
+        return None
+    candidates = []
+    try:
+        candidates.extend(_enumerate_capture_screens())
+    except Exception:
+        pass
+    try:
+        candidates.extend(_enumerate_capture_windows())
+    except Exception:
+        pass
+    return _match_autoplay_broadcast_target(candidates)
+
+
 def _advisor_eval_text(score, mate):
     """Format Stockfish's White-perspective score for the Advisor overlay."""
     if mate is not None:
@@ -1139,6 +1656,16 @@ try:
     )
 except Exception:
     autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
+autoplay_side_preference = _normalise_autoplay_side_preference(
+    config.get("autoplay_side", "ask")
+)
+autoplay_broadcast_mode = _normalise_autoplay_broadcast_mode(
+    config.get("autoplay_broadcast_mode", "ask")
+)
+autoplay_broadcast_target = _autoplay_broadcast_target_from_config()
+if autoplay_broadcast_mode == "saved" and not autoplay_broadcast_target:
+    autoplay_broadcast_mode = "ask"
+    config["autoplay_broadcast_mode"] = "ask"
 use_package_enabled = bool(config.get("use_package", 0))
 analysis_overlay_enabled = {
     key: bool(config.get(ANALYSIS_OVERLAY_CONFIG_KEYS[key], 0))
@@ -10890,6 +11417,18 @@ class _WinPoint(ctypes.Structure):
     ]
 
 
+class _WinMonitorInfoEx(ctypes.Structure):
+    """Win32 ``MONITORINFOEXW`` used to enumerate physical screens."""
+
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("rcMonitor", _WinRect),
+        ("rcWork", _WinRect),
+        ("dwFlags", ctypes.c_uint32),
+        ("szDevice", ctypes.c_wchar * 32),
+    ]
+
+
 def _hwnd_value(hwnd):
     """Normalise a ctypes/int HWND to an int for comparisons."""
     if not hwnd:
@@ -10968,8 +11507,30 @@ def _get_win32_capture_libs():
     user32._get_window_long_for_capture = get_long
     user32.GetWindowDC.argtypes = [wintypes.HWND]
     user32.GetWindowDC.restype = ctypes.c_void_p
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = ctypes.c_void_p
     user32.ReleaseDC.argtypes = [wintypes.HWND, ctypes.c_void_p]
     user32.ReleaseDC.restype = ctypes.c_int
+    monitor_enum_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(_WinRect),
+        wintypes.LPARAM,
+    )
+    user32._monitor_enum_proc_for_capture = monitor_enum_proc
+    user32.EnumDisplayMonitors.argtypes = [
+        wintypes.HDC,
+        ctypes.POINTER(_WinRect),
+        monitor_enum_proc,
+        wintypes.LPARAM,
+    ]
+    user32.EnumDisplayMonitors.restype = wintypes.BOOL
+    user32.GetMonitorInfoW.argtypes = [
+        wintypes.HMONITOR,
+        ctypes.POINTER(_WinMonitorInfoEx),
+    ]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
     user32.PrintWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.UINT]
     user32.PrintWindow.restype = wintypes.BOOL
     user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -10988,6 +11549,13 @@ def _get_win32_capture_libs():
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
 
+    gdi32.CreateDCW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+    ]
+    gdi32.CreateDCW.restype = ctypes.c_void_p
     gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
     gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
     gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -11067,6 +11635,25 @@ def _window_process_name(hwnd):
                 kernel32.CloseHandle(process_handle)
             except Exception:
                 pass
+
+
+def _own_window_rect_snapshot():
+    """ChessBotV's current desktop rect, for masking full-screen scans."""
+    libs = _get_win32_capture_libs()
+    if libs is None:
+        return None
+    try:
+        user32 = libs[0]
+        hwnd = _get_window_hwnd(_user32())
+        value = _hwnd_value(hwnd)
+        if not value:
+            return None
+        rect = _WinRect()
+        if not user32.GetWindowRect(ctypes.c_void_p(value), ctypes.byref(rect)):
+            return None
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+    except Exception:
+        return None
 
 
 ADVISOR_MOUSE_BUTTON_VKS = (0x01, 0x02, 0x04)  # left / right / middle
@@ -11186,6 +11773,78 @@ def _advisor_target_mouse_down():
     return _advisor_cursor_in_target_window()
 
 
+def _enumerate_capture_screens():
+    """Physical monitors Auto-play can broadcast from as whole screens."""
+    libs = _get_win32_capture_libs()
+    if libs is None:
+        return []
+    user32 = libs[0]
+    monitor_enum_proc = getattr(user32, "_monitor_enum_proc_for_capture", None)
+    if monitor_enum_proc is None:
+        return []
+    raw_screens = []
+
+    def callback(hmonitor, _hdc, _rect, _lparam):
+        try:
+            info = _WinMonitorInfoEx()
+            info.cbSize = ctypes.sizeof(_WinMonitorInfoEx)
+            if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                return True
+            rect = (
+                int(info.rcMonitor.left),
+                int(info.rcMonitor.top),
+                int(info.rcMonitor.right),
+                int(info.rcMonitor.bottom),
+            )
+            if rect[2] - rect[0] < 320 or rect[3] - rect[1] < 240:
+                return True
+            raw_screens.append({
+                "rect": rect,
+                "screen_device": str(info.szDevice or ""),
+                "primary": bool(info.dwFlags & 0x00000001),
+            })
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumDisplayMonitors(None, None, monitor_enum_proc(callback), 0)
+    except Exception:
+        return []
+
+    # Primary first, then left-to-right/top-to-bottom, gives the labels a
+    # stable, intuitive order even if Windows enumerates them differently.
+    raw_screens.sort(
+        key=lambda item: (
+            not item["primary"],
+            item["rect"][0],
+            item["rect"][1],
+            item["screen_device"],
+        )
+    )
+    screens = []
+    for index, raw in enumerate(raw_screens):
+        device = raw["screen_device"]
+        short_device = device.rsplit("\\", 1)[-1] if device else f"DISPLAY{index + 1}"
+        title = f"Screen {index + 1} · {short_device}"
+        if raw["primary"]:
+            title += " · Primary"
+        screens.append({
+            "capture_kind": "screen",
+            "kind": "screen",
+            "hwnd": 0,
+            "title": title,
+            "rect": raw["rect"],
+            "screen_rect": raw["rect"],
+            "screen_index": index,
+            "screen_device": device,
+            "screen_primary": bool(raw["primary"]),
+            "process_name": "",
+            "thumbnail": None,
+        })
+    return screens
+
+
 def _enumerate_capture_windows():
     """Visible top-level windows suitable for the Board Detection picker."""
     libs = _get_win32_capture_libs()
@@ -11226,9 +11885,13 @@ def _enumerate_capture_windows():
             if width < 240 or height < 180:
                 return True
             windows.append({
+                "capture_kind": "window",
+                "kind": "window",
                 "hwnd": hwnd_value,
                 "title": title,
                 "rect": (rect.left, rect.top, rect.right, rect.bottom),
+                "screen_index": -1,
+                "screen_device": "",
                 "process_name": _window_process_name(hwnd_value),
                 "thumbnail": None,
             })
@@ -11240,8 +11903,127 @@ def _enumerate_capture_windows():
     return windows[:12]
 
 
-def _capture_window_bgr(hwnd):
-    """Capture one window as (BGR numpy image, screen rect), or (None, None)."""
+def _capture_screen_bgr(screen_info):
+    """Capture one physical monitor as ``(BGR image, desktop rect)``."""
+    libs = _get_win32_capture_libs()
+    if libs is None or not isinstance(screen_info, dict):
+        return None, None
+    try:
+        import numpy as np
+    except Exception:
+        return None, None
+
+    rect = _autoplay_target_rect(screen_info)
+    left, top, right, bottom = (int(value) for value in rect)
+    width = int(right - left)
+    height = int(bottom - top)
+    if width <= 0 or height <= 0:
+        return None, None
+
+    user32, gdi32, _enum_proc = libs
+    device = str(screen_info.get("screen_device") or "")
+    screen_dc = None
+    created_screen_dc = False
+    try:
+        if device:
+            screen_dc = gdi32.CreateDCW("DISPLAY", device, None, None)
+            created_screen_dc = bool(screen_dc)
+        if not screen_dc:
+            screen_dc = user32.GetDC(None)
+            created_screen_dc = False
+    except Exception:
+        return None, None
+    if not screen_dc:
+        return None, None
+
+    memory_dc = None
+    bitmap = None
+    old_object = None
+    try:
+        memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+        bitmap = (
+            gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+            if memory_dc else None
+        )
+        old_object = gdi32.SelectObject(memory_dc, bitmap) if bitmap else None
+        if not memory_dc or not bitmap:
+            return None, None
+
+        def read_bits():
+            bmi = _BitmapInfo()
+            bmi.bmiHeader.biSize = ctypes.sizeof(_BitmapInfoHeader)
+            bmi.bmiHeader.biWidth = width
+            bmi.bmiHeader.biHeight = -height  # top-down rows
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = 0
+            bmi.bmiHeader.biSizeImage = width * height * 4
+            buffer = ctypes.create_string_buffer(width * height * 4)
+            rows = gdi32.GetDIBits(
+                memory_dc, bitmap, 0, height, buffer, ctypes.byref(bmi), 0
+            )
+            if rows == 0:
+                return None
+            bgra = np.frombuffer(
+                buffer, dtype=np.uint8
+            ).reshape((height, width, 4)).copy()
+            return bgra[:, :, :3].copy()
+
+        origins = []
+        for origin in ((left, top), (0, 0)):
+            if origin not in origins:
+                origins.append(origin)
+        image = None
+        SRCCOPY_CAPTUREBLT = 0x00CC0020 | 0x40000000
+        for origin_x, origin_y in origins:
+            if not gdi32.BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                screen_dc,
+                int(origin_x),
+                int(origin_y),
+                SRCCOPY_CAPTUREBLT,
+            ):
+                continue
+            candidate = read_bits()
+            if candidate is None:
+                continue
+            image = candidate
+            # A wrong monitor-origin convention usually produces a blank
+            # bitmap; accept the first real frame and otherwise try the
+            # monitor-local origin as a fallback.
+            if float(np.mean(image)) >= 2.0 or float(np.std(image)) >= 1.0:
+                break
+        if image is None:
+            return None, None
+        return image, (left, top, right, bottom)
+    finally:
+        if old_object and memory_dc:
+            gdi32.SelectObject(memory_dc, old_object)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory_dc:
+            gdi32.DeleteDC(memory_dc)
+        if screen_dc:
+            if created_screen_dc:
+                gdi32.DeleteDC(screen_dc)
+            else:
+                user32.ReleaseDC(ctypes.c_void_p(0), screen_dc)
+
+
+def _capture_window_bgr(target):
+    """Capture a window (or screen-source dict) as ``(BGR, rect)``.
+
+    Existing callers may still pass a bare HWND. Auto-play passes its
+    source dictionary so a whole physical screen can be routed to the
+    GDI screen-capture path instead of ``PrintWindow``.
+    """
+    if isinstance(target, dict) and _autoplay_target_kind(target) == "screen":
+        return _capture_screen_bgr(target)
+    hwnd = target.get("hwnd") if isinstance(target, dict) else target
     libs = _get_win32_capture_libs()
     if libs is None or not hwnd:
         return None, None
@@ -12406,10 +13188,20 @@ def _make_thumbnail_surface(image, max_w=276, max_h=92):
 def _refresh_board_detection_windows():
     global board_detection_windows, board_detection_selected
     global board_detection_page, board_detection_error
-    windows = _enumerate_capture_windows()
+    include_screens = board_detection_picker_purpose in (
+        "autoplay",
+        "autoplay_source",
+    )
+    windows = []
+    if include_screens:
+        try:
+            windows.extend(_enumerate_capture_screens())
+        except Exception:
+            pass
+    windows.extend(_enumerate_capture_windows())
     for window in windows:
         try:
-            image, _rect = _capture_window_bgr(window["hwnd"])
+            image, _rect = _capture_window_bgr(window)
         except Exception:
             image = None
         window["thumbnail"] = _make_thumbnail_surface(image)
@@ -12417,11 +13209,28 @@ def _refresh_board_detection_windows():
     board_detection_selected = max(
         0, min(board_detection_selected, len(windows) - 1)
     ) if windows else 0
+    if include_screens and autoplay_broadcast_target:
+        saved_match = _match_autoplay_broadcast_target(windows)
+        if saved_match is not None:
+            for index, window in enumerate(windows):
+                if (
+                    _autoplay_target_kind(window)
+                    == _autoplay_target_kind(saved_match)
+                    and _autoplay_broadcast_snapshot(window)
+                    == _autoplay_broadcast_snapshot(saved_match)
+                ):
+                    board_detection_selected = index
+                    break
     board_detection_page = board_detection_selected // BOARD_DETECTION_WINDOWS_PER_PAGE
     if windows:
         board_detection_error = ""
     elif os.name != "nt":
-        board_detection_error = "Window capture is available on Windows only."
+        board_detection_error = "Screen/window capture is available on Windows only."
+    elif include_screens:
+        board_detection_error = (
+            "No suitable screens or visible windows found. Open the chess "
+            "screen/window and Refresh."
+        )
     else:
         board_detection_error = "No suitable visible windows found. Open the chess window and Refresh."
     return windows
@@ -12681,7 +13490,7 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
 
 
 def request_autoplay_start():
-    """Begin the window -> side -> first-scan Auto-play setup flow."""
+    """Begin Auto-play setup, skipping questions with saved defaults."""
     if _autoplay.get("enabled") or _autoplay.get("running") or _autoplay.get("scan_running"):
         return stop_autoplay()
     if os.name != "nt":
@@ -12721,27 +13530,114 @@ def request_autoplay_start():
         "session_ready": False,
         "pending_causes_checkmate": False,
     })
-    _autoplay_set_status("Choose the window you are playing on.")
+
+    saved_target = None
+    saved_target_missing = False
+    if _normalise_autoplay_broadcast_mode(autoplay_broadcast_mode) == "saved":
+        saved_target = _resolve_saved_autoplay_broadcast_target()
+        saved_target_missing = saved_target is None
+    if saved_target is not None:
+        return _autoplay_window_selected(saved_target)
+
+    if saved_target_missing and autoplay_broadcast_target:
+        _autoplay_set_status(
+            "Saved Auto-play screen/window was not found. "
+            "Choose the screen or window to broadcast."
+        )
+    else:
+        _autoplay_set_status("Choose the screen or window to broadcast.")
     if not open_board_detection_dialog("autoplay"):
-        return stop_autoplay("Could not open the Auto-play window picker.", error=True)
+        return stop_autoplay(
+            "Could not open the Auto-play screen/window picker.", error=True
+        )
     return True
 
 
 def _autoplay_window_selected(window_info):
-    """Store the picker choice and ask which side the user is playing."""
+    """Store a source, then ask for a side unless one is saved."""
     global show_autoplay_side_dialog, autoplay_side_dialog_anim
     global show_board_detection_dialog, board_detection_picker_purpose
     if not window_info:
-        return stop_autoplay("No Auto-play window was selected.", error=True)
+        return stop_autoplay("No Auto-play screen/window was selected.", error=True)
+    window_info = dict(window_info)
+    # Remember the last source even in Ask mode, so the Settings
+    # ``Saved`` choice can be enabled later without another picker trip.
+    # This does not change the mode or an active session's source.
+    set_autoplay_broadcast_target(window_info)
     _autoplay["pending_window"] = dict(window_info)
     _autoplay["window"] = dict(window_info)
-    _autoplay["state"] = "choosing_side"
-    _autoplay_set_status("Choose the side you are playing.")
     show_board_detection_dialog = False
     board_detection_picker_purpose = "detect"
+
+    side = _normalise_autoplay_side_preference(autoplay_side_preference)
+    if side in ("white", "black"):
+        show_autoplay_side_dialog = False
+        return start_autoplay_scan(side)
+
+    _autoplay["state"] = "choosing_side"
+    _autoplay_set_status("Choose the side you are playing.")
     show_autoplay_side_dialog = True
     autoplay_side_dialog_anim = 0.0
     return True
+
+
+def _autoplay_broadcast_source_selected(window_info):
+    """Save a Settings picker choice without starting Auto-play."""
+    global show_board_detection_dialog, board_detection_picker_purpose
+    if not window_info:
+        _autoplay_set_status(
+            "No Auto-play broadcast screen/window was selected.",
+            error="No Auto-play broadcast screen/window was selected.",
+        )
+        return False
+    target = set_autoplay_broadcast_target(
+        window_info,
+        make_default=True,
+        forget_retained=True,
+    )
+    show_board_detection_dialog = False
+    board_detection_picker_purpose = "detect"
+    if target is None:
+        _autoplay_set_status(
+            "That Auto-play broadcast source could not be saved.",
+            error="That Auto-play broadcast source could not be saved.",
+        )
+        return False
+    _autoplay_set_status(
+        f"Auto-play broadcast: {_autoplay_broadcast_target_label(target)} · "
+        f"Side: {_autoplay_side_preference_label()}."
+    )
+    return True
+
+
+def open_autoplay_broadcast_picker():
+    """Open the source picker solely to save Auto-play's broadcast target."""
+    if _autoplay_setup_preferences_locked():
+        message = "Stop Auto-play before changing its broadcast screen."
+        _autoplay_set_status(message, error=message)
+        return False
+    if (
+        _advisor.get("enabled")
+        or _advisor.get("running")
+        or _advisor.get("scan_running")
+        or show_advisor_side_dialog
+        or (
+            show_board_detection_dialog
+            and board_detection_picker_purpose == "advisor"
+        )
+    ):
+        message = "Stop Advisor Mode before choosing an Auto-play screen."
+        _autoplay_set_status(message, error=message)
+        return False
+    if board_detection_running:
+        message = "Wait for Board Detection to finish before choosing a screen."
+        _autoplay_set_status(message, error=message)
+        return False
+    if os.name != "nt":
+        message = "Auto-play screen/window capture is available on Windows only."
+        _autoplay_set_status(message, error=message)
+        return False
+    return open_board_detection_dialog("autoplay_source")
 
 
 def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
@@ -12749,9 +13645,36 @@ def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
     use_package = _use_package_selected(use_package)
     try:
         _ensure_vision_backend_ready(use_package)
-        image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
+        image, window_rect = _capture_window_bgr(window_info)
         if image is None:
-            raise RuntimeError("Could not screenshot the selected window")
+            source_name = (
+                "screen" if _autoplay_target_kind(window_info) == "screen"
+                else "window"
+            )
+            raise RuntimeError(f"Could not screenshot the selected {source_name}")
+        if _autoplay_target_kind(window_info) == "screen" and window_rect:
+            # A whole-screen screenshot necessarily contains ChessBotV
+            # itself when both are on the same monitor. Mask our own
+            # window for this initial locator pass so Auto-play cannot
+            # mistake ChessBotV's internal board for the broadcast game.
+            exclude_rect = window_info.get("capture_exclude_rect")
+            try:
+                if exclude_rect:
+                    ex0 = max(0, int(exclude_rect[0]) - int(window_rect[0]))
+                    ey0 = max(0, int(exclude_rect[1]) - int(window_rect[1]))
+                    ex1 = min(
+                        int(image.shape[1]),
+                        int(exclude_rect[2]) - int(window_rect[0]),
+                    )
+                    ey1 = min(
+                        int(image.shape[0]),
+                        int(exclude_rect[3]) - int(window_rect[1]),
+                    )
+                    if ex1 > ex0 and ey1 > ey0:
+                        image = image.copy()
+                        image[ey0:ey1, ex0:ex1] = 0
+            except Exception:
+                pass
         expected_anchors = ("R", "r") if _autoplay_side_name(side) == "black" else None
         detection = detect_chessboard_in_image(
             image,
@@ -12759,14 +13682,20 @@ def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
             use_package=use_package,
         )
         if detection is None:
+            source_name = (
+                "screen" if _autoplay_target_kind(window_info) == "screen"
+                else "window"
+            )
             raise RuntimeError(
-                "No 8x8 board found in that window (OpenCV corners or "
+                f"No 8x8 board found on that {source_name} (OpenCV corners or "
                 "Chess.com/Basic-Lichess colour fallback). Make sure the "
                 "full board is visible and try again."
             )
         board_rect = detection["board_rect"]
         detection["window"] = dict(window_info)
-        detection["window_title"] = window_info.get("title", "Selected window")
+        detection["window_title"] = window_info.get(
+            "title", _autoplay_broadcast_target_label(window_info)
+        )
         detection["side"] = _autoplay_side_name(side)
         detection["screenshot"] = image
         if window_rect:
@@ -12800,8 +13729,22 @@ def start_autoplay_scan(side=None):
     global menu_anim_closing
     window_info = _autoplay.get("pending_window") or _autoplay.get("window")
     if not window_info:
-        return stop_autoplay("Choose a window before scanning.", error=True)
-    side = _autoplay_side_name(side or _autoplay.get("side", "white"))
+        return stop_autoplay("Choose a screen/window before scanning.", error=True)
+    window_info = dict(window_info)
+    if _autoplay_target_kind(window_info) == "screen":
+        # Snapshot our rect on the GUI thread; the worker only uses the
+        # tuple to mask ChessBotV out of its first full-screen locator.
+        window_info["capture_exclude_rect"] = _own_window_rect_snapshot()
+    if side is None:
+        saved_side = _normalise_autoplay_side_preference(
+            autoplay_side_preference
+        )
+        side = (
+            saved_side
+            if saved_side in ("white", "black")
+            else _autoplay.get("side", "white")
+        )
+    side = _autoplay_side_name(side)
     _autoplay_invalidate_drag()
     _autoplay_poll_runner.invalidate()
     scan_id = int(_autoplay.get("scan_id", 0)) + 1
@@ -12832,8 +13775,8 @@ def start_autoplay_scan(side=None):
         "session_ready": False,
     })
     _autoplay_set_status(
-        f"Scanning the full board as {side.capitalize()} with "
-        f"{_vision_backend_label(use_package_snapshot)}..."
+        f"Scanning {_autoplay_broadcast_target_label(window_info)} as "
+        f"{side.capitalize()} with {_vision_backend_label(use_package_snapshot)}..."
     )
     try:
         begin_settings_menu_close()
@@ -12850,7 +13793,7 @@ def start_autoplay_scan(side=None):
 
 
 def restart_autoplay_scan():
-    """Scan a newly started game in the same window/as the same side."""
+    """Scan a newly started game from the same source/as the same side."""
     global show_autoplay_gameover_dialog
     show_autoplay_gameover_dialog = False
     if not _autoplay.get("window"):
@@ -12863,8 +13806,8 @@ def toggle_autoplay():
     """Universal Auto-play on/off action used by F8 everywhere.
 
     Active setup/scanning/running sessions stop. A finished game (or a
-    previous imported session) rescans the retained window/side. With no
-    reusable session, F8 starts the normal window -> side -> scan flow.
+    previous imported session) rescans the retained source/side. With no
+    reusable session, F8 starts setup using any saved side/source defaults.
     """
     if (
         _autoplay.get("enabled")
@@ -13267,7 +14210,7 @@ def _capture_board_crop_snapshot(window_info, board_rect, expected_window_size):
     if len(board_rect) != 4:
         return result
 
-    image, window_rect = _capture_window_bgr(window_info.get("hwnd"))
+    image, window_rect = _capture_window_bgr(window_info)
     if image is None or window_rect is None:
         return result
     window_size = (
@@ -13316,8 +14259,13 @@ def _autoplay_capture_board_crop():
         window_info, board_rect, _autoplay.get("window_size")
     )
     if result.get("status") == "resized":
+        source_name = (
+            "screen" if _autoplay_target_kind(window_info) == "screen"
+            else "window"
+        )
         stop_autoplay(
-            "The target window was resized; restart Auto-play to scan its board again.",
+            f"The broadcast {source_name} changed size; restart Auto-play "
+            "to scan its board again.",
             error=True,
         )
         return None
@@ -13881,7 +14829,11 @@ def open_board_detection_dialog(purpose="detect"):
     global board_detection_error
     if board_detection_running:
         return False
-    purpose = purpose if purpose in ("autoplay", "advisor") else "detect"
+    purpose = (
+        purpose
+        if purpose in ("autoplay", "autoplay_source", "advisor")
+        else "detect"
+    )
     if purpose == "detect" and (
         _autoplay.get("enabled") or _advisor.get("enabled")
     ):
@@ -13891,7 +14843,11 @@ def open_board_detection_dialog(purpose="detect"):
         board_detection_status = board_detection_error
         return False
     board_detection_picker_purpose = purpose
-    board_detection_status = "Refreshing window previews..."
+    board_detection_status = (
+        "Refreshing screen/window previews..."
+        if purpose in ("autoplay", "autoplay_source")
+        else "Refreshing window previews..."
+    )
     _refresh_board_detection_windows()
     board_detection_status = ""
     show_board_detection_dialog = True
@@ -13959,10 +14915,12 @@ def draw_board_detection_dialog(screen):
     pygame.draw.rect(screen, (80, 160, 255), panel, 2, border_radius=14)
 
     autoplay_picker = board_detection_picker_purpose == "autoplay"
+    autoplay_source_picker = board_detection_picker_purpose == "autoplay_source"
     advisor_picker = board_detection_picker_purpose == "advisor"
     live_picker = autoplay_picker or advisor_picker
     title_text = (
         "Advisor Mode" if advisor_picker
+        else "Auto-play Broadcast" if autoplay_source_picker
         else "Auto-play" if autoplay_picker
         else "Board Detection"
     )
@@ -13971,8 +14929,8 @@ def draw_board_detection_dialog(screen):
     subtitle_text = (
         "Choose the window to broadcast on"
         if advisor_picker
-        else "Choose the window you are playing on"
-        if autoplay_picker
+        else "Choose the screen or window to broadcast to Auto-play"
+        if autoplay_picker or autoplay_source_picker
         else "Choose the window containing the chessboard"
     )
     subtitle = font_small.render(subtitle_text, True, TEXT_MUTED)
@@ -13994,10 +14952,15 @@ def draw_board_detection_dialog(screen):
 
     mx, my = pygame.mouse.get_pos()
     if not board_detection_windows:
-        message = board_detection_error or "No windows available."
+        message = board_detection_error or "No screens/windows available."
         message_s = font_small.render(_elide_text(message, font_small, panel.width - 80), True, TEXT_MUTED)
         screen.blit(message_s, message_s.get_rect(center=(panel.centerx, panel.centery - 20)))
-        hint = font_tiny.render("Open the chess window, then press Refresh.", True, TEXT_MUTED)
+        hint_text = (
+            "Open the chess screen/window, then press Refresh."
+            if autoplay_picker or autoplay_source_picker
+            else "Open the chess window, then press Refresh."
+        )
+        hint = font_tiny.render(hint_text, True, TEXT_MUTED)
         screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.centery + 12)))
     else:
         for window_index, card in cards:
@@ -14020,7 +14983,11 @@ def draw_board_detection_dialog(screen):
             title_s = font_tiny.render(title_text, True, TEXT_COLOR)
             screen.blit(title_s, (card.x + 10, card.y + 108))
             rect = window.get("rect", (0, 0, 0, 0))
-            dims = f"{rect[2] - rect[0]} x {rect[3] - rect[1]}"
+            source_kind = (
+                "Screen" if _autoplay_target_kind(window) == "screen"
+                else "Window"
+            )
+            dims = f"{source_kind} · {rect[2] - rect[0]} x {rect[3] - rect[1]}"
             dims_s = font_tiny.render(dims, True, TEXT_MUTED)
             screen.blit(dims_s, (card.x + 10, card.y + 128))
             if selected:
@@ -14034,7 +15001,11 @@ def draw_board_detection_dialog(screen):
         detail = board_detection_error
     else:
         detail = (
-            "Select a preview, then Use Window."
+            "Select a preview, then Save Source."
+            if autoplay_source_picker
+            else "Select a preview, then Use Source."
+            if autoplay_picker
+            else "Select a preview, then Use Window."
             if live_picker else "Select a preview, then Capture & Detect."
         )
     detail_s = font_tiny.render(_elide_text(detail, font_tiny, panel.width - 64), True, TEXT_MUTED)
@@ -14042,10 +15013,20 @@ def draw_board_detection_dialog(screen):
 
     _draw_board_detection_button(screen, refresh_rect, "Refresh")
     _draw_board_detection_button(screen, cancel_rect, "Cancel")
+    if board_detection_running:
+        detect_label = "Working..."
+    elif autoplay_source_picker:
+        detect_label = "Save Source"
+    elif autoplay_picker:
+        detect_label = "Use Source"
+    elif live_picker:
+        detect_label = "Use Window"
+    else:
+        detect_label = "Capture & Detect"
     _draw_board_detection_button(
         screen,
         detect_rect,
-        "Working..." if board_detection_running else "Use Window" if live_picker else "Capture & Detect",
+        detect_label,
         enabled=bool(board_detection_windows) and not board_detection_running,
         primary=True,
     )
@@ -14075,10 +15056,12 @@ def handle_board_detection_click(mx, my):
     )
     if cancel_rect.collidepoint(mx, my) or not panel.collidepoint(mx, my):
         if board_detection_picker_purpose == "autoplay":
-            stop_autoplay("Auto-play cancelled before choosing a window.")
+            stop_autoplay("Auto-play cancelled before choosing a screen/window.")
         elif board_detection_picker_purpose == "advisor":
             stop_advisor("Advisor Mode cancelled before choosing a window.")
         else:
+            if board_detection_picker_purpose == "autoplay_source":
+                _autoplay_set_status("Auto-play broadcast source unchanged.")
             show_board_detection_dialog = False
             board_detection_picker_purpose = "detect"
         return True
@@ -14099,6 +15082,8 @@ def handle_board_detection_click(mx, my):
         selected_window = board_detection_windows[board_detection_selected]
         if board_detection_picker_purpose == "autoplay":
             _autoplay_window_selected(selected_window)
+        elif board_detection_picker_purpose == "autoplay_source":
+            _autoplay_broadcast_source_selected(selected_window)
         elif board_detection_picker_purpose == "advisor":
             _advisor_window_selected(selected_window)
         else:
@@ -14112,10 +15097,12 @@ def handle_board_detection_key(key):
     global board_detection_picker_purpose
     if key == pygame.K_ESCAPE:
         if board_detection_picker_purpose == "autoplay":
-            stop_autoplay("Auto-play cancelled before choosing a window.")
+            stop_autoplay("Auto-play cancelled before choosing a screen/window.")
         elif board_detection_picker_purpose == "advisor":
             stop_advisor("Advisor Mode cancelled before choosing a window.")
         else:
+            if board_detection_picker_purpose == "autoplay_source":
+                _autoplay_set_status("Auto-play broadcast source unchanged.")
             show_board_detection_dialog = False
             board_detection_picker_purpose = "detect"
         return True
@@ -14124,6 +15111,8 @@ def handle_board_detection_key(key):
             selected_window = board_detection_windows[board_detection_selected]
             if board_detection_picker_purpose == "autoplay":
                 _autoplay_window_selected(selected_window)
+            elif board_detection_picker_purpose == "autoplay_source":
+                _autoplay_broadcast_source_selected(selected_window)
             elif board_detection_picker_purpose == "advisor":
                 _advisor_window_selected(selected_window)
             else:
@@ -18016,15 +19005,15 @@ def get_auto_move_color_rects(offset_x=0, offset_y=0):
 
 
 def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
-    """Auto-play sits below Board Detection (whose own Y is dynamic)."""
+    """Expanded Auto-play card below Board Detection (dynamic Y)."""
     bd_rect = get_board_detection_button_rect(offset_x, offset_y)
-    return pygame.Rect(bd_rect.x, bd_rect.bottom + 42, bd_rect.width, 94)
+    return pygame.Rect(bd_rect.x, bd_rect.bottom + 42, bd_rect.width, 128)
 
 
 def get_autoplay_depth_rects(offset_x=0, offset_y=0):
-    """Compact Auto-play depth stepper inside its existing 94px card."""
+    """Compact depth stepper in the expanded card's top-right area."""
     row = get_autoplay_toggle_rect(offset_x, offset_y)
-    outer = pygame.Rect(row.right - 188, row.bottom - 27, 172, 23)
+    outer = pygame.Rect(row.right - 188, row.y + 10, 172, 23)
     minus = pygame.Rect(outer.x + 52, outer.y + 2, 26, 19)
     value = pygame.Rect(minus.right + 4, outer.y + 2, 48, 19)
     plus = pygame.Rect(value.right + 4, outer.y + 2, 26, 19)
@@ -18127,12 +19116,137 @@ def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
     return rects
 
 
+def get_autoplay_setup_rects(offset_x=0, offset_y=0):
+    """Side/source setup controls in the expanded Auto-play card."""
+    row = get_autoplay_toggle_rect(offset_x, offset_y)
+    strip_y = row.bottom - 39
+    side_label = pygame.Rect(row.x + 18, strip_y, 40, 29)
+    side = {}
+    side_x = row.x + 62
+    for name, width in (("ask", 56), ("white", 62), ("black", 62)):
+        side[name] = pygame.Rect(side_x, strip_y, width, 29)
+        side_x += width + 6
+
+    source_label = pygame.Rect(row.x + 272, strip_y, 54, 29)
+    source_ask = pygame.Rect(row.x + 332, strip_y, 56, 29)
+    source_saved = pygame.Rect(source_ask.right + 6, strip_y, 64, 29)
+    source_choose = pygame.Rect(source_saved.right + 6, strip_y, 76, 29)
+    return {
+        "row": row,
+        "strip": pygame.Rect(row.x + 18, strip_y, row.width - 36, 29),
+        "side_label": side_label,
+        "side": side,
+        "source_label": source_label,
+        "source_ask": source_ask,
+        "source_saved": source_saved,
+        "source_choose": source_choose,
+    }
+
+
+def _draw_autoplay_setup_controls(screen, mouse_pos, offset_x=0, offset_y=0):
+    """Draw saved Side and broadcast Screen controls on the Auto-play card."""
+    rects = get_autoplay_setup_rects(offset_x, offset_y)
+    row = rects["row"]
+    mouse_x, mouse_y = mouse_pos or (-9999, -9999)
+    locked = _autoplay_setup_preferences_locked()
+
+    pygame.draw.line(
+        screen,
+        (92, 96, 112),
+        (row.x + 18, row.bottom - 48),
+        (row.right - 18, row.bottom - 48),
+        1,
+    )
+    for label, rect in (
+        ("Side", rects["side_label"]),
+        ("Screen", rects["source_label"]),
+    ):
+        label_surface = font_tiny.render(label, True, TEXT_MUTED)
+        screen.blit(
+            label_surface,
+            label_surface.get_rect(midleft=(rect.x, rect.centery + 1)),
+        )
+
+    def draw_choice(rect, label, selected, enabled, side_disc=None):
+        hovered = enabled and rect.collidepoint(mouse_x, mouse_y)
+        if selected:
+            background = (62, 105, 83) if locked else (58, 139, 82)
+            border = (140, 230, 160)
+        elif hovered:
+            background = BUTTON_HOVER_COLOR
+            border = (150, 170, 255)
+        elif enabled:
+            background = (48, 48, 60)
+            border = MENU_BORDER_COLOR
+        else:
+            background = (42, 42, 50)
+            border = (72, 72, 82)
+        pygame.draw.rect(screen, background, rect, border_radius=7)
+        pygame.draw.rect(screen, border, rect, 1, border_radius=7)
+
+        text_colour = TEXT_COLOR if enabled or selected else TEXT_MUTED
+        text = font_tiny.render(label, True, text_colour)
+        text_centre = rect.center
+        if side_disc in ("white", "black"):
+            pygame.draw.circle(
+                screen,
+                (242, 242, 242) if side_disc == "white" else (22, 22, 22),
+                (rect.x + 11, rect.centery),
+                5,
+            )
+            pygame.draw.circle(
+                screen,
+                (150, 150, 150),
+                (rect.x + 11, rect.centery),
+                5,
+                1,
+            )
+            text_centre = (rect.centerx + 7, rect.centery)
+        screen.blit(text, text.get_rect(center=text_centre))
+
+    side_preference = _normalise_autoplay_side_preference(
+        autoplay_side_preference
+    )
+    for side, label in (("ask", "Ask"), ("white", "White"), ("black", "Black")):
+        draw_choice(
+            rects["side"][side],
+            label,
+            side_preference == side,
+            not locked,
+            side_disc=side if side in ("white", "black") else None,
+        )
+
+    saved_mode = (
+        _normalise_autoplay_broadcast_mode(autoplay_broadcast_mode) == "saved"
+        and bool(autoplay_broadcast_target)
+    )
+    draw_choice(
+        rects["source_ask"],
+        "Ask",
+        not saved_mode,
+        not locked,
+    )
+    draw_choice(
+        rects["source_saved"],
+        "Saved",
+        saved_mode,
+        not locked and bool(autoplay_broadcast_target),
+    )
+    draw_choice(
+        rects["source_choose"],
+        "Choose…",
+        False,
+        not locked,
+    )
+    return rects
+
+
 def get_use_package_toggle_rect(offset_x=0, offset_y=0):
     """Recognition-backend toggle below Auto-play and its status line."""
     autoplay_rect = get_autoplay_toggle_rect(offset_x, offset_y)
     return pygame.Rect(
         autoplay_rect.x,
-        autoplay_rect.bottom + 44,
+        autoplay_rect.bottom + 26,
         autoplay_rect.width,
         74,
     )
@@ -18142,7 +19256,7 @@ def get_advisor_toggle_rect(offset_x=0, offset_y=0):
     """Compact Advisor row in the Analysis header space.
 
     The rest of the Analysis page is already exactly full when Auto-Move
-    is on (Use Package ends at y836 of 860), so Advisor uses the unused
+    is on (Use Package ends at y852 of 860), so Advisor uses the unused
     strip between the intro line and the Auto-Move card rather than
     moving any established card.
     """
@@ -19364,9 +20478,9 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         (WIDTH // 2 - bd_status_s.get_width() // 2 + offset_x, bd_rect.bottom + 16 + offset_y),
     )
 
-    # Auto-play is a separate live-window mode from internal Auto-Move.
-    # Its toggle starts the window/side setup; clicking it again (or F8
-    # anywhere on Windows) stops the session immediately.
+    # Auto-play is a separate live-source mode from internal Auto-Move.
+    # Its toggle starts setup (skipping saved Side/Screen defaults);
+    # clicking it again (or F8 anywhere on Windows) stops immediately.
     autoplay_rect = get_autoplay_toggle_rect(offset_x, offset_y)
     autoplay_shown_on = bool(
         _autoplay.get("enabled")
@@ -19376,16 +20490,32 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
             and board_detection_picker_purpose == "autoplay"
         )
     )
+    if _autoplay.get("window"):
+        autoplay_setup_subtitle = (
+            f"{_autoplay_side_name(_autoplay.get('side', 'white')).capitalize()} · "
+            f"{_autoplay_broadcast_target_label(_autoplay.get('window'))}"
+        )
+    else:
+        autoplay_setup_subtitle = (
+            f"Side: {_autoplay_side_preference_label()} · "
+            f"Screen: {_autoplay_broadcast_preference_label()}"
+        )
     draw_toggle_row(
         screen,
         autoplay_rect,
         "Auto-play",
-        "Scan, sync FEN, drag best move",
+        _elide_text(autoplay_setup_subtitle, font_tiny, 360),
         autoplay_shown_on,
         autoplay_anim,
         idle and autoplay_rect.collidepoint(mx, my),
     )
     _draw_autoplay_depth_stepper(
+        screen,
+        (mx, my) if idle else (-9999, -9999),
+        offset_x,
+        offset_y,
+    )
+    _draw_autoplay_setup_controls(
         screen,
         (mx, my) if idle else (-9999, -9999),
         offset_x,
@@ -19398,7 +20528,10 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         autoplay_status = _autoplay["status"]
         autoplay_colour = TEXT_ACCENT if autoplay_shown_on else TEXT_MUTED
     else:
-        autoplay_status = "Choose a window and side. F8 toggles Auto-play at any time."
+        autoplay_status = (
+            "Set Side/Screen or start and answer the prompts. "
+            "F8 toggles Auto-play at any time."
+        )
         autoplay_colour = TEXT_MUTED
     if "F8" not in autoplay_status:
         if _autoplay.get("awaiting_f8_restart"):
@@ -19412,7 +20545,7 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         autoplay_status_s,
         (
             WIDTH // 2 - autoplay_status_s.get_width() // 2 + offset_x,
-            autoplay_rect.bottom + 16 + offset_y,
+            autoplay_rect.bottom + 6 + offset_y,
         ),
     )
 
@@ -27824,6 +28957,49 @@ def handle_menu_click(mx, my):
             if not board_detection_running:
                 open_board_detection_dialog()
             return True
+        autoplay_setup_rects = get_autoplay_setup_rects()
+        setup_clicked = any(
+            rect.collidepoint(mx, my)
+            for rect in (
+                *autoplay_setup_rects["side"].values(),
+                autoplay_setup_rects["source_ask"],
+                autoplay_setup_rects["source_saved"],
+                autoplay_setup_rects["source_choose"],
+            )
+        )
+        if setup_clicked and _autoplay_setup_preferences_locked():
+            message = "Stop Auto-play before changing its Side/Screen defaults."
+            _autoplay_set_status(message, error=message)
+            return True
+        for side, rect in autoplay_setup_rects["side"].items():
+            if rect.collidepoint(mx, my):
+                set_autoplay_side_preference(side, forget_retained=True)
+                _autoplay_set_status(
+                    f"Auto-play side: {_autoplay_side_preference_label()}."
+                )
+                return True
+        if autoplay_setup_rects["source_ask"].collidepoint(mx, my):
+            set_autoplay_broadcast_mode("ask", forget_retained=True)
+            _autoplay_set_status(
+                "Auto-play will ask which screen/window to broadcast."
+            )
+            return True
+        if autoplay_setup_rects["source_saved"].collidepoint(mx, my):
+            if autoplay_broadcast_target:
+                set_autoplay_broadcast_mode("saved", forget_retained=True)
+                _autoplay_set_status(
+                    "Auto-play broadcast: "
+                    f"{_autoplay_broadcast_target_label()}."
+                )
+            else:
+                open_autoplay_broadcast_picker()
+            return True
+        if autoplay_setup_rects["source_choose"].collidepoint(mx, my):
+            open_autoplay_broadcast_picker()
+            return True
+        if autoplay_setup_rects["strip"].collidepoint(mx, my):
+            # Labels/gaps in the setup strip are not the on/off toggle.
+            return True
         autoplay_depth_rects = get_autoplay_depth_rects()
         if autoplay_depth_rects["minus"].collidepoint(mx, my):
             _adjust_autoplay_depth(-1)
@@ -29107,8 +30283,14 @@ def main():
             if kind == "verify_our_move" and expected_pending != actual_pending:
                 return None
             if result.get("status") == "resized":
+                source_name = (
+                    "screen"
+                    if _autoplay_target_kind(_autoplay.get("window")) == "screen"
+                    else "window"
+                )
                 stop_autoplay(
-                    "The target window was resized; restart Auto-play to scan its board again.",
+                    f"The broadcast {source_name} changed size; restart "
+                    "Auto-play to scan its board again.",
                     error=True,
                 )
                 return {
