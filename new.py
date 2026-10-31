@@ -8,6 +8,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -797,7 +798,14 @@ autoplay_side_preference = "ask"
 autoplay_broadcast_mode = "ask"
 autoplay_broadcast_target = None
 AUTOPLAY_POLL_SECONDS = 0.4
-AUTOPLAY_DRAG_SECONDS = 0.38
+# Nominal one-square drag time. The physical drag varies this by travel
+# distance and a small per-move random factor rather than always taking
+# exactly the same time between two square centres.
+AUTOPLAY_DRAG_SECONDS = 0.44
+AUTOPLAY_DRAG_MIN_SECONDS = 0.30
+AUTOPLAY_DRAG_MAX_SECONDS = 0.68
+AUTOPLAY_APPROACH_MIN_SECONDS = 0.06
+AUTOPLAY_APPROACH_MAX_SECONDS = 0.34
 AUTOPLAY_STOP_VK = 0x77  # F8: universal Auto-play toggle (Windows VK_F8)
 AUTOPLAY_TOGGLE_VK = AUTOPLAY_STOP_VK
 show_autoplay_side_dialog = False
@@ -11251,6 +11259,57 @@ def _autoplay_move_screen_points(screen_board_rect, move, side):
     )
 
 
+def _autoplay_human_point_in_bounds(bounds, rng=None):
+    """A slightly off-centre point safely inside one target-board cell.
+
+    Human players do not grab and release every piece on the exact pixel
+    centre of a square. Keep the variation in the central part of the
+    cell so the target site still unambiguously sees the intended square.
+    """
+    rng = rng or random.Random()
+    left, top, right, bottom = (round(value) for value in bounds)
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    centre_x = (left + right) / 2.0
+    centre_y = (top + bottom) / 2.0
+    max_dx = max(0.0, (width - 1) * 0.18)
+    max_dy = max(0.0, (height - 1) * 0.18)
+    dx = max(-max_dx, min(max_dx, rng.gauss(0.0, width * 0.085)))
+    dy = max(-max_dy, min(max_dy, rng.gauss(0.0, height * 0.085)))
+    x = round(centre_x + dx)
+    y = round(centre_y + dy)
+    if width > 2:
+        x = max(left + 1, min(right - 2, x))
+    else:
+        x = left
+    if height > 2:
+        y = max(top + 1, min(bottom - 2, y))
+    else:
+        y = top
+    return x, y
+
+
+def _autoplay_human_square_screen_point(screen_board_rect, square, side, rng=None):
+    """Human-varied desktop point for grabbing/dropping on one square."""
+    row, col = _autoplay_square_visual(square, side)
+    return _autoplay_human_point_in_bounds(
+        _board_cell_bounds(screen_board_rect, row, col), rng=rng
+    )
+
+
+def _autoplay_human_move_screen_points(screen_board_rect, move, side, rng=None):
+    """Pickup/drop points for one move, varied independently per square."""
+    rng = rng or random.Random()
+    return (
+        _autoplay_human_square_screen_point(
+            screen_board_rect, move.from_square, side, rng=rng
+        ),
+        _autoplay_human_square_screen_point(
+            screen_board_rect, move.to_square, side, rng=rng
+        ),
+    )
+
+
 def _cv2_label(image, text, origin, scale=0.55, thickness=1):
     """Draw white text on a fitted black label, clamped inside the image."""
     import cv2
@@ -12115,6 +12174,208 @@ def _autoplay_drag_is_current(drag_id):
         )
 
 
+def _autoplay_drag_sleep(seconds, drag_id):
+    """Sleep in small slices so F8/session invalidation stays responsive."""
+    try:
+        remaining = float(seconds)
+    except Exception:
+        remaining = 0.0
+    deadline = time.monotonic() + max(0.0, remaining)
+    while True:
+        if not _autoplay_drag_is_current(drag_id):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.01, remaining))
+
+
+def _autoplay_cursor_position(user32):
+    """Current desktop cursor point, or ``None`` when Win32 cannot read it."""
+    if user32 is None:
+        return None
+    try:
+        point = _WinPoint()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        return int(point.x), int(point.y)
+    except Exception:
+        return None
+
+
+def _autoplay_human_drag_duration(start, end, requested=None, rng=None):
+    """Held-piece travel time, varied by distance and from move to move."""
+    rng = rng or random.Random()
+    distance = math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+    if requested is not None:
+        try:
+            requested = float(requested)
+        except Exception:
+            requested = AUTOPLAY_DRAG_SECONDS
+        return max(0.08, min(0.95, requested * rng.uniform(0.94, 1.07)))
+    if distance <= 2:
+        return 0.18
+    duration = AUTOPLAY_DRAG_SECONDS + 0.065 * (
+        math.log2(distance / 80.0 + 1.0) - 1.0
+    )
+    duration *= rng.uniform(0.90, 1.13)
+    return max(
+        AUTOPLAY_DRAG_MIN_SECONDS,
+        min(AUTOPLAY_DRAG_MAX_SECONDS, duration),
+    )
+
+
+def _autoplay_human_approach_duration(start, end, rng=None):
+    """Unhurried-but-brisk cursor travel time before grabbing a piece."""
+    rng = rng or random.Random()
+    distance = math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+    if distance <= 3:
+        return 0.0
+    duration = 0.045 + 0.06 * math.log2(distance / 18.0 + 1.0)
+    duration *= rng.uniform(0.90, 1.10)
+    return max(
+        AUTOPLAY_APPROACH_MIN_SECONDS,
+        min(AUTOPLAY_APPROACH_MAX_SECONDS, duration),
+    )
+
+
+def _autoplay_human_cursor_path(
+    start,
+    end,
+    duration,
+    *,
+    rng=None,
+    curve_scale=1.0,
+    allow_overshoot=False,
+):
+    """Timed cursor samples along a gently curved, eased human path.
+
+    A cubic Bezier gives the path a slight hand-drawn arc, smootherstep
+    timing makes it accelerate away from and settle into the target, and
+    a sub-pixel-to-one-pixel tremor/correction removes the perfectly
+    uniform steps of a straight interpolation. Both endpoints remain
+    exact, so the visual variation cannot change the intended square.
+    """
+    rng = rng or random.Random()
+    start = (round(start[0]), round(start[1]))
+    end = (round(end[0]), round(end[1]))
+    try:
+        duration = float(duration)
+    except Exception:
+        duration = AUTOPLAY_DRAG_SECONDS
+    duration = max(0.01, duration)
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    distance = math.hypot(dx, dy)
+    if distance < 1:
+        return [(0.0, end), (duration, end)]
+
+    unit_x, unit_y = dx / distance, dy / distance
+    normal_x, normal_y = -unit_y, unit_x
+    try:
+        curve_scale = float(curve_scale)
+    except Exception:
+        curve_scale = 1.0
+    curve_scale = max(0.0, min(1.5, curve_scale))
+    bend_factor = max(-1.15, min(1.15, rng.gauss(0.0, 0.55)))
+    bend = bend_factor * min(38.0, max(1.5, distance * 0.10)) * curve_scale
+    control_1_fraction = rng.uniform(0.22, 0.36)
+    control_1_bend = bend * rng.uniform(0.75, 1.0)
+    control_1 = (
+        start[0] + dx * control_1_fraction + normal_x * control_1_bend,
+        start[1] + dy * control_1_fraction + normal_y * control_1_bend,
+    )
+    control_2_fraction = rng.uniform(0.64, 0.82)
+    control_2_bend = bend * rng.uniform(0.25, 0.75)
+    control_2 = (
+        start[0] + dx * control_2_fraction + normal_x * control_2_bend,
+        start[1] + dy * control_2_fraction + normal_y * control_2_bend,
+    )
+    tremor_phase = rng.uniform(0.0, math.tau)
+    tremor_cycles = rng.uniform(1.7, 3.4)
+    tremor_amplitude = min(1.1, 0.25 + distance * 0.0015) * curve_scale
+    overshoot = 0.0
+    if allow_overshoot and distance >= 90 and rng.random() < 0.65:
+        overshoot = rng.uniform(0.0, min(3.5, distance * 0.012))
+
+    steps = max(16, min(90, round(duration * 90.0)))
+    samples = []
+    for step in range(steps + 1):
+        raw = step / float(steps)
+        # Smootherstep: zero velocity/acceleration at both ends.
+        eased = raw * raw * raw * (raw * (raw * 6.0 - 15.0) + 10.0)
+        inverse = 1.0 - eased
+        x = (
+            inverse * inverse * inverse * start[0]
+            + 3.0 * inverse * inverse * eased * control_1[0]
+            + 3.0 * inverse * eased * eased * control_2[0]
+            + eased * eased * eased * end[0]
+        )
+        y = (
+            inverse * inverse * inverse * start[1]
+            + 3.0 * inverse * inverse * eased * control_1[1]
+            + 3.0 * inverse * eased * eased * control_2[1]
+            + eased * eased * eased * end[1]
+        )
+        if 0.0 < raw < 1.0:
+            envelope = math.sin(math.pi * raw) ** 0.75
+            tremor = (
+                math.sin(tremor_phase + raw * math.tau * tremor_cycles)
+                * tremor_amplitude
+                * envelope
+            )
+            x += normal_x * tremor
+            y += normal_y * tremor
+            if overshoot and raw >= 0.78:
+                settle = math.sin(math.pi * ((raw - 0.78) / 0.22))
+                x += unit_x * overshoot * settle
+                y += unit_y * overshoot * settle
+        samples.append((duration * raw, (round(x), round(y))))
+
+    samples[0] = (0.0, start)
+    samples[-1] = (duration, end)
+    return samples
+
+
+def _autoplay_move_cursor_human(
+    user32,
+    start,
+    end,
+    duration,
+    drag_id,
+    *,
+    rng=None,
+    curve_scale=1.0,
+    allow_overshoot=False,
+):
+    """Move the real cursor through one generated human path."""
+    if user32 is None or not _autoplay_drag_is_current(drag_id):
+        return False
+    start = (round(start[0]), round(start[1]))
+    end = (round(end[0]), round(end[1]))
+    path = _autoplay_human_cursor_path(
+        start,
+        end,
+        duration,
+        rng=rng,
+        curve_scale=curve_scale,
+        allow_overshoot=allow_overshoot,
+    )
+    started = time.monotonic()
+    last_point = None
+    for offset, point in path:
+        if not _autoplay_drag_is_current(drag_id):
+            return False
+        remaining = started + offset - time.monotonic()
+        if remaining > 0 and not _autoplay_drag_sleep(remaining, drag_id):
+            return False
+        if point != last_point:
+            if not user32.SetCursorPos(int(point[0]), int(point[1])):
+                return False
+            last_point = point
+    return _autoplay_drag_is_current(drag_id)
+
+
 def _autoplay_focus_window(hwnd, drag_id=None):
     """Bring the target chess window forward before a real mouse drag."""
     user32 = _autoplay_user32()
@@ -12138,63 +12399,135 @@ def _autoplay_focus_window(hwnd, drag_id=None):
         return False
 
 
-def _autoplay_click_screen_point(point, drag_id=None):
+def _autoplay_click_screen_point(point, drag_id=None, rng=None):
+    """Glide to a point and click it with varied human press timing."""
     user32 = _autoplay_user32()
     if user32 is None:
         return False
+    rng = rng or random.Random()
+    mouse_down = False
     try:
         if not _autoplay_drag_is_current(drag_id):
             return False
-        if not user32.SetCursorPos(int(point[0]), int(point[1])):
-            return False
-        time.sleep(0.03)
-        if not _autoplay_drag_is_current(drag_id):
+        target = (round(point[0]), round(point[1]))
+        current = _autoplay_cursor_position(user32)
+        if current is None:
+            if not user32.SetCursorPos(*target):
+                return False
+        elif math.hypot(target[0] - current[0], target[1] - current[1]) > 2:
+            approach_duration = min(
+                0.28,
+                max(
+                    0.04,
+                    _autoplay_human_approach_duration(current, target, rng=rng),
+                ),
+            )
+            if not _autoplay_move_cursor_human(
+                user32,
+                current,
+                target,
+                approach_duration,
+                drag_id,
+                rng=rng,
+                curve_scale=0.65,
+            ):
+                return False
+
+        if not _autoplay_drag_sleep(rng.uniform(0.025, 0.07), drag_id):
             return False
         user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
-        time.sleep(0.03)
+        mouse_down = True
+        held_current = _autoplay_drag_sleep(rng.uniform(0.045, 0.095), drag_id)
         user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
-        return _autoplay_drag_is_current(drag_id)
+        mouse_down = False
+        return held_current and _autoplay_drag_is_current(drag_id)
     except Exception:
         return False
+    finally:
+        if mouse_down:
+            try:
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+            except Exception:
+                pass
 
 
 def _autoplay_drag_screen_points(
     start,
     end,
-    duration=AUTOPLAY_DRAG_SECONDS,
+    duration=None,
     drag_id=None,
+    rng=None,
 ):
-    """Drag the real cursor from one desktop point to another in <=0.4s."""
+    """Drag the real cursor between two points with human mouse motion.
+
+    The cursor first glides from wherever it currently is to the pickup
+    point instead of teleporting there. Short varied pauses surround the
+    grab and release, while the held portion follows the eased, gently
+    curved path generated by :func:`_autoplay_human_cursor_path`.
+    """
     user32 = _autoplay_user32()
     if user32 is None:
         return False
-    duration = max(0.05, min(0.4, float(duration)))
+    rng = rng or random.Random()
     mouse_down = False
     try:
         if not _autoplay_drag_is_current(drag_id):
             return False
-        if not user32.SetCursorPos(int(start[0]), int(start[1])):
-            return False
-        time.sleep(0.03)
-        if not _autoplay_drag_is_current(drag_id):
+        start = (round(start[0]), round(start[1]))
+        end = (round(end[0]), round(end[1]))
+
+        current = _autoplay_cursor_position(user32)
+        if current is None:
+            if not user32.SetCursorPos(*start):
+                return False
+        else:
+            approach_distance = math.hypot(
+                start[0] - current[0], start[1] - current[1]
+            )
+            if approach_distance > 3:
+                approach_duration = _autoplay_human_approach_duration(
+                    current, start, rng=rng
+                )
+                if not _autoplay_move_cursor_human(
+                    user32,
+                    current,
+                    start,
+                    approach_duration,
+                    drag_id,
+                    rng=rng,
+                    curve_scale=0.8,
+                ):
+                    return False
+            elif current != start:
+                if not user32.SetCursorPos(*start):
+                    return False
+
+        # A brief aim/grab/settle sequence is what makes the pickup read
+        # as a hand rather than a scripted instantaneous mouse-down.
+        if not _autoplay_drag_sleep(rng.uniform(0.02, 0.065), drag_id):
             return False
         user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
         mouse_down = True
-        started = time.monotonic()
-        steps = 24
-        for step in range(1, steps + 1):
-            if not _autoplay_drag_is_current(drag_id):
-                return False
-            fraction = step / steps
-            x = int(round(start[0] + (end[0] - start[0]) * fraction))
-            y = int(round(start[1] + (end[1] - start[1]) * fraction))
-            if not user32.SetCursorPos(x, y):
-                return False
-            target_elapsed = duration * fraction
-            remaining = target_elapsed - (time.monotonic() - started)
-            if remaining > 0:
-                time.sleep(remaining)
-        time.sleep(0.02)
+        if not _autoplay_drag_sleep(rng.uniform(0.025, 0.075), drag_id):
+            return False
+
+        held_duration = _autoplay_human_drag_duration(
+            start, end, requested=duration, rng=rng
+        )
+        if not _autoplay_move_cursor_human(
+            user32,
+            start,
+            end,
+            held_duration,
+            drag_id,
+            rng=rng,
+            curve_scale=1.0,
+            allow_overshoot=True,
+        ):
+            return False
+
+        if not _autoplay_drag_sleep(rng.uniform(0.02, 0.065), drag_id):
+            return False
         user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
         mouse_down = False
         return _autoplay_drag_is_current(drag_id)
@@ -12223,8 +12556,15 @@ def _autoplay_drag_move(
     _autoplay_focus_window(hwnd, drag_id=drag_id)
     if not _autoplay_drag_is_current(drag_id):
         return False
-    start, end = _autoplay_move_screen_points(screen_board_rect, move, side)
-    if not _autoplay_drag_screen_points(start, end, drag_id=drag_id):
+    rng = random.Random()
+    # A tiny, varied beat after focusing the board breaks up the old
+    # focus -> teleport -> drag sequence before the cursor approaches.
+    if not _autoplay_drag_sleep(rng.uniform(0.02, 0.07), drag_id):
+        return False
+    start, end = _autoplay_human_move_screen_points(
+        screen_board_rect, move, side, rng=rng
+    )
+    if not _autoplay_drag_screen_points(start, end, drag_id=drag_id, rng=rng):
         return False
 
     if move.promotion:
@@ -12233,8 +12573,7 @@ def _autoplay_drag_move(
         # this also harmlessly confirms auto-queen boards in most themes.
         # For an underpromotion, classify those choice cells and click
         # the one that actually shows the desired piece when possible.
-        time.sleep(0.12)
-        if not _autoplay_drag_is_current(drag_id):
+        if not _autoplay_drag_sleep(rng.uniform(0.12, 0.20), drag_id):
             return False
         order = (chess.QUEEN, chess.KNIGHT, chess.ROOK, chess.BISHOP)
         try:
@@ -12268,12 +12607,13 @@ def _autoplay_drag_move(
                         choice_row = cell[0]
                         break
 
-        left, top, right, bottom = _board_cell_bounds(
+        choice_bounds = _board_cell_bounds(
             screen_board_rect, choice_row, dest_col
         )
         _autoplay_click_screen_point(
-            ((left + right) // 2, (top + bottom) // 2),
+            _autoplay_human_point_in_bounds(choice_bounds, rng=rng),
             drag_id=drag_id,
+            rng=rng,
         )
     return _autoplay_drag_is_current(drag_id)
 
