@@ -533,6 +533,18 @@ GAME_REVIEW_RATINGS = {
         "colour": (176, 141, 87),
         "symbol": "B",
     },
+    "brilliant": {
+        "label": "Brilliant!",
+        "filename": "brilliant.png",
+        "colour": (20, 184, 201),
+        "symbol": "!!",
+    },
+    "great": {
+        "label": "Great Move",
+        "filename": "great.png",
+        "colour": (76, 141, 230),
+        "symbol": "!",
+    },
     "best": {
         "label": "Best Move",
         "filename": "best.png",
@@ -551,6 +563,12 @@ GAME_REVIEW_RATINGS = {
         "colour": (145, 190, 95),
         "symbol": "✓",
     },
+    "forced": {
+        "label": "Forced Move",
+        "filename": "forced.png",
+        "colour": (150, 150, 155),
+        "symbol": "→",
+    },
     "inaccuracy": {
         "label": "Inaccuracy",
         "filename": "inaccuracy.png",
@@ -562,6 +580,12 @@ GAME_REVIEW_RATINGS = {
         "filename": "mistake.png",
         "colour": (240, 130, 55),
         "symbol": "?",
+    },
+    "miss": {
+        "label": "Miss",
+        "filename": "miss.png",
+        "colour": (205, 82, 118),
+        "symbol": "×",
     },
     "blunder": {
         "label": "Blunder",
@@ -3017,11 +3041,35 @@ def game_review_centipawn_loss(before_cp, after_cp, mover_colour):
 
 
 def classify_game_review_move(
-    centipawn_loss, is_best_move=False, is_book_move=False
+    centipawn_loss,
+    is_best_move=False,
+    is_book_move=False,
+    is_forced=False,
+    is_brilliant=False,
+    is_great=False,
+    is_miss=False,
+    is_special_blunder=False,
 ):
-    """Map centipawn loss to one of the seven Game Review ratings."""
+    """Map centipawn loss/context to one of the Game Review ratings.
+
+    Contextual ratings deliberately sit above the raw CPL bands: a forced
+    move was the only legal choice, a book move remains theory even if the
+    local engine prefers another line, a checked sacrifice can be brilliant
+    despite its material offer, and a missed forced mate is a Miss rather
+    than merely a large centipawn-loss blunder.
+    """
+    if is_forced:
+        return "forced"
     if is_book_move:
         return "book"
+    if is_special_blunder:
+        return "blunder"
+    if is_miss:
+        return "miss"
+    if is_brilliant:
+        return "brilliant"
+    if is_great:
+        return "great"
     if is_best_move:
         return "best"
     try:
@@ -3173,6 +3221,550 @@ def _game_review_terminal_evaluation(board):
         "bestmove_uci": None,
         "bestmove_san": "—",
         "depth": GAME_REVIEW_DEPTH,
+        "lines": [],
+    }
+
+
+# --- Game Review special-move detection ---
+# These helpers add chess context around the raw depth-12 evaluation: mate
+# transitions, material left en prise (via static-exchange evaluation),
+# deliberate sacrifices, missed mates/free pawns, king moves that surrender
+# castling, forced moves, and the MultiPV gap behind a Great Move.
+_GAME_REVIEW_PIECE_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK: 500,
+    chess.QUEEN: 1000,
+    chess.KING: 20000,
+}
+_GAME_REVIEW_PIECE_NAMES = {
+    chess.PAWN: "pawn",
+    chess.KNIGHT: "knight",
+    chess.BISHOP: "bishop",
+    chess.ROOK: "rook",
+    chess.QUEEN: "queen",
+    chess.KING: "king",
+}
+_GAME_REVIEW_HANGING_MIN_GAIN = 200
+_GAME_REVIEW_SACRIFICE_MIN_GAIN = 200
+_GAME_REVIEW_GREAT_MIN_GAP_CP = 150
+
+
+def _game_review_piece_name(piece_type):
+    return _GAME_REVIEW_PIECE_NAMES.get(piece_type, "piece")
+
+
+def _game_review_eval_for_mover(evaluation, mover):
+    """Return ``(cp, mate)`` from the mover's point of view.
+
+    Stored Game Review evaluations are White-relative. A positive returned
+    mate means the mover eventually delivers mate; negative means the
+    opponent eventually delivers mate.
+    """
+    evaluation = evaluation or {}
+    try:
+        cp_white = int(round(float(evaluation.get("cp", 0) or 0)))
+    except Exception:
+        cp_white = 0
+    mate_white = evaluation.get("mate")
+    if mate_white is not None:
+        try:
+            mate_white = int(mate_white)
+        except Exception:
+            mate_white = None
+    if mover == chess.WHITE:
+        return cp_white, mate_white
+    return -cp_white, (-mate_white if mate_white is not None else None)
+
+
+def _game_review_line_for_mover(line, mover):
+    cp, mate = _game_review_eval_for_mover(line, mover)
+    move_uci = (line or {}).get("move_uci") or (line or {}).get(
+        "bestmove_uci"
+    )
+    return {"move_uci": move_uci, "cp": cp, "mate": mate}
+
+
+def _game_review_second_best_gap(evaluation, played_move_uci, mover):
+    """Centipawn gap between MultiPV 1 and 2 when the played move is first."""
+    raw_lines = list((evaluation or {}).get("lines") or [])
+    if len(raw_lines) < 2:
+        return 0
+    indexed = []
+    for fallback_index, raw_line in enumerate(raw_lines):
+        line = _game_review_line_for_mover(raw_line, mover)
+        if not line["move_uci"]:
+            continue
+        try:
+            rank = int(raw_line.get("multipv", fallback_index + 1))
+        except Exception:
+            rank = fallback_index + 1
+        indexed.append((rank, fallback_index, line))
+    if len(indexed) < 2:
+        return 0
+    indexed.sort(key=lambda item: (item[0], item[1]))
+    first = indexed[0][2]
+    second = indexed[1][2]
+    if first["move_uci"] != played_move_uci:
+        return 0
+    return max(0, int(first["cp"]) - int(second["cp"]))
+
+
+def _game_review_static_exchange_gain(board, move, attacker_colour=None):
+    """Static-exchange gain, in centipawns, for a capture on one square.
+
+    The result is the initiating side's net material gain if both sides
+    keep recapturing on the destination square with their least valuable
+    attacker. It is a deliberately local/tactical measure: the engine
+    evaluation remains responsible for judging compensation, checks and
+    longer tactics, while SEE answers "how much material is really being
+    offered or left en prise here?"
+    """
+    if board is None or move is None:
+        return 0
+    if attacker_colour is None:
+        attacker_colour = board.turn
+    moving_piece = board.piece_at(move.from_square)
+    if moving_piece is None or moving_piece.color != attacker_colour:
+        return 0
+
+    captured_square = move.to_square
+    if board.is_en_passant(move):
+        captured_square = chess.square(
+            chess.square_file(move.to_square),
+            chess.square_rank(move.from_square),
+        )
+    captured_piece = board.piece_at(captured_square)
+    if captured_piece is None or captured_piece.color == attacker_colour:
+        return 0
+
+    gains = [_GAME_REVIEW_PIECE_VALUES.get(captured_piece.piece_type, 0)]
+    captured_value = _GAME_REVIEW_PIECE_VALUES.get(
+        move.promotion or moving_piece.piece_type, 0
+    )
+    occupied = int(board.occupied)
+    occupied ^= int(chess.BB_SQUARES[move.from_square])
+    if captured_square != move.to_square:
+        occupied ^= int(chess.BB_SQUARES[captured_square])
+
+    side = not attacker_colour
+    for _depth in range(31):
+        try:
+            attackers = (
+                int(board.attackers_mask(side, move.to_square, occupied))
+                & occupied
+            )
+        except Exception:
+            break
+        candidates = []
+        for square in chess.scan_forward(attackers):
+            piece = board.piece_at(square)
+            if piece is not None and piece.color == side:
+                candidates.append(
+                    (
+                        _GAME_REVIEW_PIECE_VALUES.get(piece.piece_type, 0),
+                        square,
+                        piece.piece_type,
+                    )
+                )
+        if not candidates:
+            break
+        candidates.sort()
+        _value, attacker_square, attacker_type = candidates[0]
+        if attacker_type == chess.KING:
+            # A king may not recapture into a still-defended square.
+            without_king = occupied ^ int(
+                chess.BB_SQUARES[attacker_square]
+            )
+            try:
+                defended = bool(
+                    int(
+                        board.attackers_mask(
+                            not side, move.to_square, without_king
+                        )
+                    )
+                    & without_king
+                )
+            except Exception:
+                defended = False
+            if defended:
+                break
+        gains.append(captured_value - gains[-1])
+        captured_value = _GAME_REVIEW_PIECE_VALUES.get(attacker_type, 0)
+        occupied ^= int(chess.BB_SQUARES[attacker_square])
+        side = not side
+
+    for index in range(len(gains) - 2, -1, -1):
+        gains[index] = -max(-gains[index], gains[index + 1])
+    return int(gains[0])
+
+
+def _game_review_best_capture_gain(board, square, attacker_colour):
+    """Best SEE gain available to ``attacker_colour`` by taking on square."""
+    victim = board.piece_at(square) if board is not None else None
+    if victim is None or victim.color == attacker_colour:
+        return 0
+    legal_moves = set(board.legal_moves) if board.turn == attacker_colour else None
+    best_gain = 0
+    for from_square in board.attackers(attacker_colour, square):
+        piece = board.piece_at(from_square)
+        if piece is None or piece.color != attacker_colour:
+            continue
+        promotion = None
+        if piece.piece_type == chess.PAWN and chess.square_rank(square) in (0, 7):
+            promotion = chess.QUEEN
+        move = chess.Move(from_square, square, promotion=promotion)
+        if legal_moves is not None and move not in legal_moves:
+            continue
+        gain = _game_review_static_exchange_gain(
+            board, move, attacker_colour=attacker_colour
+        )
+        best_gain = max(best_gain, int(gain))
+    return int(best_gain)
+
+
+def _game_review_piece_can_be_saved(
+    before_board, square, piece_type, colour, threshold
+):
+    """Whether some legal reply leaves this already-attacked piece safe-ish."""
+    opponent = not colour
+    for alternative in before_board.legal_moves:
+        target_square = (
+            alternative.to_square if alternative.from_square == square else square
+        )
+        board = before_board.copy(stack=False)
+        board.push(alternative)
+        piece = board.piece_at(target_square)
+        if piece is None or piece.color != colour or piece.piece_type != piece_type:
+            continue
+        if (
+            _game_review_best_capture_gain(board, target_square, opponent)
+            < threshold
+        ):
+            return True
+    return False
+
+
+def _game_review_hanging_info(before_board, after_board, move, mover):
+    """Largest newly/worsened (or savable but ignored) hanging major/minor."""
+    opponent = not mover
+    candidates = []
+    for square, piece in after_board.piece_map().items():
+        if piece.color != mover or piece.piece_type not in (
+            chess.QUEEN,
+            chess.ROOK,
+            chess.BISHOP,
+            chess.KNIGHT,
+        ):
+            continue
+        gain_after = _game_review_best_capture_gain(
+            after_board, square, opponent
+        )
+        if gain_after < _GAME_REVIEW_HANGING_MIN_GAIN:
+            continue
+
+        before_square = move.from_square if square == move.to_square else square
+        before_piece = before_board.piece_at(before_square)
+        gain_before = 0
+        same_piece_before = (
+            before_piece is not None
+            and before_piece.color == mover
+            and before_piece.piece_type == piece.piece_type
+        )
+        if same_piece_before:
+            gain_before = _game_review_best_capture_gain(
+                before_board, before_square, opponent
+            )
+        worsened = gain_after - int(gain_before)
+        newly_hanging = (
+            gain_before < _GAME_REVIEW_HANGING_MIN_GAIN or worsened >= 75
+        )
+        if not newly_hanging:
+            # The piece was already en prise. Only blame this move for
+            # leaving it there if the mover actually had a way to save it.
+            if not _game_review_piece_can_be_saved(
+                before_board,
+                before_square,
+                piece.piece_type,
+                mover,
+                _GAME_REVIEW_HANGING_MIN_GAIN,
+            ):
+                continue
+        candidates.append(
+            {
+                "piece_type": piece.piece_type,
+                "piece_name": _game_review_piece_name(piece.piece_type),
+                "square": int(square),
+                "gain": int(gain_after),
+                "gain_before": int(gain_before),
+                "newly_hanging": bool(newly_hanging),
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            item["gain"],
+            _GAME_REVIEW_PIECE_VALUES.get(item["piece_type"], 0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _game_review_sacrifice_info(before_board, after_board, move, mover):
+    """Largest apparent material offer created by the played move."""
+    opponent = not mover
+    candidates = []
+
+    moved_piece = after_board.piece_at(move.to_square)
+    if moved_piece is not None and moved_piece.color == mover:
+        gain = _game_review_best_capture_gain(
+            after_board, move.to_square, opponent
+        )
+        if gain >= _GAME_REVIEW_SACRIFICE_MIN_GAIN:
+            candidates.append(
+                {
+                    "piece_type": moved_piece.piece_type,
+                    "piece_name": _game_review_piece_name(
+                        moved_piece.piece_type
+                    ),
+                    "square": int(move.to_square),
+                    "gain": int(gain),
+                }
+            )
+
+    # A deflector/line-opening move can also offer a different piece. Only
+    # count a clear increase so an unrelated pre-existing threat does not
+    # turn every strong move into a supposed sacrifice.
+    for square, piece in after_board.piece_map().items():
+        if (
+            square == move.to_square
+            or piece.color != mover
+            or piece.piece_type
+            not in (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT)
+        ):
+            continue
+        before_piece = before_board.piece_at(square)
+        if (
+            before_piece is None
+            or before_piece.color != mover
+            or before_piece.piece_type != piece.piece_type
+        ):
+            continue
+        gain_after = _game_review_best_capture_gain(
+            after_board, square, opponent
+        )
+        if gain_after < _GAME_REVIEW_SACRIFICE_MIN_GAIN:
+            continue
+        gain_before = _game_review_best_capture_gain(
+            before_board, square, opponent
+        )
+        if gain_after - int(gain_before) >= _GAME_REVIEW_SACRIFICE_MIN_GAIN:
+            candidates.append(
+                {
+                    "piece_type": piece.piece_type,
+                    "piece_name": _game_review_piece_name(piece.piece_type),
+                    "square": int(square),
+                    "gain": int(gain_after),
+                }
+            )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item["gain"], reverse=True)
+    return candidates[0]
+
+
+def _game_review_capture_piece_type(board, move):
+    if board is None or move is None or not board.is_capture(move):
+        return None
+    if board.is_en_passant(move):
+        return chess.PAWN
+    piece = board.piece_at(move.to_square)
+    return piece.piece_type if piece is not None else None
+
+
+def _game_review_missed_free_pawn(before_board, move, before_evaluation):
+    best_uci = (before_evaluation or {}).get("bestmove_uci")
+    if not best_uci or best_uci == move.uci():
+        return False
+    try:
+        best_move = chess.Move.from_uci(str(best_uci))
+    except Exception:
+        return False
+    if best_move not in before_board.legal_moves:
+        return False
+    if _game_review_capture_piece_type(before_board, best_move) != chess.PAWN:
+        return False
+    if _game_review_static_exchange_gain(before_board, best_move) < 50:
+        return False
+    # Taking a different genuinely free pawn is not missing the idea.
+    if (
+        _game_review_capture_piece_type(before_board, move) == chess.PAWN
+        and _game_review_static_exchange_gain(before_board, move) >= 50
+    ):
+        return False
+    return True
+
+
+def _game_review_pointless_king_move(
+    before_board, after_board, move, mover, is_best_move
+):
+    moving_piece = before_board.piece_at(move.from_square)
+    return bool(
+        moving_piece is not None
+        and moving_piece.piece_type == chess.KING
+        and not before_board.is_castling(move)
+        and before_board.has_castling_rights(mover)
+        and not after_board.has_castling_rights(mover)
+        and not before_board.is_check()
+        and not before_board.is_capture(move)
+        and not after_board.is_check()
+        and not is_best_move
+    )
+
+
+def _analyse_game_review_special_context(
+    before_board,
+    after_board,
+    move,
+    mover,
+    before_evaluation,
+    after_evaluation,
+    centipawn_loss,
+    is_best_move,
+    legal_move_count,
+):
+    """Detect special ratings/notes around one reviewed move."""
+    _before_cp, before_mate = _game_review_eval_for_mover(
+        before_evaluation, mover
+    )
+    after_cp, after_mate = _game_review_eval_for_mover(
+        after_evaluation, mover
+    )
+    try:
+        cpl = max(0, int(round(float(centipawn_loss))))
+    except Exception:
+        cpl = 0
+
+    is_checkmate = bool(after_board.is_checkmate())
+    opponent_mate_in = (
+        abs(int(after_mate))
+        if after_mate is not None and int(after_mate) < 0
+        else None
+    )
+    allows_opponent_mate = bool(
+        not is_checkmate
+        and opponent_mate_in is not None
+        and not (before_mate is not None and int(before_mate) < 0)
+    )
+    missed_mate = bool(
+        not is_checkmate
+        and before_mate is not None
+        and int(before_mate) > 0
+        and after_mate is None
+    )
+
+    hanging = _game_review_hanging_info(
+        before_board, after_board, move, mover
+    )
+    sacrifice = _game_review_sacrifice_info(
+        before_board, after_board, move, mover
+    )
+    second_best_gap = _game_review_second_best_gap(
+        before_evaluation, move.uci(), mover
+    )
+
+    strong_move = bool(is_best_move or cpl <= 10)
+    decisive_after = bool(
+        is_checkmate
+        or (after_mate is not None and int(after_mate) > 0)
+        or int(after_cp) >= 200
+    )
+    is_brilliant = bool(
+        sacrifice is not None
+        and int(sacrifice.get("gain", 0)) >= _GAME_REVIEW_SACRIFICE_MIN_GAIN
+        and strong_move
+        and decisive_after
+    )
+    is_great = bool(
+        int(legal_move_count) > 1
+        and bool(is_best_move)
+        and int(second_best_gap) >= _GAME_REVIEW_GREAT_MIN_GAP_CP
+        and cpl <= 30
+    )
+
+    hangs_piece = bool(
+        hanging is not None
+        and cpl >= 100
+        and not is_brilliant
+        and not (after_mate is not None and int(after_mate) > 0)
+    )
+    is_special_blunder = bool(allows_opponent_mate or hangs_piece)
+
+    miss_reason = ""
+    miss_note = ""
+    if missed_mate:
+        miss_reason = "missed_mate"
+        miss_note = (
+            "This move allows the opponent to escape from eventual mate."
+        )
+    elif cpl >= 50 and _game_review_missed_free_pawn(
+        before_board, move, before_evaluation
+    ):
+        miss_reason = "free_pawn"
+        miss_note = "This misses an opportunity to capture a free pawn."
+    elif cpl >= 30 and _game_review_pointless_king_move(
+        before_board, after_board, move, mover, is_best_move
+    ):
+        miss_reason = "king_castling"
+        miss_note = "Now, the king cannot castle to safety."
+
+    blunder_note = ""
+    if allows_opponent_mate:
+        if opponent_mate_in == 1:
+            blunder_note = "This move causes immediate checkmate."
+        else:
+            blunder_note = (
+                "This move permits the opponent to force eventual checkmate."
+            )
+    elif hangs_piece and hanging is not None:
+        blunder_note = f"This hangs the {hanging['piece_name']}."
+
+    brilliant_note = ""
+    if is_brilliant and sacrifice is not None:
+        piece_name = sacrifice["piece_name"]
+        if after_mate is not None and int(after_mate) > 0:
+            brilliant_note = (
+                f"This sacrifices the {piece_name} to force checkmate."
+            )
+        else:
+            brilliant_note = (
+                f"This sacrifices the {piece_name} for a decisive advantage."
+            )
+
+    return {
+        "is_checkmate": is_checkmate,
+        "is_forced_move": int(legal_move_count) == 1,
+        "legal_move_count": int(legal_move_count),
+        "is_brilliant": bool(is_brilliant),
+        "is_great": bool(is_great),
+        "is_miss": bool(miss_reason),
+        "miss_reason": miss_reason,
+        "miss_note": miss_note,
+        "is_special_blunder": bool(is_special_blunder),
+        "blunder_note": blunder_note,
+        "brilliant_note": brilliant_note,
+        "great_note": "That was the only good move." if is_great else "",
+        "allows_opponent_mate": bool(allows_opponent_mate),
+        "opponent_mate_in": opponent_mate_in,
+        "missed_forced_mate": bool(missed_mate),
+        "hanging_piece": hanging["piece_name"] if hangs_piece and hanging else "",
+        "hanging_gain": int(hanging["gain"]) if hanging else 0,
+        "sacrifice_piece": sacrifice["piece_name"] if sacrifice else "",
+        "sacrifice_gain": int(sacrifice["gain"]) if sacrifice else 0,
+        "second_best_gap_cp": int(second_best_gap),
     }
 
 
@@ -3504,10 +4096,17 @@ class _GameReviewEngine:
             if self._read_line().startswith(token):
                 return
 
-    def evaluate(self, board):
+    def evaluate(self, board, multipv=1):
         if get_game_status(board)[2]:
             return _game_review_terminal_evaluation(board)
 
+        try:
+            multipv = max(1, min(5, int(multipv)))
+        except Exception:
+            multipv = 1
+        legal_count = board.legal_moves.count()
+        multipv = max(1, min(multipv, legal_count or 1))
+        self._send(f"setoption name MultiPV value {multipv}")
         self._send(f"position fen {board.fen()}")
         self._send(f"go depth {GAME_REVIEW_DEPTH}")
         score_cp = None
@@ -3515,6 +4114,7 @@ class _GameReviewEngine:
         depth = 0
         pv_first = None
         bestmove_uci = None
+        raw_lines = {}
         while True:
             line = self._read_line()
             if line.startswith("bestmove"):
@@ -3525,28 +4125,52 @@ class _GameReviewEngine:
             if not line.startswith("info") or line.startswith("info string"):
                 continue
             tokens = line.split()
+            line_depth = depth
+            line_multipv = 1
+            line_score_cp = None
+            line_mate = None
+            line_pv_first = None
             try:
                 index = 1
                 while index < len(tokens):
                     token = tokens[index]
                     if token == "depth" and index + 1 < len(tokens):
-                        depth = int(tokens[index + 1])
+                        line_depth = int(tokens[index + 1])
+                        index += 2
+                    elif token == "multipv" and index + 1 < len(tokens):
+                        line_multipv = int(tokens[index + 1])
                         index += 2
                     elif token == "score" and index + 2 < len(tokens):
                         if tokens[index + 1] == "cp":
-                            score_cp = int(tokens[index + 2])
-                            mate = None
+                            line_score_cp = int(tokens[index + 2])
+                            line_mate = None
                         elif tokens[index + 1] == "mate":
-                            mate = int(tokens[index + 2])
-                            score_cp = None
+                            line_mate = int(tokens[index + 2])
+                            line_score_cp = None
                         index += 3
                     elif token == "pv" and index + 1 < len(tokens):
-                        pv_first = tokens[index + 1]
+                        line_pv_first = tokens[index + 1]
                         break
                     else:
                         index += 1
             except (TypeError, ValueError):
                 continue
+
+            if line_pv_first is None or (
+                line_score_cp is None and line_mate is None
+            ):
+                continue
+            raw_lines[line_multipv] = {
+                "depth": int(line_depth or GAME_REVIEW_DEPTH),
+                "score_cp": line_score_cp,
+                "mate": line_mate,
+                "move_uci": line_pv_first,
+            }
+            if line_multipv == 1:
+                depth = line_depth
+                score_cp = line_score_cp
+                mate = line_mate
+                pv_first = line_pv_first
 
         if bestmove_uci is None:
             bestmove_uci = pv_first
@@ -3554,15 +4178,24 @@ class _GameReviewEngine:
             return _game_review_terminal_evaluation(board)
 
         white_to_move = board.turn == chess.WHITE
-        if mate is not None:
-            sign = 1 if mate > 0 else -1
-            side_cp = sign * (10000 - min(abs(mate), 99) * 10)
-            white_cp = side_cp if white_to_move else -side_cp
-            white_mate = mate if white_to_move else -mate
-        else:
-            side_cp = int(score_cp or 0)
-            white_cp = side_cp if white_to_move else -side_cp
-            white_mate = None
+
+        def to_white_values(side_score_cp, side_mate):
+            if side_mate is not None:
+                sign = 1 if side_mate > 0 else -1
+                converted_cp = sign * (
+                    10000 - min(abs(int(side_mate)), 99) * 10
+                )
+                return (
+                    converted_cp if white_to_move else -converted_cp,
+                    int(side_mate) if white_to_move else -int(side_mate),
+                )
+            converted_cp = int(side_score_cp or 0)
+            return (
+                converted_cp if white_to_move else -converted_cp,
+                None,
+            )
+
+        white_cp, white_mate = to_white_values(score_cp, mate)
         white_cp = max(-10000, min(10000, int(white_cp)))
 
         bestmove_san = bestmove_uci
@@ -3572,12 +4205,41 @@ class _GameReviewEngine:
                 bestmove_san = board.san(best_move)
         except Exception:
             pass
+
+        lines = []
+        for rank in sorted(raw_lines):
+            raw_line = raw_lines[rank]
+            move_uci = raw_line.get("move_uci")
+            try:
+                candidate = chess.Move.from_uci(str(move_uci))
+            except Exception:
+                continue
+            if candidate not in board.legal_moves:
+                continue
+            line_cp, line_mate = to_white_values(
+                raw_line.get("score_cp"), raw_line.get("mate")
+            )
+            lines.append(
+                {
+                    "multipv": int(rank),
+                    "move_uci": move_uci,
+                    "bestmove_uci": move_uci,
+                    "move_san": board.san(candidate),
+                    "bestmove_san": board.san(candidate),
+                    "cp": max(-10000, min(10000, int(line_cp))),
+                    "mate": line_mate,
+                    "depth": int(
+                        raw_line.get("depth") or depth or GAME_REVIEW_DEPTH
+                    ),
+                }
+            )
         return {
             "cp": white_cp,
             "mate": white_mate,
             "bestmove_uci": bestmove_uci,
             "bestmove_san": bestmove_san,
             "depth": int(depth or GAME_REVIEW_DEPTH),
+            "lines": lines,
         }
 
     def quit(self):
@@ -3600,6 +4262,14 @@ def _game_review_generation_is_current(generation):
         return int(_game_review.get("generation", 0)) == int(generation)
 
 
+def _evaluate_game_review_position(evaluator, board, multipv=2):
+    """Evaluate with top-two lines when supported, preserving old testers."""
+    try:
+        return evaluator.evaluate(board, multipv=multipv)
+    except TypeError:
+        return evaluator.evaluate(board)
+
+
 def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory):
     """Worker body: evaluate each position once and publish each rating."""
     evaluator = None
@@ -3608,7 +4278,7 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
         board = chess.Board(root_fen)
         opening_book = load_game_review_opening_book()
         played_sequence = []
-        before = evaluator.evaluate(board)
+        before = _evaluate_game_review_position(evaluator, board, multipv=2)
         with _game_review_lock:
             if int(_game_review.get("generation", 0)) != int(generation):
                 return
@@ -3623,6 +4293,9 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
             if move not in board.legal_moves:
                 raise ValueError(f"review move is no longer legal: {move_uci}")
             mover = board.turn
+            legal_moves = list(board.legal_moves)
+            legal_move_count = len(legal_moves)
+            before_board = board.copy(stack=False)
             move_san = board.san(move)
             candidate_sequence = played_sequence + [move_uci]
             book_info = get_game_review_book_move(
@@ -3632,8 +4305,11 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                 book=opening_book,
             )
             board.push(move)
+            after_board = board.copy(stack=False)
             played_sequence = candidate_sequence
-            after = evaluator.evaluate(board)
+            after = _evaluate_game_review_position(
+                evaluator, board, multipv=2
+            )
             if not _game_review_generation_is_current(generation):
                 return
             cpl = game_review_centipawn_loss(
@@ -3643,11 +4319,43 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
             engine_rating = classify_game_review_move(
                 cpl, is_best_move=is_best
             )
+            special = _analyse_game_review_special_context(
+                before_board,
+                after_board,
+                move,
+                mover,
+                before,
+                after,
+                cpl,
+                is_best,
+                legal_move_count,
+            )
             rating = classify_game_review_move(
                 cpl,
                 is_best_move=is_best,
                 is_book_move=bool(book_info),
+                is_forced=special.get("is_forced_move", False),
+                is_brilliant=special.get("is_brilliant", False),
+                is_great=special.get("is_great", False),
+                is_miss=special.get("is_miss", False),
+                is_special_blunder=special.get(
+                    "is_special_blunder", False
+                ),
             )
+            if special.get("is_checkmate"):
+                note = "That's checkmate."
+            elif rating == "forced":
+                note = "That was the only legal move."
+            elif rating == "blunder":
+                note = special.get("blunder_note", "")
+            elif rating == "miss":
+                note = special.get("miss_note", "")
+            elif rating == "brilliant":
+                note = special.get("brilliant_note", "")
+            elif rating == "great":
+                note = special.get("great_note", "")
+            else:
+                note = ""
             result = {
                 "ply": index + 1,
                 "move_uci": move_uci,
@@ -3659,6 +4367,34 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                 "opening_eco": (book_info or {}).get("opening_eco", ""),
                 "opening_name": (book_info or {}).get("opening_name", ""),
                 "book_source": (book_info or {}).get("book_source", ""),
+                "note": note,
+                "special_note": note,
+                "is_checkmate": bool(special.get("is_checkmate")),
+                "is_forced_move": bool(special.get("is_forced_move")),
+                "legal_move_count": int(
+                    special.get("legal_move_count", legal_move_count)
+                ),
+                "is_brilliant_move": bool(special.get("is_brilliant")),
+                "is_great_move": bool(special.get("is_great")),
+                "is_miss": bool(special.get("is_miss")),
+                "miss_reason": special.get("miss_reason", ""),
+                "is_special_blunder": bool(
+                    special.get("is_special_blunder")
+                ),
+                "allows_opponent_mate": bool(
+                    special.get("allows_opponent_mate")
+                ),
+                "opponent_mate_in": special.get("opponent_mate_in"),
+                "missed_forced_mate": bool(
+                    special.get("missed_forced_mate")
+                ),
+                "hanging_piece": special.get("hanging_piece", ""),
+                "hanging_gain": int(special.get("hanging_gain", 0)),
+                "sacrifice_piece": special.get("sacrifice_piece", ""),
+                "sacrifice_gain": int(special.get("sacrifice_gain", 0)),
+                "second_best_gap_cp": int(
+                    special.get("second_best_gap_cp", 0)
+                ),
                 "centipawn_loss": int(cpl),
                 "is_best_move": bool(is_best),
                 "bestmove_uci": before.get("bestmove_uci"),
@@ -14198,7 +14934,85 @@ def draw_game_review_rating_icon(surface, rating, centre, size=26):
         )
         pygame.draw.lines(surface, (255, 255, 255), False, check_points, width)
         return
-    if rating == "excellent":
+    if rating == "brilliant":
+        for x_offset in (-0.25, 0.25):
+            stem = pygame.Rect(
+                centre[0] + int(radius * x_offset) - max(1, radius // 7),
+                centre[1] - int(radius * 0.58),
+                max(2, radius // 3),
+                int(radius * 0.78),
+            )
+            pygame.draw.rect(
+                surface, (25, 30, 36), stem.move(0, 1), border_radius=2
+            )
+            pygame.draw.rect(
+                surface, (255, 255, 255), stem, border_radius=2
+            )
+            pygame.draw.circle(
+                surface,
+                (255, 255, 255),
+                (
+                    centre[0] + int(radius * x_offset),
+                    centre[1] + int(radius * 0.52),
+                ),
+                max(1, radius // 5),
+            )
+        return
+    if rating == "forced":
+        shaft = pygame.Rect(
+            centre[0] - int(radius * 0.58),
+            centre[1] - max(1, int(radius * 0.13)),
+            int(radius * 0.72),
+            max(2, int(radius * 0.26)),
+        )
+        head = [
+            (centre[0] + radius * 0.05, centre[1] - radius * 0.46),
+            (centre[0] + radius * 0.62, centre[1]),
+            (centre[0] + radius * 0.05, centre[1] + radius * 0.46),
+        ]
+        pygame.draw.rect(surface, (25, 30, 36), shaft.move(0, 1), border_radius=2)
+        pygame.draw.polygon(
+            surface, (25, 30, 36), [(x, y + 1) for x, y in head]
+        )
+        pygame.draw.rect(surface, (255, 255, 255), shaft, border_radius=2)
+        pygame.draw.polygon(surface, (255, 255, 255), head)
+        return
+    if rating == "miss":
+        target_radius = max(3, int(radius * 0.68))
+        line_width = max(1, int(round(radius * 0.16)))
+        for colour, y_offset in (((25, 30, 36), 1), ((255, 255, 255), 0)):
+            target_centre = (centre[0], centre[1] + y_offset)
+            pygame.draw.circle(
+                surface, colour, target_centre, target_radius, line_width
+            )
+            pygame.draw.line(
+                surface,
+                colour,
+                (
+                    centre[0] - radius * 0.38,
+                    centre[1] - radius * 0.38 + y_offset,
+                ),
+                (
+                    centre[0] + radius * 0.38,
+                    centre[1] + radius * 0.38 + y_offset,
+                ),
+                max(1, line_width),
+            )
+            pygame.draw.line(
+                surface,
+                colour,
+                (
+                    centre[0] + radius * 0.38,
+                    centre[1] - radius * 0.38 + y_offset,
+                ),
+                (
+                    centre[0] - radius * 0.38,
+                    centre[1] + radius * 0.38 + y_offset,
+                ),
+                max(1, line_width),
+            )
+        return
+    if rating in ("excellent", "great"):
         stem = pygame.Rect(
             centre[0] - max(1, radius // 6),
             centre[1] - int(radius * 0.58),
@@ -14347,22 +15161,36 @@ def _draw_game_review_coach_character(
             max(0, int(round(width * sx))) if width else 0,
         )
 
-    bob_speed = 420 if reaction in ("best", "excellent") else 720
-    speaking_bob = 0.35 * mouth_open * math.sin(time_ms / 95.0)
-    bob = (
-        math.sin(time_ms / bob_speed) * (1.2 if reaction == "best" else 0.7)
-        + speaking_bob
+    bob_speed = (
+        360
+        if reaction == "brilliant"
+        else 420
+        if reaction in ("best", "excellent", "great")
+        else 720
     )
+    speaking_bob = 0.35 * mouth_open * math.sin(time_ms / 95.0)
+    bob_amplitude = (
+        1.45
+        if reaction == "brilliant"
+        else 1.2
+        if reaction == "best"
+        else 0.7
+    )
+    bob = math.sin(time_ms / bob_speed) * bob_amplitude + speaking_bob
     shake = 0.0
     if reaction == "blunder":
         shake = math.sin(time_ms / 55.0) * 0.8
     tilt = {
         "book": -1.0,
+        "brilliant": -1.5,
+        "great": -1.1,
         "best": -1.2,
         "excellent": -0.8,
         "good": 0.0,
+        "forced": 0.6,
         "inaccuracy": 2.2,
         "mistake": 1.4,
+        "miss": 2.6,
         "blunder": shake,
         "thinking": -1.6,
     }.get(reaction, 0.0)
@@ -14481,20 +15309,28 @@ def _draw_game_review_coach_character(
             1.4,
         )
 
-    blink = (int(time_ms) % 3600) < 110 and reaction not in ("blunder", "best")
+    blink = (int(time_ms) % 3600) < 110 and reaction not in (
+        "blunder",
+        "best",
+        "brilliant",
+    )
     gaze = {
         "book": (-0.6, 1.3),
+        "brilliant": (0.4, -0.9),
+        "great": (0.9, -0.6),
         "best": (0.8, -0.7),
         "excellent": (1.0, -0.3),
         "good": (0.5, 0.0),
+        "forced": (1.5, 0.4),
         "inaccuracy": (-1.4, 0.7),
         "mistake": (-0.7, 1.0),
+        "miss": (-1.7, -0.4),
         "blunder": (0.0, 0.0),
         "thinking": (1.7, -0.8),
     }.get(reaction, (0.0, 0.0))
-    eye_w = 7.4 if reaction == "blunder" else 6.4
-    eye_h = 8.6 if reaction == "blunder" else 7.4
-    if reaction in ("best", "excellent"):
+    eye_w = 7.4 if reaction in ("blunder", "brilliant") else 6.4
+    eye_h = 8.6 if reaction in ("blunder", "brilliant") else 7.4
+    if reaction in ("best", "excellent", "great"):
         eye_h *= 0.82
     for side in (-1, 1):
         eye_cx = head_cx + side * 12
@@ -14510,9 +15346,12 @@ def _draw_game_review_coach_character(
             line(hair_dark, [(eye_cx - 4.5, eye_cy - 4.2), (eye_cx + 4.5, eye_cy - 4.5)], 1.0)
 
     brow_y = 47 + head_y
-    if reaction in ("best", "excellent"):
+    if reaction in ("best", "excellent", "great", "brilliant"):
         line(hair_dark, [(head_cx - 18, brow_y + 1), (head_cx - 7, brow_y - 2)], 2)
         line(hair_dark, [(head_cx + 7, brow_y - 2), (head_cx + 18, brow_y + 1)], 2)
+    elif reaction == "miss":
+        line(hair_dark, [(head_cx - 18, brow_y - 4), (head_cx - 7, brow_y - 3)], 2)
+        line(hair_dark, [(head_cx + 7, brow_y + 2), (head_cx + 18, brow_y - 1)], 2)
     elif reaction == "inaccuracy":
         line(hair_dark, [(head_cx - 18, brow_y - 2), (head_cx - 7, brow_y + 1)], 2)
         line(hair_dark, [(head_cx + 7, brow_y + 1), (head_cx + 18, brow_y - 3)], 2)
@@ -14544,7 +15383,7 @@ def _draw_game_review_coach_character(
             [(head_cx - 5, 55 + head_y), (head_cx + 5, 55 + head_y)],
             1.4,
         )
-    if reaction in ("best", "excellent", "good"):
+    if reaction in ("best", "excellent", "good", "great", "brilliant"):
         for side in (-1, 1):
             blush = pygame.Surface((int(16 * sx), int(9 * sy)), pygame.SRCALPHA)
             pygame.draw.ellipse(blush, (238, 130, 116, 62), blush.get_rect())
@@ -14556,11 +15395,15 @@ def _draw_game_review_coach_character(
         # corners retain the current reaction's smile/frown direction.
         corner_lift = {
             "book": -1.2,
+            "brilliant": -2.6,
+            "great": -2.0,
             "best": -2.2,
             "excellent": -1.7,
             "good": -1.2,
+            "forced": 0.0,
             "inaccuracy": 0.8,
             "mistake": 1.8,
+            "miss": 1.4,
             "blunder": 1.2,
             "thinking": 0.0,
         }.get(reaction, 0.0)
@@ -14620,13 +15463,13 @@ def _draw_game_review_coach_character(
             ],
             1.4,
         )
-    elif reaction == "best":
+    elif reaction in ("best", "brilliant"):
         ellipse((126, 55, 48), (head_cx - 9, mouth_y - 3, 18, 12))
         ellipse((255, 255, 255), (head_cx - 7, mouth_y - 3, 14, 5))
         ellipse(skin, (head_cx - 10, mouth_y - 8, 20, 6))
-    elif reaction in ("excellent", "good"):
+    elif reaction in ("excellent", "good", "great"):
         pygame.draw.arc(canvas, (126, 55, 48), r(head_cx - 9, mouth_y - 7, 18, 13), math.pi * 1.08, math.pi * 1.92, max(1, int(2 * sx)))
-    elif reaction == "inaccuracy":
+    elif reaction in ("inaccuracy", "miss"):
         line((126, 55, 48), [(head_cx - 8, mouth_y), (head_cx - 3, mouth_y - 2), (head_cx + 2, mouth_y + 1), (head_cx + 8, mouth_y - 1)], 1.8)
     elif reaction == "mistake":
         pygame.draw.arc(canvas, (126, 55, 48), r(head_cx - 8, mouth_y - 2, 16, 12), math.pi * 0.12, math.pi * 0.88, max(1, int(2 * sx)))
@@ -14635,6 +15478,8 @@ def _draw_game_review_coach_character(
         ellipse((83, 35, 34), (head_cx - 3, mouth_y - 2, 6, 8))
     elif reaction == "book":
         pygame.draw.arc(canvas, (126, 55, 48), r(head_cx - 7, mouth_y - 6, 14, 11), math.pi * 1.1, math.pi * 1.9, max(1, int(1.8 * sx)))
+    elif reaction == "forced":
+        line((126, 55, 48), [(head_cx - 7, mouth_y), (head_cx + 7, mouth_y)], 1.8)
     else:  # thinking
         line((126, 55, 48), [(head_cx - 5, mouth_y + 1), (head_cx + 6, mouth_y)], 1.8)
 
@@ -14671,7 +15516,7 @@ def _draw_game_review_coach_character(
             line((165, 145, 105), [(44, book_y + line_offset - 2), (54, book_y + line_offset)], 0.9)
         circle(skin, (58, book_y + 20), 4.5)
         circle(skin, (20, book_y + 20), 4.0)
-    elif reaction in ("best", "excellent"):
+    elif reaction in ("best", "excellent", "great", "brilliant"):
         line(jacket_dark, [(84, 108 + bob * 0.25), (98, 94 + head_y)], 7)
         circle(skin, (100, 91 + head_y), 6)
         pygame.draw.rect(canvas, skin, r(97, 80 + head_y, 5, 10), border_radius=int(2 * sx))
@@ -14682,9 +15527,66 @@ def _draw_game_review_coach_character(
                 angle = k * math.pi / 4 + time_ms / 650.0
                 points.append(p(sparkle_x + math.cos(angle) * radius, sparkle_y + head_y + math.sin(angle) * radius))
             pygame.draw.polygon(canvas, (255, 215, 92), points)
+        if reaction == "brilliant":
+            line(jacket_dark, [(36, 108 + bob * 0.25), (22, 94 + head_y)], 7)
+            circle(skin, (20, 91 + head_y), 6)
+            pygame.draw.rect(
+                canvas, skin, r(18, 80 + head_y, 5, 10), border_radius=int(2 * sx)
+            )
+            for sparkle_x, sparkle_y, sparkle_r in ((60, 12, 5), (25, 58, 3)):
+                points = []
+                for k in range(8):
+                    radius = sparkle_r if k % 2 == 0 else sparkle_r * 0.38
+                    angle = k * math.pi / 4 - time_ms / 700.0
+                    points.append(
+                        p(
+                            sparkle_x + math.cos(angle) * radius,
+                            sparkle_y + head_y + math.sin(angle) * radius,
+                        )
+                    )
+                pygame.draw.polygon(canvas, (120, 235, 255), points)
     elif reaction == "good":
         line(jacket_dark, [(84, 108 + bob * 0.25), (98, 99 + head_y)], 7)
         circle(skin, (100, 97 + head_y), 5.5)
+    elif reaction == "forced":
+        line(jacket_dark, [(30, 108 + bob * 0.25), (19, 103 + head_y)], 6)
+        line(jacket_dark, [(90, 108 + bob * 0.25), (101, 103 + head_y)], 6)
+        circle(skin, (17, 102 + head_y), 5)
+        circle(skin, (103, 102 + head_y), 5)
+        sign_y = 105 + bob * 0.25
+        line((112, 76, 42), [(24, sign_y + 22), (24, sign_y + 3)], 3)
+        pygame.draw.rect(
+            canvas,
+            (235, 238, 245),
+            r(9, sign_y, 31, 14),
+            border_radius=int(3 * sx),
+        )
+        pygame.draw.rect(
+            canvas,
+            (80, 88, 105),
+            r(9, sign_y, 31, 14),
+            max(1, int(round(1.2 * sx))),
+            border_radius=int(3 * sx),
+        )
+        line((55, 65, 82), [(14, sign_y + 7), (30, sign_y + 7)], 2)
+        line((55, 65, 82), [(30, sign_y + 7), (25, sign_y + 3)], 2)
+        line((55, 65, 82), [(30, sign_y + 7), (25, sign_y + 11)], 2)
+    elif reaction == "miss":
+        ellipse(skin, (head_cx + 7, 82 + head_y, 17, 9))
+        line(jacket_dark, [(82, 108 + bob * 0.25), (head_cx + 14, 87 + head_y)], 6)
+        target = (100, 91 + head_y)
+        circle((205, 82, 118), target, 10, 2)
+        circle((205, 82, 118), target, 5, 1.5)
+        line(
+            (245, 245, 245),
+            [(target[0] - 1, target[1] - 7), (target[0] + 7, target[1] + 1)],
+            2,
+        )
+        line(
+            (245, 245, 245),
+            [(target[0] + 7, target[1] - 7), (target[0] - 1, target[1] + 1)],
+            2,
+        )
     elif reaction == "thinking":
         ellipse(skin, (head_cx + 8, 82 + head_y, 17, 9))
         line(jacket_dark, [(82, 108 + bob * 0.25), (head_cx + 15, 87 + head_y)], 6)
@@ -14784,10 +15686,10 @@ def _draw_game_review_button(screen, rect, hovered):
         draw_game_review_rating_icon(
             screen,
             rating,
-            (visual.x + 112 + index * 24, visual.bottom - 17),
-            20,
+            (visual.x + 109 + index * 19, visual.bottom - 17),
+            18,
         )
-    pill = pygame.Rect(visual.x + 286, visual.bottom - 30, 96, 24)
+    pill = pygame.Rect(visual.x + 316, visual.bottom - 30, 96, 24)
     pygame.draw.rect(screen, (255, 209, 92), pill, border_radius=12)
     pygame.draw.rect(screen, (146, 104, 28), pill, 1, border_radius=12)
     pill_text = _game_review_font(13, True).render(
@@ -14844,6 +15746,21 @@ _GAME_REVIEW_LINES = {
         "Straight from the opening book.",
         "Theory. That one has been played many times before.",
     ),
+    "brilliant": (
+        "Brilliant! That sacrifice turns the position on its head.",
+        "Brilliant! The material offer is completely justified.",
+        "Brilliant! A spectacular way to seize the game.",
+    ),
+    "great": (
+        "Great move — that was the only good move.",
+        "Great move. The alternatives all ran into trouble.",
+        "Great move — precisely what the position demanded.",
+    ),
+    "forced": (
+        "That was the only legal move.",
+        "Forced — there was no alternative.",
+        "Only one legal move was available there.",
+    ),
     "best": (
         "That's the engine's top choice — beautifully played.",
         "Perfect. You found the strongest move.",
@@ -14869,6 +15786,11 @@ _GAME_REVIEW_LINES = {
         "A real wobble there. The engine wanted something else.",
         "Careful: that move makes the game much harder.",
     ),
+    "miss": (
+        "A missed opportunity there.",
+        "That lets a big chance slip away.",
+        "So close — there was a stronger idea available.",
+    ),
     "blunder": (
         "Oh no — that changes the whole game!",
         "That's a blunder. Take a breath and see what was missed.",
@@ -14878,10 +15800,15 @@ _GAME_REVIEW_LINES = {
 
 
 def _game_review_result_spoken_text(result, display_speech):
-    """Build the Piper line for one rated move from its bubble text."""
-    move_speech = game_review_san_to_speech(result.get("move_san", ""))
-    rating = result.get("rating", "good")
-    label = GAME_REVIEW_RATINGS.get(rating, {}).get("label", "Move")
+    """Build Piper's line from the coach's note only.
+
+    The played move and rating are already visible in the dock title and
+    badge; Coach Nolan should simply read the textual note in the speech
+    bubble. A trailing engine suggestion is part of that note, so its SAN
+    is converted to words, but the move that was played is not announced.
+    """
+    if result and result.get("is_checkmate"):
+        return "That's checkmate."
     main_text = str(display_speech or "").strip()
     best_clause = ""
     marker = " Best was "
@@ -14891,10 +15818,10 @@ def _game_review_result_spoken_text(result, display_speech):
             main_text += "."
         best_clause = (
             " Best was "
-            + game_review_san_to_speech(result.get("bestmove_san", ""))
+            + game_review_san_to_speech((result or {}).get("bestmove_san", ""))
             + "."
         )
-    return f"{move_speech.capitalize()}. {label}. {main_text}{best_clause}".strip()
+    return f"{main_text}{best_clause}".strip()
 
 
 def get_game_review_dialogue(board, snapshot=None):
@@ -14942,7 +15869,12 @@ def get_game_review_dialogue(board, snapshot=None):
         )
         lines = _GAME_REVIEW_LINES.get(reaction, ())
         speech = lines[(ply - 1) % len(lines)] if lines else ""
-        if reaction == "book" and result.get("opening_name"):
+        result_note = str(result.get("note") or "").strip()
+        if result.get("is_checkmate"):
+            speech = "That's checkmate."
+        elif result_note:
+            speech = result_note
+        elif reaction == "book" and result.get("opening_name"):
             opening_name = str(result.get("opening_name")).strip()
             book_variants = (
                 f"Book move — this is {opening_name}.",
@@ -16740,7 +17672,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     The caller owns the original 400x50 row, hover gating and navigation.
     This visual-only renderer summarises the seven board overlays and the
     Game Review coach with a magnified-board medallion, live eval trace and
-    the seven coach rating badges on the right.
+    the eleven coach rating badges on the right.
     """
     global analysis_settings_button_hover_amount
     global analysis_settings_button_pulse_phase
@@ -17004,7 +17936,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
     screen.blit(subtitle, subtitle_rect)
 
-    # Right-hand detail: all seven coach badges in a compact 4 x 2 cluster.
+    # Right-hand detail: all eleven coach badges in a compact 4 x 3 cluster.
     for index, rating in enumerate(GAME_REVIEW_RATINGS):
         col = index % 4
         row = index // 4
@@ -17012,13 +17944,13 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
             screen,
             rating,
             (
-                visual_rect.right - 104 + col * 19,
-                visual_rect.centery - 11 + row * 22,
+                visual_rect.right - 104 + col * 18,
+                visual_rect.centery - 15 + row * 15,
             ),
-            16,
+            14,
         )
     if review_live:
-        live_dot = (visual_rect.right - 104, visual_rect.y + 8)
+        live_dot = (visual_rect.right - 112, visual_rect.y + 8)
         live_radius = 3 + int(round(hover_amount))
         pygame.draw.circle(screen, (110, 210, 255), live_dot, live_radius)
         pygame.draw.circle(screen, (255, 255, 255), live_dot, live_radius + 1, 1)
