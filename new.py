@@ -15485,37 +15485,414 @@ def _draw_game_review_coach_character(
 
     # Hands/props reinforce each reaction without needing a full body.
     if reaction == "book":
-        # An open opening book held low in front of the jacket.
-        book_y = 103 + bob * 0.25
-        cover_points = [
-            (18, book_y + 4),
-            (39, book_y),
-            (60, book_y + 4),
-            (60, book_y + 25),
-            (39, book_y + 20),
-            (18, book_y + 25),
+        # Nolan is reading the opening book, so its printed pages face him.
+        # From the viewer's side we therefore see the backs of both leather
+        # covers, their raised central spine/hinges, and only the pale
+        # page-block edges peeking around the top and fore-edges.
+        book_top = 97.0 + bob * 0.22
+        spine_x = 55.0
+
+        def book_poly(points, colour, width=0):
+            pygame.draw.polygon(
+                canvas,
+                colour,
+                [p(point_x, point_y) for point_x, point_y in points],
+                max(0, int(round(width * sx))) if width else 0,
+            )
+
+        def quad_point(corners, u, v):
+            tl, tr, br, bl = corners
+            top_x = tl[0] + (tr[0] - tl[0]) * u
+            top_y = tl[1] + (tr[1] - tl[1]) * u
+            bottom_x = bl[0] + (br[0] - bl[0]) * u
+            bottom_y = bl[1] + (br[1] - bl[1]) * u
+            return (
+                top_x + (bottom_x - top_x) * v,
+                top_y + (bottom_y - top_y) * v,
+            )
+
+        def quad_slice(corners, u0, u1, v0, v1):
+            return [
+                quad_point(corners, u0, v0),
+                quad_point(corners, u1, v0),
+                quad_point(corners, u1, v1),
+                quad_point(corners, u0, v1),
+            ]
+
+        # Cover quads are TL/TR/BR/BL. The two planes slope away from the
+        # near, raised spine toward Nolan's hands at the fore-edges.
+        left_cover = [
+            (19.0, book_top + 5.0),
+            (spine_x, book_top),
+            (spine_x, book_top + 29.0),
+            (21.0, book_top + 32.0),
         ]
-        pygame.draw.polygon(canvas, (74, 45, 28), [p(x, y) for x, y in cover_points])
-        left_page = [
-            (21, book_y + 6),
-            (39, book_y + 3),
-            (39, book_y + 20),
-            (21, book_y + 23),
+        right_cover = [
+            (spine_x, book_top),
+            (91.0, book_top + 5.0),
+            (89.0, book_top + 32.0),
+            (spine_x, book_top + 29.0),
         ]
-        right_page = [
-            (41, book_y + 3),
-            (57, book_y + 6),
-            (57, book_y + 23),
-            (41, book_y + 20),
+        # The page blocks sit behind the covers (between cover and coach),
+        # so only their layered top and outer edges are visible.
+        left_block = [
+            (17.5, book_top + 3.4),
+            (spine_x, book_top - 1.6),
+            (spine_x, book_top + 27.0),
+            (19.5, book_top + 29.8),
         ]
-        pygame.draw.polygon(canvas, (246, 238, 214), [p(x, y) for x, y in left_page])
-        pygame.draw.polygon(canvas, (255, 252, 238), [p(x, y) for x, y in right_page])
-        line((112, 72, 42), [(40, book_y + 2), (40, book_y + 21)], 1.5)
-        for line_offset in (8, 12, 16):
-            line((165, 145, 105), [(24, book_y + line_offset), (36, book_y + line_offset - 2)], 0.9)
-            line((165, 145, 105), [(44, book_y + line_offset - 2), (54, book_y + line_offset)], 0.9)
-        circle(skin, (58, book_y + 20), 4.5)
-        circle(skin, (20, book_y + 20), 4.0)
+        right_block = [
+            (spine_x, book_top - 1.6),
+            (92.5, book_top + 3.4),
+            (90.5, book_top + 29.8),
+            (spine_x, book_top + 27.0),
+        ]
+
+        # Sleeves disappear behind the book; fingertips reappear below.
+        line(jacket_dark, [(31, 111 + bob * 0.25), (22, book_top + 22)], 7)
+        line(jacket_dark, [(82, 111 + bob * 0.25), (89, book_top + 22)], 7)
+
+        # Contact shadow, cast down-left onto the jacket.
+        book_shadow = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+        for points in (left_cover, right_cover):
+            pygame.draw.polygon(
+                book_shadow,
+                (8, 18, 24, 88),
+                [p(point_x - 1.2, point_y + 2.7) for point_x, point_y in points],
+            )
+        canvas.blit(book_shadow, (0, 0))
+
+        # A ribbon marker slips out from between the far-side pages and is
+        # just visible underneath the lower edge.
+        book_poly(
+            [
+                (63.0, book_top + 18.0),
+                (68.2, book_top + 18.8),
+                (67.3, book_top + 34.7),
+                (65.1, book_top + 32.2),
+                (63.2, book_top + 34.7),
+            ],
+            (164, 43, 54),
+        )
+        line(
+            (112, 25, 35),
+            [(65.2, book_top + 26.0), (65.0, book_top + 32.0)],
+            0.8,
+        )
+
+        # Page-block layers: no print is visible from this side—only fine
+        # leaf striations along the exposed block edges.
+        for block in (left_block, right_block):
+            book_poly(block, (237, 224, 191))
+            book_poly(quad_slice(block, 0.06, 0.94, 0.0, 0.10), (250, 244, 220))
+            for layer in range(4):
+                v = 0.035 + layer * 0.025
+                line(
+                    (196, 176, 137),
+                    [
+                        quad_point(block, 0.04, v),
+                        quad_point(block, 0.96, v),
+                    ],
+                    0.45,
+                )
+            for layer in range(5):
+                u = 0.025 + layer * 0.012
+                line(
+                    (205, 184, 145),
+                    [
+                        quad_point(block, u, 0.06),
+                        quad_point(block, u + 0.018, 0.92),
+                    ],
+                    0.4,
+                )
+                line(
+                    (205, 184, 145),
+                    [
+                        quad_point(block, 1.0 - u, 0.06),
+                        quad_point(block, 0.982 - u, 0.92),
+                    ],
+                    0.4,
+                )
+
+        # One unprinted reverse side of a page curls above the right block,
+        # turned toward Nolan; its shadow helps sell the direction.
+        book_poly(
+            [
+                (61.0, book_top + 0.8),
+                (76.0, book_top - 2.4),
+                (88.0, book_top + 3.2),
+                (73.0, book_top + 4.3),
+            ],
+            (250, 245, 225),
+        )
+        line(
+            (201, 181, 142),
+            [(63.0, book_top + 1.7), (76.0, book_top - 0.8), (86.0, book_top + 3.5)],
+            0.65,
+        )
+
+        # Leather covers, built from thin perspective bands so the hardback
+        # has a soft top-light gradient when supersampled down.
+        cover_palettes = (
+            (left_cover, (132, 64, 47), (82, 36, 29)),
+            (right_cover, (120, 55, 44), (72, 31, 27)),
+        )
+        for corners, top_colour, bottom_colour in cover_palettes:
+            for band in range(10):
+                colour = _lerp_color(
+                    top_colour, bottom_colour, (band + 0.5) / 10.0
+                )
+                book_poly(
+                    quad_slice(
+                        corners,
+                        0.0,
+                        1.0,
+                        band / 10.0,
+                        (band + 1) / 10.0,
+                    ),
+                    colour,
+                )
+            line(
+                (42, 20, 18),
+                [corners[0], corners[1], corners[2], corners[3]],
+                1.25,
+                closed=True,
+            )
+
+        # Directional light and spine shadow over the two cover planes.
+        book_light = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+        pygame.draw.polygon(
+            book_light,
+            (255, 226, 170, 34),
+            [
+                p(*point)
+                for point in quad_slice(left_cover, 0.10, 0.62, 0.0, 0.36)
+            ],
+        )
+        pygame.draw.polygon(
+            book_light,
+            (20, 8, 8, 48),
+            [
+                p(*point)
+                for point in quad_slice(right_cover, 0.0, 0.20, 0.0, 1.0)
+            ],
+        )
+        pygame.draw.polygon(
+            book_light,
+            (20, 8, 8, 34),
+            [
+                p(*point)
+                for point in quad_slice(left_cover, 0.82, 1.0, 0.0, 1.0)
+            ],
+        )
+        canvas.blit(book_light, (0, 0))
+
+        # Double gilt rules inset into each back cover.
+        for corners in (left_cover, right_cover):
+            for bounds, colour, width in (
+                ((0.10, 0.90, 0.11, 0.89), (224, 175, 95), 0.95),
+                ((0.17, 0.83, 0.18, 0.82), (58, 27, 22), 0.75),
+            ):
+                line(
+                    colour,
+                    quad_slice(corners, *bounds),
+                    width,
+                    closed=True,
+                )
+
+        # Fine deterministic leather grain and a few worn scuffs.
+        for panel_index, corners in enumerate((left_cover, right_cover)):
+            for grain_index in range(20):
+                u = 0.12 + ((grain_index * 37 + panel_index * 19) % 68) / 100.0
+                v = 0.12 + ((grain_index * 23 + panel_index * 11) % 72) / 100.0
+                start = quad_point(corners, u, v)
+                end = (start[0] + 1.4 + (grain_index % 3) * 0.35, start[1] + 0.25)
+                line(
+                    (66, 31, 25) if grain_index % 2 else (154, 83, 57),
+                    [start, end],
+                    0.38,
+                )
+            for u0, v0, u1, v1 in (
+                (0.24, 0.72, 0.42, 0.66),
+                (0.58, 0.24, 0.72, 0.30),
+            ):
+                line(
+                    (166, 96, 65),
+                    [quad_point(corners, u0, v0), quad_point(corners, u1, v1)],
+                    0.55,
+                )
+
+        # Abstract gilt publisher lines on the outside rear cover. These are
+        # on dark leather, distinct from the hidden printed pages.
+        for row, (u0, u1) in enumerate(
+            ((0.24, 0.76), (0.29, 0.69), (0.25, 0.62), (0.34, 0.58))
+        ):
+            v = 0.30 + row * 0.10
+            line(
+                (224, 175, 95),
+                [quad_point(left_cover, u0, v), quad_point(left_cover, u1, v)],
+                0.72,
+            )
+
+        # Gilt knight medallion on the outside front cover (viewer's right).
+        medallion = quad_point(right_cover, 0.58, 0.52)
+        circle((224, 175, 95), medallion, 7.8, 1.05)
+        circle((92, 39, 31), medallion, 6.6)
+        book_poly(
+            [
+                (medallion[0] + 2.5, medallion[1] - 5.4),
+                (medallion[0] + 4.6, medallion[1] - 2.3),
+                (medallion[0] + 3.4, medallion[1] + 1.0),
+                (medallion[0] + 5.1, medallion[1] + 4.8),
+                (medallion[0] - 4.1, medallion[1] + 4.8),
+                (medallion[0] - 3.2, medallion[1] + 1.2),
+                (medallion[0] - 5.1, medallion[1] - 0.6),
+                (medallion[0] - 2.0, medallion[1] - 2.1),
+                (medallion[0] - 0.4, medallion[1] - 4.4),
+            ],
+            (224, 175, 95),
+        )
+        circle(
+            (92, 39, 31),
+            (medallion[0] + 1.5, medallion[1] - 2.3),
+            0.72,
+        )
+        for v, u0, u1 in ((0.24, 0.32, 0.74), (0.31, 0.40, 0.66), (0.78, 0.36, 0.70)):
+            line(
+                (224, 175, 95),
+                [quad_point(right_cover, u0, v), quad_point(right_cover, u1, v)],
+                0.78,
+            )
+
+        # Brass corner protectors and a dark elastic closure near the
+        # right-hand fore-edge add hardback hardware at readable scale.
+        for corners, outer_is_left in ((left_cover, True), (right_cover, False)):
+            if outer_is_left:
+                corner_sets = (
+                    (0.0, 0.0, 0.22, 0.0, 0.0, 0.20),
+                    (0.0, 1.0, 0.22, 1.0, 0.0, 0.80),
+                )
+            else:
+                corner_sets = (
+                    (1.0, 0.0, 0.78, 0.0, 1.0, 0.20),
+                    (1.0, 1.0, 0.78, 1.0, 1.0, 0.80),
+                )
+            for u0, v0, u1, v1, u2, v2 in corner_sets:
+                book_poly(
+                    [
+                        quad_point(corners, u0, v0),
+                        quad_point(corners, u1, v1),
+                        quad_point(corners, u2, v2),
+                    ],
+                    (216, 165, 79),
+                )
+                line(
+                    (116, 78, 28),
+                    [
+                        quad_point(corners, u1, v1),
+                        quad_point(corners, u2, v2),
+                    ],
+                    0.55,
+                )
+        line(
+            (36, 34, 42),
+            [
+                quad_point(right_cover, 0.84, 0.04),
+                quad_point(right_cover, 0.81, 0.96),
+            ],
+            1.7,
+        )
+        clasp = quad_point(right_cover, 0.825, 0.52)
+        pygame.draw.rect(
+            canvas,
+            (222, 171, 82),
+            r(clasp[0] - 2.0, clasp[1] - 1.5, 4.0, 3.0),
+            border_radius=max(1, int(round(0.8 * sx))),
+        )
+
+        # Raised spine, hinge grooves, horizontal bands and stitching. The
+        # spine is the nearest ridge; both covers fall away from it.
+        spine = [
+            (spine_x - 3.0, book_top + 0.3),
+            (spine_x + 3.0, book_top + 0.3),
+            (spine_x + 3.0, book_top + 28.7),
+            (spine_x - 3.0, book_top + 28.7),
+        ]
+        book_poly(spine, (62, 29, 24))
+        for band_offset in (5.0, 12.0, 19.0, 25.5):
+            book_poly(
+                [
+                    (spine_x - 3.4, book_top + band_offset),
+                    (spine_x + 3.4, book_top + band_offset),
+                    (spine_x + 3.4, book_top + band_offset + 2.0),
+                    (spine_x - 3.4, book_top + band_offset + 2.0),
+                ],
+                (111, 51, 38),
+            )
+            line(
+                (224, 175, 95),
+                [
+                    (spine_x - 2.5, book_top + band_offset + 0.6),
+                    (spine_x + 2.5, book_top + band_offset + 0.6),
+                ],
+                0.5,
+            )
+        line(
+            (236, 190, 112),
+            [(spine_x, book_top + 1.0), (spine_x, book_top + 28.0)],
+            0.8,
+        )
+        for hinge_x in (spine_x - 5.3, spine_x + 5.3):
+            line(
+                (45, 22, 19),
+                [(hinge_x, book_top + 1.5), (hinge_x, book_top + 27.5)],
+                0.8,
+            )
+            for stitch in range(6):
+                stitch_y = book_top + 4.0 + stitch * 4.1
+                line(
+                    (224, 175, 95),
+                    [(hinge_x - 0.8, stitch_y), (hinge_x + 0.8, stitch_y + 1.1)],
+                    0.48,
+                )
+
+        # Fingertips wrap around the fore-edges from Nolan's side and land
+        # on the viewer-facing back covers; nails and finger grooves make
+        # the grip read even after downscaling to the dock.
+        for corners, outer_u, nail_direction in (
+            (left_cover, 0.035, 1.0),
+            (right_cover, 0.965, -1.0),
+        ):
+            palm = quad_point(corners, outer_u, 0.94)
+            circle(skin_shadow, (palm[0], palm[1] + 0.7), 4.1)
+            circle(skin, palm, 3.9)
+            for v in (0.34, 0.52, 0.70):
+                centre = quad_point(corners, outer_u, v)
+                ellipse(
+                    skin_shadow,
+                    (centre[0] - 3.9, centre[1] - 1.6, 7.8, 3.6),
+                )
+                ellipse(
+                    skin,
+                    (centre[0] - 3.9, centre[1] - 2.2, 7.8, 3.6),
+                )
+                ellipse(
+                    (250, 222, 199),
+                    (
+                        centre[0] + nail_direction * 1.5 - 1.4,
+                        centre[1] - 1.55,
+                        2.8,
+                        2.2,
+                    ),
+                )
+                line(
+                    skin_shadow,
+                    [
+                        (centre[0] - nail_direction * 3.0, centre[1] - 0.2),
+                        (centre[0] + nail_direction * 0.7, centre[1] - 0.2),
+                    ],
+                    0.55,
+                )
     elif reaction in ("best", "excellent", "great", "brilliant"):
         line(jacket_dark, [(84, 108 + bob * 0.25), (98, 94 + head_y)], 7)
         circle(skin, (100, 91 + head_y), 6)
