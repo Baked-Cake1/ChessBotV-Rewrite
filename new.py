@@ -15161,18 +15161,43 @@ def _draw_game_review_coach_character(
             max(0, int(round(width * sx))) if width else 0,
         )
 
+    def poly(colour, points, width=0):
+        pygame.draw.polygon(
+            canvas,
+            colour,
+            [p(point_x, point_y) for point_x, point_y in points],
+            max(0, round(width * sx)) if width else 0,
+        )
+
+    def star_points(centre, outer_radius, inner_radius=None, rotation=-math.pi / 2):
+        if inner_radius is None:
+            inner_radius = outer_radius * 0.48
+        points = []
+        for index in range(10):
+            radius = outer_radius if index % 2 == 0 else inner_radius
+            angle = rotation + index * math.pi / 5.0
+            points.append(
+                (
+                    centre[0] + math.cos(angle) * radius,
+                    centre[1] + math.sin(angle) * radius,
+                )
+            )
+        return points
+
     bob_speed = (
         360
         if reaction == "brilliant"
+        else 390
+        if reaction == "best"
         else 420
-        if reaction in ("best", "excellent", "great")
+        if reaction in ("excellent", "great")
         else 720
     )
     speaking_bob = 0.35 * mouth_open * math.sin(time_ms / 95.0)
     bob_amplitude = (
         1.45
         if reaction == "brilliant"
-        else 1.2
+        else 1.38
         if reaction == "best"
         else 0.7
     )
@@ -15184,7 +15209,7 @@ def _draw_game_review_coach_character(
         "book": -1.0,
         "brilliant": -1.5,
         "great": -1.1,
-        "best": -1.2,
+        "best": -1.8,
         "excellent": -0.8,
         "good": 0.0,
         "forced": 0.6,
@@ -15205,6 +15230,46 @@ def _draw_game_review_coach_character(
     jacket = (43, 116, 128)
     jacket_dark = (28, 82, 96)
     shirt = (246, 241, 222)
+
+    best_pulse = (
+        0.5 + 0.5 * math.sin(time_ms / 360.0) if reaction == "best" else 0.0
+    )
+    if reaction == "best":
+        # A soft top-choice aura sits behind the bust. Short rays rotate
+        # very slowly so the reaction feels celebratory without becoming
+        # as manic as Brilliant's cyan two-thumbs-up burst.
+        aura = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+        aura_centre = (head_cx, 56 + head_y)
+        for radius, alpha in ((43, 18), (36, 24), (29, 28)):
+            pygame.draw.ellipse(
+                aura,
+                (255, 214, 92, alpha),
+                r(
+                    aura_centre[0] - radius,
+                    aura_centre[1] - radius,
+                    radius * 2,
+                    radius * 2,
+                ),
+            )
+        ray_rotation = time_ms / 1600.0
+        for ray_index in range(10):
+            angle = ray_rotation + ray_index * math.tau / 10.0
+            inner_radius = 37.0
+            outer_radius = 42.0 + (2.2 if ray_index % 2 == 0 else 0.0)
+            pygame.draw.line(
+                aura,
+                (255, 220, 115, 72),
+                p(
+                    aura_centre[0] + math.cos(angle) * inner_radius,
+                    aura_centre[1] + math.sin(angle) * inner_radius,
+                ),
+                p(
+                    aura_centre[0] + math.cos(angle) * outer_radius,
+                    aura_centre[1] + math.sin(angle) * outer_radius,
+                ),
+                max(1, round(1.15 * sx)),
+            )
+        canvas.blit(aura, (0, 0))
 
     # Body first, so the head and expressive hands sit naturally over it.
     ellipse(jacket_dark, (18, 101 + bob * 0.25, 84, 38))
@@ -15230,6 +15295,65 @@ def _draw_game_review_coach_character(
     circle((245, 202, 92), (82, 108 + bob * 0.25), 5)
     line((130, 88, 24), [(82, 104 + bob * 0.25), (82, 112 + bob * 0.25)], 1.2)
     line((130, 88, 24), [(79.5, 107 + bob * 0.25), (84.5, 107 + bob * 0.25)], 1.2)
+
+    if reaction == "best":
+        # Raised shoulders and a swinging green-and-gold star medal make
+        # the Best pose read as "top choice" even before the hands appear.
+        body_y = bob * 0.25
+        ellipse((58, 139, 150), (23, 98 + body_y, 28, 13))
+        ellipse((58, 139, 150), (69, 98 + body_y, 28, 13))
+        line((83, 171, 181), [(31, 102 + body_y), (45, 97 + body_y)], 1.1)
+        line((83, 171, 181), [(76, 97 + body_y), (90, 102 + body_y)], 1.1)
+        line(jacket_dark, [(36, 113 + body_y), (43, 124 + body_y)], 0.9)
+        line(jacket_dark, [(85, 113 + body_y), (78, 124 + body_y)], 0.9)
+
+        medal_centre = (
+            60 + bob * 0.35,
+            112 + body_y + best_pulse * 0.45,
+        )
+        # Ribbon halves disappear under the neck/collar and cross behind
+        # the medallion; fine gold edge stripes keep them readable small.
+        poly(
+            (39, 132, 76),
+            [
+                (52.5, 94 + body_y),
+                (58.5, 94 + body_y),
+                (medal_centre[0] - 1.0, medal_centre[1] - 5.0),
+                (medal_centre[0] - 5.5, medal_centre[1] - 3.5),
+            ],
+        )
+        poly(
+            (91, 184, 102),
+            [
+                (61.5, 94 + body_y),
+                (67.5, 94 + body_y),
+                (medal_centre[0] + 5.5, medal_centre[1] - 3.5),
+                (medal_centre[0] + 1.0, medal_centre[1] - 5.0),
+            ],
+        )
+        line(
+            (245, 202, 92),
+            [(54, 97 + body_y), (medal_centre[0] - 3.5, medal_centre[1] - 5.0)],
+            0.65,
+        )
+        line(
+            (245, 202, 92),
+            [(66, 97 + body_y), (medal_centre[0] + 3.5, medal_centre[1] - 5.0)],
+            0.65,
+        )
+        circle((20, 43, 39), (medal_centre[0], medal_centre[1] + 0.8), 8.7)
+        circle((245, 202, 92), medal_centre, 8.3)
+        circle((124, 190, 75), medal_centre, 6.7)
+        circle((91, 160, 58), medal_centre, 6.7, 0.8)
+        poly(
+            (255, 255, 255),
+            star_points(medal_centre, 5.2, 2.45),
+        )
+        circle(
+            (255, 246, 190),
+            (medal_centre[0] - 4.6, medal_centre[1] - 4.8),
+            1.15,
+        )
 
     # Neck and ears. Nolan's broader neck/jaw match his male Piper voice.
     pygame.draw.rect(canvas, skin_shadow, r(head_cx - 8, 83 + head_y, 16, 17), border_radius=int(4 * sx))
@@ -15309,6 +15433,44 @@ def _draw_game_review_coach_character(
             1.4,
         )
 
+    if reaction == "best":
+        # The celebratory bounce lifts a cowlick, and a small star glint
+        # travels through the swept-back hair.
+        lift = best_pulse * 0.55
+        poly(
+            hair,
+            [
+                (head_cx - 3, 15 + head_y),
+                (head_cx + 3, 9.2 - lift + head_y),
+                (head_cx + 12, 10.8 + head_y),
+                (head_cx + 15, 16 + head_y),
+                (head_cx + 5, 16 + head_y),
+            ],
+        )
+        line(
+            hair_light,
+            [
+                (head_cx + 2, 13.5 + head_y),
+                (head_cx + 6, 10.8 - lift + head_y),
+                (head_cx + 12, 12.8 + head_y),
+            ],
+            1.05,
+        )
+        sheen_x = head_cx - 13 + ((int(time_ms) % 2400) / 2400.0) * 22.0
+        line(
+            (205, 139, 82),
+            [(sheen_x, 22 + head_y), (sheen_x + 5, 19.5 + head_y)],
+            1.0,
+        )
+        poly(
+            (255, 220, 110),
+            star_points(
+                (head_cx + 26, 28 + head_y),
+                2.5 + best_pulse * 0.55,
+                1.1,
+            ),
+        )
+
     blink = (int(time_ms) % 3600) < 110 and reaction not in (
         "blunder",
         "best",
@@ -15330,7 +15492,11 @@ def _draw_game_review_coach_character(
     }.get(reaction, (0.0, 0.0))
     eye_w = 7.4 if reaction in ("blunder", "brilliant") else 6.4
     eye_h = 8.6 if reaction in ("blunder", "brilliant") else 7.4
-    if reaction in ("best", "excellent", "great"):
+    if reaction == "best":
+        # A stronger happy squint separates Best from Excellent/Great.
+        eye_w = 7.0
+        eye_h = 5.45
+    elif reaction in ("excellent", "great"):
         eye_h *= 0.82
     for side in (-1, 1):
         eye_cx = head_cx + side * 12
@@ -15344,9 +15510,59 @@ def _draw_game_review_coach_character(
             circle((20, 18, 18), (eye_cx + gaze[0], eye_cy + gaze[1]), 1.25)
             circle((255, 255, 255), (eye_cx + gaze[0] - 0.8, eye_cy + gaze[1] - 0.9), 0.65)
             line(hair_dark, [(eye_cx - 4.5, eye_cy - 4.2), (eye_cx + 4.5, eye_cy - 4.5)], 1.0)
+            if reaction == "best":
+                circle(
+                    (255, 255, 255),
+                    (eye_cx + gaze[0] + 1.15, eye_cy + gaze[1] - 0.75),
+                    0.45,
+                )
+                pygame.draw.arc(
+                    canvas,
+                    skin_shadow,
+                    r(
+                        eye_cx - eye_w / 2,
+                        eye_cy - eye_h / 2 + 1.0,
+                        eye_w,
+                        eye_h,
+                    ),
+                    math.pi * 0.16,
+                    math.pi * 0.84,
+                    max(1, round(0.75 * sx)),
+                )
 
     brow_y = 47 + head_y
-    if reaction in ("best", "excellent", "great", "brilliant"):
+    if reaction == "best":
+        # Higher two-segment arches give Best an unmistakable delighted
+        # look without borrowing Book's glasses or Brilliant's wide eyes.
+        line(
+            hair_dark,
+            [
+                (head_cx - 19, brow_y + 0.3),
+                (head_cx - 13, brow_y - 3.3),
+                (head_cx - 6.5, brow_y - 0.7),
+            ],
+            2.25,
+        )
+        line(
+            hair_dark,
+            [
+                (head_cx + 6.5, brow_y - 0.7),
+                (head_cx + 13, brow_y - 3.3),
+                (head_cx + 19, brow_y + 0.3),
+            ],
+            2.25,
+        )
+        line(
+            hair_light,
+            [(head_cx - 16, brow_y - 1.2), (head_cx - 12, brow_y - 3.9)],
+            0.65,
+        )
+        line(
+            hair_light,
+            [(head_cx + 12, brow_y - 3.9), (head_cx + 16, brow_y - 1.2)],
+            0.65,
+        )
+    elif reaction in ("excellent", "great", "brilliant"):
         line(hair_dark, [(head_cx - 18, brow_y + 1), (head_cx - 7, brow_y - 2)], 2)
         line(hair_dark, [(head_cx + 7, brow_y - 2), (head_cx + 18, brow_y + 1)], 2)
     elif reaction == "miss":
@@ -15388,6 +15604,33 @@ def _draw_game_review_coach_character(
             blush = pygame.Surface((int(16 * sx), int(9 * sy)), pygame.SRCALPHA)
             pygame.draw.ellipse(blush, (238, 130, 116, 62), blush.get_rect())
             canvas.blit(blush, p(head_cx + side * 20 - 8, 66 + head_y))
+
+    if reaction == "best":
+        # Lifted-cheek creases work for both the static grin and Piper's
+        # animated speaking mouth.
+        for side in (-1, 1):
+            line(
+                skin_shadow,
+                [
+                    (head_cx + side * 4.5, 68 + head_y),
+                    (head_cx + side * 10.5, 71 + head_y),
+                    (head_cx + side * 16.0, 72.5 + head_y),
+                ],
+                0.8,
+            )
+            line(
+                skin_shadow,
+                [
+                    (head_cx + side * 13.5, 75 + head_y),
+                    (head_cx + side * 15.5, 72.5 + head_y),
+                ],
+                0.9,
+            )
+        line(
+            skin_shadow,
+            [(head_cx - 2.2, 87 + head_y), (head_cx + 2.2, 87 + head_y)],
+            0.7,
+        )
 
     mouth_y = 76 + head_y
     if mouth_open > 0.03:
@@ -15463,7 +15706,49 @@ def _draw_game_review_coach_character(
             ],
             1.4,
         )
-    elif reaction in ("best", "brilliant"):
+    elif reaction == "best":
+        # A broader, toothy grin: lip shadow, shaped upper teeth with a
+        # centre incisor line, a hint of lower teeth, tongue, and lifted
+        # corners. It remains below the stubble so the smile stays clear.
+        ellipse((104, 45, 42), (head_cx - 11, mouth_y - 3.5, 22, 15))
+        ellipse((83, 35, 34), (head_cx - 9.5, mouth_y - 2.0, 19, 12.5))
+        ellipse((196, 91, 86), (head_cx - 5.5, mouth_y + 5.0, 11, 5.5))
+        ellipse((255, 255, 255), (head_cx - 8.5, mouth_y - 2.8, 17, 6.4))
+        ellipse(skin, (head_cx - 11, mouth_y - 8.5, 22, 6.2))
+        line(
+            (205, 205, 205),
+            [(head_cx, mouth_y - 1.2), (head_cx, mouth_y + 3.2)],
+            0.65,
+        )
+        line(
+            (225, 225, 225),
+            [(head_cx - 4.2, mouth_y - 0.6), (head_cx - 4.2, mouth_y + 2.6)],
+            0.5,
+        )
+        line(
+            (225, 225, 225),
+            [(head_cx + 4.2, mouth_y - 0.6), (head_cx + 4.2, mouth_y + 2.6)],
+            0.5,
+        )
+        ellipse((245, 248, 248), (head_cx - 4.5, mouth_y + 8.0, 9, 2.4))
+        pygame.draw.arc(
+            canvas,
+            (150, 70, 58),
+            r(head_cx - 10.5, mouth_y - 6.0, 21, 16),
+            math.pi * 1.08,
+            math.pi * 1.92,
+            max(1, round(1.25 * sx)),
+        )
+        for side in (-1, 1):
+            line(
+                (126, 55, 48),
+                [
+                    (head_cx + side * 9.5, mouth_y + 0.8),
+                    (head_cx + side * 13.0, mouth_y - 1.8),
+                ],
+                1.15,
+            )
+    elif reaction == "brilliant":
         ellipse((126, 55, 48), (head_cx - 9, mouth_y - 3, 18, 12))
         ellipse((255, 255, 255), (head_cx - 7, mouth_y - 3, 14, 5))
         ellipse(skin, (head_cx - 10, mouth_y - 8, 20, 6))
@@ -15893,7 +16178,232 @@ def _draw_game_review_coach_character(
                     ],
                     0.55,
                 )
-    elif reaction in ("best", "excellent", "great", "brilliant"):
+    elif reaction == "best":
+        # Best gets a dedicated top-choice celebration rather than sharing
+        # Excellent/Great's simple thumb: a detailed thumbs-up on the
+        # viewer's right, a left fist pump, and a floating two-tone star
+        # that bobs and slowly rocks over the raised thumb.
+        body_y = bob * 0.25
+        float_y = math.sin(time_ms / 390.0) * 1.05
+        star_centre = (101.0, 57.0 + head_y + float_y)
+        star_radius = 9.4 + best_pulse * 1.15
+        star_rotation = -math.pi / 2 + math.sin(time_ms / 520.0) * 0.09
+        best_star = star_points(
+            star_centre, star_radius, star_radius * 0.49, star_rotation
+        )
+
+        # Orbital guide arcs and a dropping-shadow star give the floating
+        # emblem depth before either hand is drawn over its trail.
+        for start, end in ((0.18, 1.28), (2.05, 3.05), (3.65, 4.55)):
+            pygame.draw.arc(
+                canvas,
+                (105, 196, 112),
+                r(
+                    star_centre[0] - 13.5,
+                    star_centre[1] - 13.5,
+                    27,
+                    27,
+                ),
+                math.pi * start,
+                math.pi * end,
+                max(1, round(1.0 * sx)),
+            )
+        poly(
+            (54, 91, 48),
+            [(point_x, point_y + 1.4) for point_x, point_y in best_star],
+        )
+        poly((255, 214, 92), best_star)
+        # Shade the lower/right facets, then add a small polished centre.
+        poly(
+            (238, 174, 61),
+            [
+                star_centre,
+                best_star[2],
+                best_star[3],
+                best_star[4],
+                best_star[5],
+                best_star[6],
+            ],
+        )
+        poly(
+            (255, 237, 165),
+            star_points(star_centre, star_radius * 0.46, star_radius * 0.22, star_rotation),
+        )
+        line((146, 104, 28), best_star, 0.85, closed=True)
+        circle(
+            (255, 255, 245),
+            (star_centre[0] - 2.7, star_centre[1] - 3.1),
+            1.15,
+        )
+        for trail_index in range(3):
+            circle(
+                (255, 220, 115),
+                (
+                    98.8 - trail_index * 2.0,
+                    68.6 + head_y + trail_index * 2.5,
+                ),
+                0.95 - trail_index * 0.16,
+            )
+
+        # Five-point twinkles in the rating's green/gold palette. Their
+        # radii pulse out of phase with one another and with the main star.
+        for twinkle_index, (twinkle_x, twinkle_y, base_radius, colour) in enumerate(
+            (
+                (16.0, 28.0, 4.0, (255, 220, 110)),
+                (22.0, 59.0, 3.1, (151, 222, 122)),
+                (103.0, 33.0, 3.5, (255, 240, 170)),
+                (88.0, 72.0, 2.7, (255, 214, 92)),
+            )
+        ):
+            twinkle_pulse = 0.5 + 0.5 * math.sin(
+                time_ms / 310.0 + twinkle_index * 1.7
+            )
+            twinkle_radius = base_radius * (0.82 + twinkle_pulse * 0.30)
+            poly(
+                colour,
+                star_points(
+                    (twinkle_x, twinkle_y + head_y),
+                    twinkle_radius,
+                    twinkle_radius * 0.38,
+                    -math.pi / 2 + time_ms / 900.0 + twinkle_index * 0.4,
+                ),
+            )
+
+        # A few restrained confetti dashes around the shoulders.
+        for confetti in (
+            ((18, 76), (22, 73), (105, 196, 112)),
+            ((103, 80), (107, 77), (255, 214, 92)),
+            ((25, 42), (29, 45), (105, 196, 112)),
+            ((94, 45), (98, 42), (255, 220, 110)),
+        ):
+            start, end, colour = confetti
+            line(
+                colour,
+                [(start[0], start[1] + head_y), (end[0], end[1] + head_y)],
+                1.05,
+            )
+
+        # Left fist pump: sleeve, cuff, four knuckle bumps, grooves, and
+        # a thumb folded across the front of the fist. Short speed lines
+        # sit outside the hand so its silhouette stays clean at dock size.
+        line(jacket_dark, [(37, 110 + body_y), (23, 101 + head_y)], 8)
+        line(jacket, [(36, 108 + body_y), (24, 100 + head_y)], 4.5)
+        ellipse(jacket_dark, (19.0, 99.5 + head_y, 12.5, 8.5))
+        ellipse(shirt, (20.3, 100.3 + head_y, 10.0, 6.5))
+        pygame.draw.rect(
+            canvas,
+            skin_shadow,
+            r(12.6, 92.6 + head_y, 17.0, 14.0),
+            border_radius=int(3.2 * sx),
+        )
+        pygame.draw.rect(
+            canvas,
+            skin,
+            r(11.5, 91.5 + head_y, 17.0, 14.0),
+            border_radius=int(3.2 * sx),
+        )
+        for knuckle_x in (14.8, 18.6, 22.4, 26.0):
+            circle(skin, (knuckle_x, 92.2 + head_y), 2.55)
+        for groove_x in (16.7, 20.5, 24.2):
+            line(
+                skin_shadow,
+                [(groove_x, 92.8 + head_y), (groove_x, 98.0 + head_y)],
+                0.6,
+            )
+        ellipse(skin, (19.5, 98.4 + head_y, 8.5, 5.2))
+        line(
+            skin_shadow,
+            [(20.1, 100.7 + head_y), (27.2, 99.7 + head_y)],
+            0.6,
+        )
+        for speed_start, speed_end in (
+            ((4.5, 92.5), (9.5, 94.0)),
+            ((3.5, 99.5), (9.0, 99.5)),
+            ((5.0, 106.5), (10.0, 104.5)),
+        ):
+            line(
+                (255, 214, 92),
+                [
+                    (speed_start[0], speed_start[1] + head_y),
+                    (speed_end[0], speed_end[1] + head_y),
+                ],
+                0.95,
+            )
+
+        # Right thumbs-up: putting the broad thumb on the fist's inner
+        # edge (instead of centring a narrow digit) makes the gesture
+        # unambiguous. It sits behind the curled fingers and carries a
+        # thumbnail and joint crease; the fist has bumps/grooves and cuff.
+        line(jacket_dark, [(82, 110 + body_y), (99, 99 + head_y)], 9)
+        line(jacket, [(84, 108 + body_y), (98, 98 + head_y)], 5)
+        ellipse(jacket_dark, (91.0, 95.0 + head_y, 15.5, 10.5))
+        ellipse(shirt, (92.4, 96.0 + head_y, 12.5, 7.8))
+        # Draw the thumb as a blunt, slightly outward-leaning polygon.
+        # A shadow copy gives it an outline without introducing a dark
+        # cartoon stroke that would clash with the rest of Nolan.
+        thumb_points = [
+            (93.0, 89.5 + head_y),
+            (91.2, 79.0 + head_y),
+            (91.7, 74.0 + head_y),
+            (94.0, 71.8 + head_y),
+            (97.2, 73.0 + head_y),
+            (98.2, 78.5 + head_y),
+            (97.4, 89.0 + head_y),
+        ]
+        poly(
+            skin_shadow,
+            [(point_x + 1.0, point_y + 0.8) for point_x, point_y in thumb_points],
+        )
+        poly(skin, thumb_points)
+        ellipse((250, 222, 199), (92.3, 72.5 + head_y, 4.1, 5.1))
+        line(
+            skin_shadow,
+            [(92.0, 81.8 + head_y), (97.3, 80.9 + head_y)],
+            0.65,
+        )
+        pygame.draw.rect(
+            canvas,
+            skin_shadow,
+            r(93.4, 87.0 + head_y, 17.8, 14.8),
+            border_radius=int(3.4 * sx),
+        )
+        pygame.draw.rect(
+            canvas,
+            skin,
+            r(92.3, 85.9 + head_y, 17.8, 14.8),
+            border_radius=int(3.4 * sx),
+        )
+        # Three stacked, outlined capsules read as curled fingers even
+        # after the 3x sprite is downscaled to the Game Review dock.
+        for finger_y in (86.8, 91.0, 95.2):
+            finger_box = (97.0, finger_y + head_y, 12.2, 4.7)
+            ellipse(skin, finger_box)
+            ellipse(skin_shadow, finger_box, 0.62)
+            line(
+                skin_shadow,
+                [
+                    (100.0, finger_y + 1.1 + head_y),
+                    (100.0, finger_y + 3.6 + head_y),
+                ],
+                0.5,
+            )
+        line(
+            skin_shadow,
+            [(96.9, 85.8 + head_y), (97.8, 99.4 + head_y)],
+            0.75,
+        )
+        for tick_angle in (-0.75, -0.30, 0.15):
+            tick_x = 93.8 + math.sin(tick_angle) * 8.5
+            tick_y = 72.5 + head_y - math.cos(tick_angle) * 2.6
+            line(
+                (255, 220, 115),
+                [
+                    (tick_x, tick_y),
+                    (tick_x + math.sin(tick_angle) * 3.0, tick_y - 3.0),
+                ],
+                0.9,
+            )
+    elif reaction in ("excellent", "great", "brilliant"):
         line(jacket_dark, [(84, 108 + bob * 0.25), (98, 94 + head_y)], 7)
         circle(skin, (100, 91 + head_y), 6)
         pygame.draw.rect(canvas, skin, r(97, 80 + head_y, 5, 10), border_radius=int(2 * sx))
