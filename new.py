@@ -192,6 +192,194 @@ def play_sound(sound_name):
     return True
 
 
+# --- Shared loading activity -------------------------------------------------
+# Expensive model/book loaders often run in worker threads. They must never
+# draw with pygame themselves (SDL display work belongs on the main thread),
+# so they only publish a small thread-safe activity record here. The main
+# loop renders it as a loading card immediately before every flip.
+_loading_activity_lock = threading.Lock()
+_loading_activities = {}
+_loading_activity_sequence = 0
+_startup_loading_token = None
+
+
+def _begin_loading_activity(title, detail="", progress=None):
+    """Publish a loading activity and return its opaque completion token."""
+    global _loading_activity_sequence
+    with _loading_activity_lock:
+        _loading_activity_sequence += 1
+        token = _loading_activity_sequence
+        _loading_activities[token] = {
+            "title": str(title or "Loading"),
+            "detail": str(detail or ""),
+            "progress": progress,
+            "started_at": time.monotonic(),
+            "sequence": token,
+        }
+    return token
+
+
+def _end_loading_activity(token):
+    """Remove a loading activity; safe to call more than once."""
+    if token is None:
+        return
+    with _loading_activity_lock:
+        _loading_activities.pop(token, None)
+
+
+def get_loading_activity_snapshot():
+    """Return the newest active loading activity, or ``None`` when idle."""
+    with _loading_activity_lock:
+        if not _loading_activities:
+            return None
+        activity = max(
+            _loading_activities.values(), key=lambda item: item["sequence"]
+        )
+        return dict(activity)
+
+
+def draw_loading_overlay(surface):
+    """Draw the current loading activity as a centred card over the UI."""
+    activity = get_loading_activity_snapshot()
+    if activity is None or surface is None:
+        return False
+
+    width, height = surface.get_size()
+    dim = pygame.Surface((width, height), pygame.SRCALPHA)
+    dim.fill((5, 8, 16, 155))
+    surface.blit(dim, (0, 0))
+
+    card_w = min(500, max(280, width - 48))
+    card_h = 196
+    card = pygame.Rect(
+        (width - card_w) // 2,
+        (height - card_h) // 2,
+        card_w,
+        card_h,
+    )
+    pygame.draw.rect(surface, (8, 10, 20), card.move(0, 4), border_radius=20)
+    body = pygame.Surface(card.size, pygame.SRCALPHA)
+    for row in range(card.height):
+        colour = _lerp_color(
+            (48, 55, 104), (25, 67, 82), row / max(1, card.height - 1)
+        )
+        pygame.draw.line(body, (*colour, 255), (0, row), (card.width - 1, row))
+    sheen = pygame.Surface(card.size, pygame.SRCALPHA)
+    pygame.draw.polygon(
+        sheen,
+        (255, 255, 255, 18),
+        [
+            (-30, card.height),
+            (card.width * 0.38, 0),
+            (card.width * 0.58, 0),
+            (card.width * 0.14, card.height),
+        ],
+    )
+    body.blit(sheen, (0, 0))
+    mask = pygame.Surface(card.size, pygame.SRCALPHA)
+    pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=20)
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    surface.blit(body, card.topleft)
+    pygame.draw.rect(surface, (165, 178, 235), card, 2, border_radius=20)
+    pygame.draw.rect(
+        surface,
+        (225, 235, 255),
+        card.inflate(-4, -4),
+        1,
+        border_radius=17,
+    )
+
+    now_ms = pygame.time.get_ticks()
+    spinner_centre = (card.centerx, card.y + 43)
+    pygame.draw.circle(surface, (24, 30, 54), spinner_centre, 22)
+    pygame.draw.circle(surface, (125, 165, 220), spinner_centre, 22, 2)
+    start_angle = -(now_ms / 260.0) % (2.0 * math.pi)
+    pygame.draw.arc(
+        surface,
+        (150, 235, 180),
+        pygame.Rect(spinner_centre[0] - 15, spinner_centre[1] - 15, 30, 30),
+        start_angle,
+        start_angle + math.pi * 1.35,
+        4,
+    )
+    pygame.draw.circle(surface, (255, 214, 92), spinner_centre, 3)
+
+    title_text = _elide_text(activity["title"], font_large, card.width - 44)
+    title = font_large.render(title_text, True, (248, 250, 255))
+    title_shadow = font_large.render(title_text, True, (15, 18, 38))
+    title_rect = title.get_rect(center=(card.centerx, card.y + 82))
+    surface.blit(title_shadow, title_rect.move(0, 1))
+    surface.blit(title, title_rect)
+
+    elapsed = max(0.0, time.monotonic() - float(activity["started_at"]))
+    details = [activity["detail"]] if activity["detail"] else []
+    if elapsed >= 1.0:
+        details.append(f"{elapsed:.0f}s")
+    detail_text = _elide_text(" · ".join(details), font_small, card.width - 44)
+    if detail_text:
+        detail = font_small.render(detail_text, True, (205, 218, 245))
+        surface.blit(
+            detail, detail.get_rect(center=(card.centerx, card.y + 110))
+        )
+
+    bar = pygame.Rect(card.x + 28, card.y + 137, card.width - 56, 12)
+    pygame.draw.rect(surface, (22, 28, 50), bar, border_radius=6)
+    raw_progress = activity.get("progress")
+    if raw_progress is None:
+        segment_w = max(42, bar.width // 4)
+        travel = max(1, bar.width - segment_w)
+        segment_x = bar.x + int(((now_ms // 12) % (travel * 2)))
+        if segment_x > bar.x + travel:
+            segment_x = bar.x + travel * 2 - (segment_x - bar.x)
+        pygame.draw.rect(
+            surface,
+            (112, 218, 155),
+            (segment_x, bar.y, segment_w, bar.height),
+            border_radius=6,
+        )
+        progress_label = "Please wait…"
+    else:
+        progress = max(0.0, min(1.0, float(raw_progress)))
+        fill_w = round(bar.width * progress)
+        if fill_w:
+            pygame.draw.rect(
+                surface,
+                (112, 218, 155),
+                (bar.x, bar.y, fill_w, bar.height),
+                border_radius=6,
+            )
+        progress_label = f"{round(progress * 100)}%"
+    pygame.draw.rect(surface, (150, 170, 220), bar, 1, border_radius=6)
+    label = font_tiny.render(progress_label, True, (190, 205, 235))
+    surface.blit(
+        label, label.get_rect(center=(card.centerx, card.y + 166))
+    )
+    return True
+
+
+def show_startup_loading(title, detail="", progress=None):
+    """Present one synchronous startup step before the main loop starts."""
+    global _startup_loading_token
+    _end_loading_activity(_startup_loading_token)
+    _startup_loading_token = _begin_loading_activity(title, detail, progress)
+    try:
+        screen.fill(BG_COLOR)
+        draw_loading_overlay(screen)
+        pygame.display.flip()
+        pygame.event.pump()
+    except Exception:
+        # Loading presentation is a courtesy only; never let it prevent the
+        # application itself from starting.
+        pass
+
+
+def finish_startup_loading():
+    """Clear the startup activity once the normal frame loop takes over."""
+    global _startup_loading_token
+    _end_loading_activity(_startup_loading_token)
+    _startup_loading_token = None
+
+
 # --- Ctypes: Always on Top ---
 # NOTE: the Win32 calls below MUST be prototyped with pointer-sized HWND
 # arguments. The previous version passed plain Python ints through
@@ -1629,6 +1817,47 @@ def preload_piece_images(themes=None):
     return loaded
 
 
+_piece_shadow_cache = {}
+
+
+def _draw_piece_ground_shadow(surface, centre, piece=None, alpha=88):
+    """Draw a cached soft elliptical shadow under a board piece.
+
+    One small surface per piece-type/alpha is reused for every frame, so
+    settled and sliding pieces gain depth without allocating or blurring a
+    shadow sprite for each piece each frame.
+    """
+    piece_type = getattr(piece, "piece_type", None)
+    width = {
+        chess.PAWN: 38,
+        chess.KNIGHT: 46,
+        chess.BISHOP: 46,
+        chess.ROOK: 50,
+        chess.QUEEN: 56,
+        chess.KING: 56,
+    }.get(piece_type, 48)
+    height = 13
+    alpha = max(0, min(160, int(alpha)))
+    cache_key = (width, height, alpha)
+    shadow = _piece_shadow_cache.get(cache_key)
+    if shadow is None:
+        shadow = pygame.Surface((width + 10, height + 10), pygame.SRCALPHA)
+        for inset, fraction in ((0, 0.30), (3, 0.52), (6, 0.76), (9, 1.0)):
+            rect = pygame.Rect(
+                5 + inset,
+                5 + inset // 2,
+                max(1, width - inset * 2),
+                max(1, height - inset),
+            )
+            pygame.draw.ellipse(
+                shadow,
+                (12, 10, 8, round(alpha * fraction)),
+                rect,
+            )
+        _piece_shadow_cache[cache_key] = shadow
+    surface.blit(shadow, shadow.get_rect(center=centre))
+
+
 available_themes = get_available_themes()
 config = load_config()
 # Resolve theme from config, fallback to classic/first available
@@ -1680,15 +1909,16 @@ analysis_overlay_enabled = {
     for key in ANALYSIS_OVERLAY_KEYS
 }
 
-# Pieces Style menu layout & scrolling — two columns of visual style cards
-# below a larger live preview. Cards are tall enough to show sample pieces,
-# the style name and its source instead of being text-only buttons.
+# Pieces Style menu layout & scrolling — three columns of visual style
+# cards below a larger live preview, using the same 600 px content column
+# as Analysis Settings. Cards show sample pieces, the style name and its
+# source instead of being text-only buttons.
 THEME_PREVIEW_H = 126
 THEME_PREVIEW_Y = 82
 THEME_LIST_TOP = 238
 THEME_ITEM_HEIGHT = 62
 THEME_ITEM_GAP = 10
-THEME_ITEM_WIDTH = 190
+THEME_ITEM_WIDTH = 192
 THEME_COL_GAP = 12
 THEME_LIST_BOTTOM = HEIGHT - 40
 theme_scroll_offset = 0.0
@@ -1825,7 +2055,7 @@ settings_button_rect = pygame.Rect(
     WIDTH - PADDING - 50, _button_y, 50, 30
 )
 new_game_button_rect = pygame.Rect(
-    settings_button_rect.x - 10 - 50, _button_y, 50, 30
+    settings_button_rect.x - 10 - 110, _button_y, 110, 30
 )
 flip_button_rect = pygame.Rect(
     new_game_button_rect.x - 10 - 50, _button_y, 50, 30
@@ -1920,6 +2150,8 @@ restart_requested = False
 
 # --- Opening Tracking ---
 current_opening_name = ""
+_opening_marquee_name = ""
+_opening_marquee_started_ms = None
 
 
 # --- Board orientation & layout helpers (flip + eval-side) ---
@@ -4512,6 +4744,30 @@ def load_game_review_opening_book(directory=None, force_reload=False):
         return book
 
 
+def preload_opening_books():
+    """Warm both opening-name/book caches before the first game starts.
+
+    ``openings`` (the lightweight ``openings.json`` lookup used by the info
+    panel) is loaded during module initialisation. The much larger local
+    Lichess TSV tree used for Game Review Book Moves used to be parsed only
+    when a review first asked for it; parse/cache it during the visible
+    startup sequence instead. Missing optional files are already represented
+    by an empty book and are not a startup error.
+    """
+    try:
+        book = load_game_review_opening_book()
+    except Exception as exc:
+        # Opening data is optional local content; do not let a malformed
+        # user-supplied TSV keep the whole application from starting. A
+        # later Game Review can retry once the files are fixed.
+        print(f"Opening book preload skipped: {exc}")
+        book = {}
+    return {
+        "named_openings": len(openings or {}),
+        "book_entries": int((book or {}).get("entries", 0)),
+    }
+
+
 def get_game_review_book_move(board, move, sequence_uci=None, book=None):
     """Return Book Move metadata for ``move``, or ``None`` if not in book."""
     if board is None or move is None:
@@ -5207,7 +5463,7 @@ def _download_game_review_piper_voice(request_id=None):
     return find_game_review_piper_model()
 
 
-def _load_game_review_piper_voice(request_id=None):
+def _load_game_review_piper_voice_impl(request_id=None):
     """Load and cache Piper's northern_english_male[medium] voice."""
     global _game_review_piper_voice, _game_review_piper_model_path
     model_path = find_game_review_piper_model()
@@ -5240,6 +5496,20 @@ def _load_game_review_piper_voice(request_id=None):
     _game_review_piper_voice = piper_voice_class.load(model_path)
     _game_review_piper_model_path = model_path
     return _game_review_piper_voice
+
+
+def _load_game_review_piper_voice(request_id=None):
+    """Load Piper, publishing the shared loading overlay while it works."""
+    if _game_review_piper_voice is not None:
+        return _load_game_review_piper_voice_impl(request_id)
+    token = _begin_loading_activity(
+        "Loading Coach Nolan's voice",
+        "Piper · northern_english_male (medium)",
+    )
+    try:
+        return _load_game_review_piper_voice_impl(request_id)
+    finally:
+        _end_loading_activity(token)
 
 
 def synthesise_game_review_speech(text, request_id=None):
@@ -5635,7 +5905,56 @@ def update_opening_name(board):
 
 def reset_opening():
     global current_opening_name
+    global _opening_marquee_name, _opening_marquee_started_ms
     current_opening_name = ""
+    _opening_marquee_name = ""
+    _opening_marquee_started_ms = None
+
+
+def _opening_marquee_offset(name, text_width, viewport_width, time_ms=None):
+    """Horizontal offset for a long opening name in its clipped viewport.
+
+    Short names are static. A long name holds at its beginning briefly,
+    slides left until it has completely left the viewport, then re-enters
+    from the right and settles back at the beginning. Restarting the cycle
+    whenever the displayed name changes means a newly reached opening is
+    always first shown from its start.
+    """
+    global _opening_marquee_name, _opening_marquee_started_ms
+    text_width = int(text_width)
+    viewport_width = int(viewport_width)
+    if viewport_width <= 0 or text_width <= viewport_width:
+        _opening_marquee_name = str(name or "")
+        _opening_marquee_started_ms = None
+        return 0
+
+    if time_ms is None:
+        time_ms = pygame.time.get_ticks()
+    time_ms = int(time_ms)
+    name_text = str(name or "")
+    if name_text != _opening_marquee_name or _opening_marquee_started_ms is None:
+        _opening_marquee_name = name_text
+        _opening_marquee_started_ms = time_ms
+
+    elapsed = max(0, time_ms - int(_opening_marquee_started_ms))
+    speed_px_per_second = 55.0
+    hold_ms = 1100.0
+    exit_ms = text_width / speed_px_per_second * 1000.0
+    enter_ms = viewport_width / speed_px_per_second * 1000.0
+    cycle_ms = hold_ms + exit_ms + enter_ms
+    cycle_elapsed = elapsed % cycle_ms if cycle_ms > 0 else 0.0
+
+    if cycle_elapsed < hold_ms:
+        return 0
+    if cycle_elapsed < hold_ms + exit_ms:
+        travelled = (cycle_elapsed - hold_ms) / 1000.0 * speed_px_per_second
+        return -round(travelled)
+    travelled = (
+        (cycle_elapsed - hold_ms - exit_ms)
+        / 1000.0
+        * speed_px_per_second
+    )
+    return round(viewport_width - travelled)
 
 
 def get_legal_squares(board, selected_sq):
@@ -7595,7 +7914,7 @@ def draw_new_game_button(screen, mouse_pos):
         accent_colour = _lerp_color(
             bottom_colour, (142, 237, 171), hover_amount
         )
-        accent_w = int(26 * hover_amount)
+        accent_w = int(44 * hover_amount)
         if accent_w >= 2:
             pygame.draw.line(
                 screen,
@@ -7605,21 +7924,24 @@ def draw_new_game_button(screen, mouse_pos):
                 2,
             )
 
-    # Badge + label are laid out as one centred group. The fallback steps
-    # keep the group inside the fixed 50 px button with wider system fonts.
+    # Badge + label are laid out as one centred group. The wider button
+    # carries the full "New Game" label; the fallback steps still keep the
+    # group inside it with unusually wide system fonts.
     text_colour = _lerp_color(
         (226, 246, 231), (255, 255, 255), hover_amount
     )
-    text = font_small.render("New", True, text_colour)
+    label_font = font_small
+    text = label_font.render("New Game", True, text_colour)
     icon_radius = 7
-    gap = 4
+    gap = 5
     group_w = icon_radius * 2 + gap + text.get_width()
-    if group_w > visual_rect.width - 5:
+    if group_w > visual_rect.width - 8:
         icon_radius = 6
-        gap = 2
+        gap = 3
         group_w = icon_radius * 2 + gap + text.get_width()
-    if group_w > visual_rect.width - 4:
-        text = font_tiny.render("New", True, text_colour)
+    if group_w > visual_rect.width - 6:
+        label_font = font_tiny
+        text = label_font.render("New Game", True, text_colour)
         group_w = icon_radius * 2 + gap + text.get_width()
 
     group_x = visual_rect.centerx - group_w // 2
@@ -7636,9 +7958,7 @@ def draw_new_game_button(screen, mouse_pos):
     text_rect = text.get_rect(
         midleft=(group_x + icon_radius * 2 + gap, visual_rect.centery)
     )
-    shadow_text = font_small.render("New", True, (17, 45, 27))
-    if shadow_text.get_width() != text.get_width():
-        shadow_text = font_tiny.render("New", True, (17, 45, 27))
+    shadow_text = label_font.render("New Game", True, (17, 45, 27))
     screen.blit(shadow_text, text_rect.move(0, 1))
     screen.blit(text, text_rect)
 
@@ -7943,7 +8263,7 @@ def _pieces_style_layout(themes, offset_x=0, offset_y=0):
     Keeping these calculations in one place prevents the visual cards and
     their hit-boxes drifting apart when the menu layout changes.
     """
-    cols = 2
+    cols = 3
     rows = (len(themes) + cols - 1) // cols
     viewport_h = THEME_LIST_BOTTOM - THEME_LIST_TOP
     total_h = max(
@@ -7953,7 +8273,7 @@ def _pieces_style_layout(themes, offset_x=0, offset_y=0):
     max_scroll = max(0, total_h - viewport_h)
     scroll = max(0.0, min(float(theme_scroll_offset), float(max_scroll)))
     top = THEME_LIST_TOP + offset_y
-    viewport = pygame.Rect(WIDTH // 2 - 200 + offset_x, top, 400, viewport_h)
+    viewport = pygame.Rect(WIDTH // 2 - 300 + offset_x, top, 600, viewport_h)
     rects = []
     for i, (theme_id, display_name) in enumerate(themes):
         row, col = divmod(i, cols)
@@ -7988,9 +8308,9 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
 
     # --- Preview panel (reserved section) ---
     preview_rect = pygame.Rect(
-        WIDTH // 2 - 200 + offset_x,
+        WIDTH // 2 - 300 + offset_x,
         THEME_PREVIEW_Y + offset_y,
-        400,
+        600,
         THEME_PREVIEW_H,
     )
     pygame.draw.rect(screen, (34, 34, 40), preview_rect.move(0, 3), border_radius=12)
@@ -8036,7 +8356,11 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
     )
     screen.blit(status_s, status_s.get_rect(center=status_rect.center))
 
-    display_text = _elide_text(preview_display, font_small, 245)
+    display_text = _elide_text(
+        preview_display,
+        font_small,
+        max(120, status_rect.x - preview_rect.x - 28),
+    )
     name_s = font_small.render(display_text, True, TEXT_ACCENT if hovered_theme else TEXT_COLOR)
     screen.blit(name_s, (preview_rect.x + 16, preview_rect.y + 28))
     source_s = font_tiny.render(
@@ -8051,15 +8375,15 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
     prev_imgs = get_preview_images(preview_theme)
     order = ["wk", "wq", "wr", "wb", "wn", "wp", "bk", "bq", "br", "bb", "bn", "bp"]
     piece_sz = 28
-    gap_px = 5
-    per_row = 6
+    gap_px = 10
+    per_row = 12
     row_w = per_row * piece_sz + (per_row - 1) * gap_px
     start_x = preview_rect.centerx - row_w // 2
     for idx, pkey in enumerate(order):
         row = idx // per_row
         col = idx % per_row
         px = start_x + col * (piece_sz + gap_px)
-        py = preview_rect.y + 64 + row * (piece_sz + gap_px)
+        py = preview_rect.y + 72 + row * (piece_sz + gap_px)
         bg = LIGHT_SQ if (row + col) % 2 == 0 else DARK_SQ
         pygame.draw.rect(screen, bg, (px, py, piece_sz, piece_sz), border_radius=4)
         pygame.draw.rect(screen, (25, 25, 30), (px, py, piece_sz, piece_sz), 1, border_radius=4)
@@ -8079,7 +8403,7 @@ def draw_pieces_style_content(screen, offset_x=0, offset_y=0):
             ),
         )
 
-    # --- Two-column visual style cards ---
+    # --- Three-column visual style cards ---
     screen.set_clip(viewport)
     for theme_id, display_name, theme_rect in style_rects:
         if not theme_rect.colliderect(viewport):
@@ -8522,27 +8846,32 @@ def draw_polished_board_button(screen, rect, hovered):
         board_button_pulse_phase,
     )
 
-    # Two-line centred label: destination above, current selections below.
+    # Two-line label: destination above, current selections below. The
+    # text is centred in the free space between the mini-board and the
+    # right-hand piece/theme preview, rather than in the whole row; with a
+    # long style name the old row-centred subtitle ended only a couple of
+    # pixels before those previews and could collide under wider fonts.
+    text_center_x = visual_rect.x + 176
     label = "Board"
     title_colour = _lerp_color(
         (244, 238, 226), (255, 255, 255), hover_amount
     )
     title = font_large.render(label, True, title_colour)
     title_rect = title.get_rect(
-        center=(visual_rect.centerx, visual_rect.centery - 9)
+        center=(text_center_x, visual_rect.centery - 9)
     )
     title_shadow = font_large.render(label, True, (24, 18, 11))
     screen.blit(title_shadow, title_rect.move(0, 1))
     screen.blit(title, title_rect)
 
     subtitle_text = f"Pieces: {piece_name} · Board: {board_name}"
-    subtitle_text = _elide_text(subtitle_text, font_tiny, 204)
+    subtitle_text = _elide_text(subtitle_text, font_tiny, 212)
     subtitle_colour = _lerp_color(
         (202, 190, 168), light_colour, 0.38 * hover_amount
     )
     subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
     subtitle_rect = subtitle.get_rect(
-        center=(visual_rect.centerx, visual_rect.centery + 15)
+        center=(text_center_x, visual_rect.centery + 15)
     )
     subtitle_shadow = font_tiny.render(
         subtitle_text, True, (24, 18, 11)
@@ -8640,7 +8969,7 @@ def draw_polished_board_button(screen, rect, hovered):
 
 
 def get_board_hub_rects(offset_x=0, offset_y=0):
-    w, h = 420, 104
+    w, h = 600, 104
     x = WIDTH // 2 - w // 2 + offset_x
     return {
         "pieces_style": pygame.Rect(x, 190 + offset_y, w, h),
@@ -8652,12 +8981,18 @@ def _draw_board_hub_card(screen, rect, title, subtitle, hovered):
     bg = (82, 82, 125) if hovered else (58, 58, 68)
     pygame.draw.rect(screen, bg, rect, border_radius=12)
     pygame.draw.rect(screen, (150, 170, 255) if hovered else MENU_BORDER_COLOR, rect, 2, border_radius=12)
+    text_x = rect.x + 164
     title_s = font_large.render(title, True, TEXT_COLOR)
-    screen.blit(title_s, (rect.x + 150, rect.y + 18))
-    sub_s = font_tiny.render(subtitle, True, TEXT_ACCENT if hovered else TEXT_MUTED)
-    screen.blit(sub_s, (rect.x + 150, rect.y + 54))
+    screen.blit(title_s, (text_x, rect.y + 18))
+    subtitle_text = _elide_text(
+        subtitle, font_tiny, max(80, rect.right - 58 - text_x)
+    )
+    sub_s = font_tiny.render(
+        subtitle_text, True, TEXT_ACCENT if hovered else TEXT_MUTED
+    )
+    screen.blit(sub_s, (text_x, rect.y + 54))
     hint_s = font_tiny.render("Open", True, TEXT_MUTED)
-    screen.blit(hint_s, (rect.x + 150, rect.y + 76))
+    screen.blit(hint_s, (text_x, rect.y + 76))
     chev = font_large.render("›", True, (200, 210, 255) if hovered else TEXT_MUTED)
     screen.blit(chev, chev.get_rect(center=(rect.right - 26, rect.centery)))
 
@@ -8680,7 +9015,7 @@ def draw_board_hub_content(screen, offset_x=0, offset_y=0):
     themes_rect = rects["board_themes"]
     board_name = BOARD_THEMES[current_board_theme]["display"]
     _draw_board_hub_card(screen, themes_rect, "Board Themes", f"Currently: {board_name}", idle and themes_rect.collidepoint(mx, my))
-    sq = 27
+    sq = 30
     for r in range(2):
         for f in range(4):
             col = LIGHT_SQ if (r + f) % 2 == 0 else DARK_SQ
@@ -8695,7 +9030,7 @@ _BOARD_THEME_BLURBS = {
 
 
 def get_board_theme_card_rects(offset_x=0, offset_y=0):
-    w, h = 420, 150
+    w, h = 600, 150
     x = WIDTH // 2 - w // 2 + offset_x
     return [
         (tid, pygame.Rect(x, 154 + i * (h + 28) + offset_y, w, h))
@@ -8718,9 +9053,10 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
         pygame.draw.rect(screen, bg, rect, border_radius=12)
         pygame.draw.rect(screen, (130, 220, 150) if is_current else (150, 170, 255) if hovered else MENU_BORDER_COLOR, rect, 2, border_radius=12)
 
-        # 4x4 mini-board preview in this theme's colours
-        sq = 26
-        bx, by = rect.x + 18, rect.y + 23
+        # 4x4 mini-board preview in this theme's colours. 28 px squares
+        # align exactly with the cached 28 px piece previews.
+        sq = 28
+        bx, by = rect.x + 18, rect.y + 19
         for r in range(4):
             for f in range(4):
                 col = theme["light"] if (r + f) % 2 == 0 else theme["dark"]
@@ -8731,17 +9067,18 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
         if "bq" in prev:
             screen.blit(prev["bq"], (bx + sq * 3, by))
 
+        text_x = rect.x + 154
         name_s = font_large.render(theme["display"], True, TEXT_COLOR)
-        screen.blit(name_s, (rect.x + 142, rect.y + 20))
+        screen.blit(name_s, (text_x, rect.y + 20))
         blurb_s = font_tiny.render(_BOARD_THEME_BLURBS.get(tid, ""), True, TEXT_MUTED)
-        screen.blit(blurb_s, (rect.x + 142, rect.y + 54))
+        screen.blit(blurb_s, (text_x, rect.y + 54))
         light_hex = "#%02x%02x%02x" % theme["light"]
         dark_hex = "#%02x%02x%02x" % theme["dark"]
         hex_s = font_tiny.render(f"Light {light_hex}   Dark {dark_hex}", True, TEXT_MUTED)
-        screen.blit(hex_s, (rect.x + 142, rect.y + 78))
+        screen.blit(hex_s, (text_x, rect.y + 78))
         # colour chips
-        pygame.draw.rect(screen, theme["light"], (rect.x + 142, rect.y + 104, 18, 18), border_radius=3)
-        pygame.draw.rect(screen, theme["dark"], (rect.x + 166, rect.y + 104, 18, 18), border_radius=3)
+        pygame.draw.rect(screen, theme["light"], (text_x, rect.y + 104, 18, 18), border_radius=3)
+        pygame.draw.rect(screen, theme["dark"], (text_x + 24, rect.y + 104, 18, 18), border_radius=3)
 
         if is_current:
             sel = font_small.render("● Selected", True, (140, 230, 160))
@@ -9172,7 +9509,16 @@ def _load_cnn_classifier():
 
 
 def _get_cnn_classifier():
-    return _load_cnn_classifier()
+    if _cnn_classifier_cache is not None:
+        return _cnn_classifier_cache
+    token = _begin_loading_activity(
+        "Loading vision model",
+        "Built-in CNN · chessbotv_cnn.pth",
+    )
+    try:
+        return _load_cnn_classifier()
+    finally:
+        _end_loading_activity(token)
 
 
 def _use_package_selected(use_package=None):
@@ -9190,7 +9536,7 @@ def _vision_backend_label(use_package=None):
     return PACKAGE_DETECTOR_NAME if _use_package_selected(use_package) else "built-in CNN"
 
 
-def _get_package_detector():
+def _load_package_detector():
     """Import and construct ``chess_fen_detector.ChessFENDetector`` once.
 
     This intentionally uses the package's documented class API rather than
@@ -9252,6 +9598,20 @@ def _get_package_detector():
         version_text = f" {version}" if version else ""
         print(f"Package vision model loaded: chess-fen-detector{version_text}.")
         return _package_detector_cache
+
+
+def _get_package_detector():
+    """Return the package detector, showing loading state on a cold load."""
+    if _package_detector_cache is not None:
+        return _package_detector_cache
+    token = _begin_loading_activity(
+        "Loading vision model",
+        f"{PACKAGE_DETECTOR_NAME} package",
+    )
+    try:
+        return _load_package_detector()
+    finally:
+        _end_loading_activity(token)
 
 
 def _ensure_vision_backend_ready(use_package=None):
@@ -15525,6 +15885,7 @@ def draw_toggle_row(screen, rect, label, subtitle, on, anim, hovered):
 
 # --- Analysis Settings board overlays ---
 _analysis_mobility_font = pygame.font.SysFont("segoeui", 11, bold=True)
+_analysis_mobility_font_small = pygame.font.SysFont("segoeui", 9, bold=True)
 _analysis_icon_cache = {}
 _analysis_overlay_cache_key = None
 _analysis_overlay_cache_data = None
@@ -15843,13 +16204,32 @@ def _pawn_is_backwards(board, square, piece):
     )
 
 
-def _pawn_is_isolated(board, square, piece, legal_destinations):
+def _pawn_has_neighbouring_pawn(board, square, piece):
     file_index = chess.square_file(square)
-    has_neighbouring_pawn = any(
+    return any(
         abs(chess.square_file(other_square) - file_index) == 1
         for other_square in board.pieces(chess.PAWN, piece.color)
     )
-    return not has_neighbouring_pawn or not legal_destinations.get(square)
+
+
+def _pawn_can_move_forward(square, piece, legal_destinations):
+    """Whether this pawn has a legal one-square forward move."""
+    file_index = chess.square_file(square)
+    rank_index = chess.square_rank(square)
+    direction = 1 if piece.color == chess.WHITE else -1
+    forward_rank = rank_index + direction
+    if not 0 <= forward_rank < 8:
+        return False
+    forward_square = chess.square(file_index, forward_rank)
+    return forward_square in legal_destinations.get(square, ())
+
+
+def _pawn_is_isolated(board, square, piece, legal_destinations):
+    """Unsupported pawn, or one that cannot advance straight ahead."""
+    return (
+        not _pawn_has_neighbouring_pawn(board, square, piece)
+        or not _pawn_can_move_forward(square, piece, legal_destinations)
+    )
 
 
 def _pawn_is_passed_close(board, square, piece):
@@ -15869,6 +16249,26 @@ def _pawn_is_passed_close(board, square, piece):
         if piece.color == chess.BLACK and enemy_rank < rank_index:
             return False
     return True
+
+
+def _pawn_overlay_category(board, square, piece, legal_destinations):
+    """Return exactly one pawn-structure category for this pawn.
+
+    The three Analysis markers are mutually exclusive. In particular, a
+    pawn that cannot move forward is categorised as isolated even if it
+    would otherwise look passed. For a pawn that can advance, an advanced
+    passed pawn keeps the passed marker instead of also being labelled
+    isolated merely because it has no neighbouring friendly pawn.
+    """
+    if not _pawn_can_move_forward(square, piece, legal_destinations):
+        return "isolated"
+    if _pawn_is_passed_close(board, square, piece):
+        return "passed"
+    if _pawn_is_backwards(board, square, piece):
+        return "backwards"
+    if not _pawn_has_neighbouring_pawn(board, square, piece):
+        return "isolated"
+    return None
 
 
 def compute_analysis_overlay_data(board):
@@ -15919,7 +16319,10 @@ def compute_analysis_overlay_data(board):
                 data["unprotected_pieces"].add(square)
 
     needs_legal_destinations = (
-        enabled["piece_mobility"] or enabled["isolated_pawn"]
+        enabled["piece_mobility"]
+        or enabled["backwards_pawn"]
+        or enabled["isolated_pawn"]
+        or enabled["passed_pawn"]
     )
     legal_destinations = (
         _legal_destinations_by_square(board)
@@ -15944,17 +16347,17 @@ def compute_analysis_overlay_data(board):
         for square, piece in piece_map.items():
             if piece.piece_type != chess.PAWN:
                 continue
-            if enabled["backwards_pawn"] and _pawn_is_backwards(
-                board, square, piece
-            ):
-                data["backwards_pawns"].add(square)
-            if enabled["isolated_pawn"] and _pawn_is_isolated(
+            # Classify first, then apply the visibility toggles. Filtering
+            # three independent predicates was what allowed one pawn to be
+            # marked passed and isolated (or backwards) at the same time.
+            category = _pawn_overlay_category(
                 board, square, piece, legal_destinations
-            ):
+            )
+            if category == "backwards" and enabled["backwards_pawn"]:
+                data["backwards_pawns"].add(square)
+            elif category == "isolated" and enabled["isolated_pawn"]:
                 data["isolated_pawns"].add(square)
-            if enabled["passed_pawn"] and _pawn_is_passed_close(
-                board, square, piece
-            ):
+            elif category == "passed" and enabled["passed_pawn"]:
                 data["passed_pawns"].add(square)
     return data
 
@@ -16034,14 +16437,17 @@ def draw_analysis_board_overlays(screen, board):
             if percent <= 0:
                 continue
             x, y = square_to_screen(square)
-            centre = (x + 15, y + SQUARE_SIZE - 15)
+            centre = (x + 16, y + SQUARE_SIZE - 16)
             colour = _mobility_colour(percent)
-            pygame.draw.circle(screen, (24, 28, 34), (centre[0], centre[1] + 1), 13)
-            pygame.draw.circle(screen, colour, centre, 12)
-            pygame.draw.circle(screen, (245, 250, 252), centre, 12, 1)
-            label = str(int(percent))
-            text = _analysis_mobility_font.render(label, True, (255, 255, 255))
-            shadow = _analysis_mobility_font.render(label, True, (25, 30, 36))
+            pygame.draw.circle(screen, (24, 28, 34), (centre[0], centre[1] + 1), 14)
+            pygame.draw.circle(screen, colour, centre, 13)
+            pygame.draw.circle(screen, (245, 250, 252), centre, 13, 1)
+            label = f"{int(percent)}%"
+            label_font = _analysis_mobility_font
+            if label_font.size(label)[0] > 22:
+                label_font = _analysis_mobility_font_small
+            text = label_font.render(label, True, (255, 255, 255))
+            shadow = label_font.render(label, True, (25, 30, 36))
             text_rect = text.get_rect(center=centre)
             screen.blit(shadow, text_rect.move(0, 1))
             screen.blit(text, text_rect)
@@ -16626,8 +17032,8 @@ def _draw_game_review_coach_character(
     line((130, 88, 24), [(79.5, 107 + bob * 0.25), (84.5, 107 + bob * 0.25)], 1.2)
 
     if reaction == "best":
-        # Raised shoulders and a swinging green-and-gold star medal make
-        # the Best pose read as "top choice" even before the hands appear.
+        # Raised shoulders make the Best pose read as "top choice" even
+        # before the hands (and the medal held in the right one) appear.
         body_y = bob * 0.25
         ellipse((58, 139, 150), (23, 98 + body_y, 28, 13))
         ellipse((58, 139, 150), (69, 98 + body_y, 28, 13))
@@ -16636,53 +17042,8 @@ def _draw_game_review_coach_character(
         line(jacket_dark, [(36, 113 + body_y), (43, 124 + body_y)], 0.9)
         line(jacket_dark, [(85, 113 + body_y), (78, 124 + body_y)], 0.9)
 
-        medal_centre = (
-            60 + bob * 0.35,
-            112 + body_y + best_pulse * 0.45,
-        )
-        # Ribbon halves disappear under the neck/collar and cross behind
-        # the medallion; fine gold edge stripes keep them readable small.
-        poly(
-            (39, 132, 76),
-            [
-                (52.5, 94 + body_y),
-                (58.5, 94 + body_y),
-                (medal_centre[0] - 1.0, medal_centre[1] - 5.0),
-                (medal_centre[0] - 5.5, medal_centre[1] - 3.5),
-            ],
-        )
-        poly(
-            (91, 184, 102),
-            [
-                (61.5, 94 + body_y),
-                (67.5, 94 + body_y),
-                (medal_centre[0] + 5.5, medal_centre[1] - 3.5),
-                (medal_centre[0] + 1.0, medal_centre[1] - 5.0),
-            ],
-        )
-        line(
-            (245, 202, 92),
-            [(54, 97 + body_y), (medal_centre[0] - 3.5, medal_centre[1] - 5.0)],
-            0.65,
-        )
-        line(
-            (245, 202, 92),
-            [(66, 97 + body_y), (medal_centre[0] + 3.5, medal_centre[1] - 5.0)],
-            0.65,
-        )
-        circle((20, 43, 39), (medal_centre[0], medal_centre[1] + 0.8), 8.7)
-        circle((245, 202, 92), medal_centre, 8.3)
-        circle((124, 190, 75), medal_centre, 6.7)
-        circle((91, 160, 58), medal_centre, 6.7, 0.8)
-        poly(
-            (255, 255, 255),
-            star_points(medal_centre, 5.2, 2.45),
-        )
-        circle(
-            (255, 246, 190),
-            (medal_centre[0] - 4.6, medal_centre[1] - 4.8),
-            1.15,
-        )
+        # The Best medal is not worn around his neck: it hangs from the
+        # raised right hand drawn in the hand/prop pass below.
 
     # Neck and ears. Nolan's broader neck/jaw match his male Piper voice.
     pygame.draw.rect(canvas, skin_shadow, r(head_cx - 8, 83 + head_y, 16, 17), border_radius=int(4 * sx))
@@ -16962,7 +17323,40 @@ def _draw_game_review_coach_character(
         )
 
     mouth_y = 76 + head_y
-    if mouth_open > 0.03:
+    if reaction == "best":
+        # Keep Best's mouth deliberately ordinary: a small friendly smile
+        # with only a modest opening while Piper is speaking. The former
+        # broad tooth/tongue construction looked over-polished and odd at
+        # dock size, especially with a large animated teeth oval.
+        mouth_h = 3.2 + 5.2 * mouth_open
+        ellipse(
+            (112, 50, 45),
+            (head_cx - 8, mouth_y - 1.5, 16, mouth_h + 3.0),
+        )
+        ellipse(skin, (head_cx - 9, mouth_y - 5.0, 18, 5.0))
+        if mouth_open > 0.08:
+            ellipse(
+                (246, 248, 248),
+                (head_cx - 5.5, mouth_y - 1.0, 11, 2.3),
+            )
+        pygame.draw.arc(
+            canvas,
+            (126, 55, 48),
+            r(head_cx - 9, mouth_y - 6.0, 18, 12),
+            math.pi * 1.08,
+            math.pi * 1.92,
+            max(1, round(1.7 * sx)),
+        )
+        for side in (-1, 1):
+            line(
+                (126, 55, 48),
+                [
+                    (head_cx + side * 8.5, mouth_y + 0.4),
+                    (head_cx + side * 11.0, mouth_y - 0.8),
+                ],
+                0.9,
+            )
+    elif mouth_open > 0.03:
         # Speaking mouth: Piper's RMS envelope opens the jaw while the
         # corners retain the current reaction's smile/frown direction.
         corner_lift = {
@@ -17035,48 +17429,6 @@ def _draw_game_review_coach_character(
             ],
             1.4,
         )
-    elif reaction == "best":
-        # A broader, toothy grin: lip shadow, shaped upper teeth with a
-        # centre incisor line, a hint of lower teeth, tongue, and lifted
-        # corners. It remains below the stubble so the smile stays clear.
-        ellipse((104, 45, 42), (head_cx - 11, mouth_y - 3.5, 22, 15))
-        ellipse((83, 35, 34), (head_cx - 9.5, mouth_y - 2.0, 19, 12.5))
-        ellipse((196, 91, 86), (head_cx - 5.5, mouth_y + 5.0, 11, 5.5))
-        ellipse((255, 255, 255), (head_cx - 8.5, mouth_y - 2.8, 17, 6.4))
-        ellipse(skin, (head_cx - 11, mouth_y - 8.5, 22, 6.2))
-        line(
-            (205, 205, 205),
-            [(head_cx, mouth_y - 1.2), (head_cx, mouth_y + 3.2)],
-            0.65,
-        )
-        line(
-            (225, 225, 225),
-            [(head_cx - 4.2, mouth_y - 0.6), (head_cx - 4.2, mouth_y + 2.6)],
-            0.5,
-        )
-        line(
-            (225, 225, 225),
-            [(head_cx + 4.2, mouth_y - 0.6), (head_cx + 4.2, mouth_y + 2.6)],
-            0.5,
-        )
-        ellipse((245, 248, 248), (head_cx - 4.5, mouth_y + 8.0, 9, 2.4))
-        pygame.draw.arc(
-            canvas,
-            (150, 70, 58),
-            r(head_cx - 10.5, mouth_y - 6.0, 21, 16),
-            math.pi * 1.08,
-            math.pi * 1.92,
-            max(1, round(1.25 * sx)),
-        )
-        for side in (-1, 1):
-            line(
-                (126, 55, 48),
-                [
-                    (head_cx + side * 9.5, mouth_y + 0.8),
-                    (head_cx + side * 13.0, mouth_y - 1.8),
-                ],
-                1.15,
-            )
     elif reaction == "brilliant":
         ellipse((126, 55, 48), (head_cx - 9, mouth_y - 3, 18, 12))
         ellipse((255, 255, 255), (head_cx - 7, mouth_y - 3, 14, 5))
@@ -17702,6 +18054,62 @@ def _draw_game_review_coach_character(
             r(92.3, 85.9 + head_y, 17.8, 14.8),
             border_radius=int(3.4 * sx),
         )
+        # The green-and-gold Best medal hangs from this raised hand. Its
+        # two ribbon straps run up into the fist, and the curled-finger
+        # capsules below are drawn over the strap tops so the medal is
+        # visibly gripped rather than floating in front of the hand.
+        medal_sway = math.sin(time_ms / 390.0) * 0.55
+        medal_centre = (
+            101.0 + medal_sway,
+            106.2 + head_y + best_pulse * 0.35,
+        )
+        poly(
+            (39, 132, 76),
+            [
+                (95.3, 92.5 + head_y),
+                (99.0, 91.8 + head_y),
+                (medal_centre[0] - 1.2, medal_centre[1] - 5.2),
+                (medal_centre[0] - 4.8, medal_centre[1] - 3.4),
+            ],
+        )
+        poly(
+            (91, 184, 102),
+            [
+                (102.5, 91.8 + head_y),
+                (106.2, 92.5 + head_y),
+                (medal_centre[0] + 4.8, medal_centre[1] - 3.4),
+                (medal_centre[0] + 1.2, medal_centre[1] - 5.2),
+            ],
+        )
+        line(
+            (245, 202, 92),
+            [
+                (97.0, 94.0 + head_y),
+                (medal_centre[0] - 3.0, medal_centre[1] - 4.8),
+            ],
+            0.6,
+        )
+        line(
+            (245, 202, 92),
+            [
+                (104.5, 94.0 + head_y),
+                (medal_centre[0] + 3.0, medal_centre[1] - 4.8),
+            ],
+            0.6,
+        )
+        circle((20, 43, 39), (medal_centre[0], medal_centre[1] + 0.7), 7.9)
+        circle((245, 202, 92), medal_centre, 7.6)
+        circle((124, 190, 75), medal_centre, 6.1)
+        circle((91, 160, 58), medal_centre, 6.1, 0.75)
+        poly(
+            (255, 255, 255),
+            star_points(medal_centre, 4.7, 2.2),
+        )
+        circle(
+            (255, 246, 190),
+            (medal_centre[0] - 4.1, medal_centre[1] - 4.3),
+            1.0,
+        )
         # Three stacked, outlined capsules read as curled fingers even
         # after the 3x sprite is downscaled to the Game Review dock.
         for finger_y in (86.8, 91.0, 95.2):
@@ -17888,13 +18296,17 @@ def _draw_game_review_button(screen, rect, hovered):
 
     if snapshot.get("active") and snapshot.get("status") == "analysing":
         subtitle_text = (
-            f"{GAME_REVIEW_COACH_NAME} is analysing · {snapshot.get('analysed_positions', 0)}/"
+            f"{GAME_REVIEW_COACH_NAME} analysing · {snapshot.get('analysed_positions', 0)}/"
             f"{snapshot.get('total_positions', 0)} positions"
         )
     elif snapshot.get("active") and snapshot.get("status") == "complete":
-        subtitle_text = "Review ready · reopen the coach for this line"
+        subtitle_text = "Coach review ready · reopen Coach Nolan"
     else:
-        subtitle_text = "Coach reactions and Stockfish move ratings for this game"
+        subtitle_text = "Coach reactions and Stockfish move ratings"
+    # Keep every state inside the free band before the play button (its
+    # circle begins at right-79), rather than letting wider fonts run
+    # underneath it or spill past the card edge.
+    subtitle_text = _elide_text(subtitle_text, font_small, 398)
     subtitle = font_small.render(subtitle_text, True, (222, 226, 255))
     screen.blit(subtitle, (visual.x + 104, visual.y + 50))
 
@@ -18293,8 +18705,8 @@ def draw_game_review_coach(screen, board, mouse_pos):
     else:
         status_text = "Game Review (experimental)"
     status_s = _game_review_font(13, False).render(status_text, True, (205, 212, 235))
-    screen.blit(status_s, (panel.x + 138, panel.y + 96))
-    bar = pygame.Rect(panel.x + 138, panel.y + 116, 180, 7)
+    screen.blit(status_s, (panel.x + 138, panel.y + 93))
+    bar = pygame.Rect(panel.x + 138, panel.y + 116, 172, 7)
     pygame.draw.rect(screen, (31, 36, 55), bar, border_radius=4)
     if progress > 0:
         pygame.draw.rect(screen, accent, (bar.x, bar.y, int(bar.width * progress), bar.height), border_radius=4)
@@ -18320,7 +18732,10 @@ def draw_game_review_coach(screen, board, mouse_pos):
     detail = detail_font.render(
         _elide_text(detail_text, detail_font, 225), True, (190, 198, 225)
     )
-    screen.blit(detail, (panel.x + 332, panel.y + 104))
+    # Sit the Move x/y detail on the progress-bar line, clear below the
+    # status line. It used to start eight pixels under "Review complete…"
+    # while overlapping that longer status horizontally.
+    screen.blit(detail, (panel.x + 328, panel.y + 112))
 
     controls = get_game_review_control_rects(panel)
     for name, rect in controls.items():
@@ -20243,12 +20658,15 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         3,
     )
 
-    # Two-line centred label, matching Board/Engine/Auto-Play polish.
+    # Two-line label, matching Board/Engine/Auto-Play polish. Its centre
+    # is shifted left so the long title/subtitle clear the eleven-badge
+    # cluster (whose icons begin at right-111) under wider system fonts.
+    text_center_x = visual_rect.x + 174
     label = "Analysis Settings"
     title_colour = _lerp_color((238, 240, 255), (255, 255, 255), hover_amount)
     title = font_large.render(label, True, title_colour)
     title_rect = title.get_rect(
-        center=(visual_rect.centerx, visual_rect.centery - 9)
+        center=(text_center_x, visual_rect.centery - 9)
     )
     title_shadow = font_large.render(label, True, (18, 17, 42))
     screen.blit(title_shadow, title_rect.move(0, 1))
@@ -20268,10 +20686,10 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         subtitle_colour = _lerp_color(
             (203, 205, 235), (240, 242, 255), hover_amount
         )
-    subtitle_text = _elide_text(subtitle_text, font_tiny, 214)
+    subtitle_text = _elide_text(subtitle_text, font_tiny, 200)
     subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
     subtitle_rect = subtitle.get_rect(
-        center=(visual_rect.centerx, visual_rect.centery + 15)
+        center=(text_center_x, visual_rect.centery + 15)
     )
     subtitle_shadow = font_tiny.render(subtitle_text, True, (18, 17, 42))
     screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
@@ -20559,21 +20977,24 @@ def draw_polished_autoplay_settings_button(screen, rect, hovered):
             screen, (255, 255, 255), (badge[0], badge[1] + 3), 1
         )
 
-    # Two-line centred label: destination above, highest-priority live
-    # Auto-Play state below (or the page's three features when all idle).
+    # Two-line label: destination above, highest-priority live Auto-Play
+    # state below (or the page's three features when all idle). Centre it
+    # in the free band before the status rails instead of in the whole
+    # row, so neither line can run into those rails.
+    text_center_x = visual_rect.x + 178
     label = "Auto-Play Settings"
     title_colour = _lerp_color(
         (237, 247, 248), (255, 255, 255), hover_amount
     )
     title = font_large.render(label, True, title_colour)
     title_rect = title.get_rect(
-        center=(visual_rect.centerx, visual_rect.centery - 9)
+        center=(text_center_x, visual_rect.centery - 9)
     )
     title_shadow = font_large.render(label, True, (16, 26, 35))
     screen.blit(title_shadow, title_rect.move(0, 1))
     screen.blit(title, title_rect)
 
-    subtitle_text = _elide_text(summary["subtitle"], font_tiny, 204)
+    subtitle_text = _elide_text(summary["subtitle"], font_tiny, 210)
     if summary["alert"]:
         subtitle_colour = (255, 166, 156)
     elif summary["live"]:
@@ -20584,7 +21005,7 @@ def draw_polished_autoplay_settings_button(screen, rect, hovered):
         )
     subtitle = font_tiny.render(subtitle_text, True, subtitle_colour)
     subtitle_rect = subtitle.get_rect(
-        center=(visual_rect.centerx, visual_rect.centery + 15)
+        center=(text_center_x, visual_rect.centery + 15)
     )
     subtitle_shadow = font_tiny.render(subtitle_text, True, (16, 26, 35))
     screen.blit(subtitle_shadow, subtitle_rect.move(0, 1))
@@ -20983,8 +21404,8 @@ if not HASH_STEPS:
 ENGINE_ROW_TOP = 120
 ENGINE_ROW_HEIGHT = 64
 ENGINE_ROW_GAP = 14
-ENGINE_ROW_WIDTH = 480
-ENGINE_SLIDER_TRACK_W = 180
+ENGINE_ROW_WIDTH = 600
+ENGINE_SLIDER_TRACK_W = 300
 ENGINE_SLIDER_TRACK_H = 6
 ENGINE_SLIDER_THUMB_R = 10
 
@@ -21009,17 +21430,23 @@ def get_engine_slider_rects(i, offset_x=0, offset_y=0):
 
 
 def get_engine_reset_rect(offset_x=0, offset_y=0):
-    reset_w, reset_h = 140, 40
+    reset_w, reset_h = 290, 40
     reset_y = ENGINE_ROW_TOP + 5 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
     return pygame.Rect(
-        WIDTH // 2 - 150 + offset_x, reset_y, reset_w, reset_h
+        WIDTH // 2 - ENGINE_ROW_WIDTH // 2 + offset_x,
+        reset_y,
+        reset_w,
+        reset_h,
     )
 
 def get_engine_save_rect(offset_x=0, offset_y=0):
-    save_w, save_h = 140, 40
+    save_w, save_h = 290, 40
     save_y = ENGINE_ROW_TOP + 5 * (ENGINE_ROW_HEIGHT + ENGINE_ROW_GAP) + 12 + offset_y
     return pygame.Rect(
-        WIDTH // 2 + 10 + offset_x, save_y, save_w, save_h
+        WIDTH // 2 + ENGINE_ROW_WIDTH // 2 - save_w + offset_x,
+        save_y,
+        save_w,
+        save_h,
     )
 
 def set_engine_slider_value(key, mouse_x, track_rect):
@@ -29836,6 +30263,11 @@ def draw_gui(
         pkey = get_piece_key(piece)
         x, y = square_to_screen(sq)
         if pkey in images:
+            _draw_piece_ground_shadow(
+                screen,
+                (x + SQUARE_SIZE // 2 + 2, y + SQUARE_SIZE - 11),
+                piece,
+            )
             screen.blit(images[pkey], (x, y))
 
     # 3b. Drag highlight for drop square
@@ -29874,6 +30306,11 @@ def draw_gui(
             ex, ey = anim_mgr.move_anim["end"]
             curr_x = sx + (ex - sx) * t
             curr_y = sy + (ey - sy) * t
+            _draw_piece_ground_shadow(
+                screen,
+                (curr_x + SQUARE_SIZE // 2 + 2, curr_y + SQUARE_SIZE - 11),
+                anim_mgr.move_anim["piece"],
+            )
             screen.blit(images[pkey], (curr_x, curr_y))
 
     if anim_mgr.rook_anim:
@@ -29884,6 +30321,11 @@ def draw_gui(
             ex, ey = anim_mgr.rook_anim["end"]
             curr_x = sx + (ex - sx) * t
             curr_y = sy + (ey - sy) * t
+            _draw_piece_ground_shadow(
+                screen,
+                (curr_x + SQUARE_SIZE // 2 + 2, curr_y + SQUARE_SIZE - 11),
+                anim_mgr.rook_anim["piece"],
+            )
             screen.blit(images[pkey], (curr_x, curr_y))
 
     # Board reset animations — multiple pieces sliding to start squares
@@ -29895,6 +30337,11 @@ def draw_gui(
             ex, ey = anim["end"]
             curr_x = sx + (ex - sx) * t
             curr_y = sy + (ey - sy) * t
+            _draw_piece_ground_shadow(
+                screen,
+                (curr_x + SQUARE_SIZE // 2 + 2, curr_y + SQUARE_SIZE - 11),
+                anim["piece"],
+            )
             screen.blit(images[pkey], (curr_x, curr_y))
 
     # Suggestion arrows — MultiPV: render all with rank medallions (#1
@@ -30045,25 +30492,44 @@ def draw_gui(
     # 6. Info panel — uses dynamic board ox for slide animation
     info_top = BOARD_OY + BOARD_WIDTH
 
-    if game_over and status_text:
+    # Opening on the left, game status in the fixed right-hand slot.
+    # Checkmate and the draw labels now use that same slot as "Check!"
+    # instead of jumping to the centre. A long opening is clipped to the
+    # remaining left-hand viewport and marquees through it, so it can
+    # never run underneath the status. In a terminal position the opening
+    # is shown once in the record row below, so it is not duplicated here.
+    status_surf = None
+    status_x = board_ox + BOARD_WIDTH
+    if status_text:
         status_surf = font_large.render(status_text, True, status_color)
-        sx = board_ox + (BOARD_WIDTH - status_surf.get_width()) // 2
-        screen.blit(status_surf, (sx, info_top + 8))
-    else:
-        opening_name = update_opening_name(board)
-        if opening_name:
-            opening_text = font_large.render(opening_name, True, TEXT_COLOR)
-            screen.blit(opening_text, (board_ox, info_top + 8))
+        status_x = board_ox + BOARD_WIDTH - status_surf.get_width()
 
-        if status_text:
-            status_surf = font_large.render(status_text, True, status_color)
-            screen.blit(
-                status_surf,
-                (
-                    board_ox + BOARD_WIDTH - status_surf.get_width(),
-                    info_top + 8,
-                ),
+    opening_name = update_opening_name(board)
+    if opening_name and not game_over:
+        opening_text = font_large.render(opening_name, True, TEXT_COLOR)
+        viewport_right = status_x - 16 if status_surf is not None else board_ox + BOARD_WIDTH
+        viewport = pygame.Rect(
+            board_ox,
+            info_top + 8,
+            max(0, viewport_right - board_ox),
+            opening_text.get_height(),
+        )
+        if viewport.width >= 40:
+            opening_offset = _opening_marquee_offset(
+                opening_name,
+                opening_text.get_width(),
+                viewport.width,
             )
+            previous_clip = screen.get_clip()
+            screen.set_clip(viewport)
+            screen.blit(
+                opening_text,
+                (viewport.x + opening_offset, viewport.y),
+            )
+            screen.set_clip(previous_clip)
+
+    if status_surf is not None:
+        screen.blit(status_surf, (status_x, info_top + 8))
 
     divider_y = info_top + 46
     pygame.draw.line(
@@ -30120,7 +30586,12 @@ def draw_gui(
         opening_name_go = update_opening_name(board)
         if opening_name_go:
             rec_label = font_small.render("Opening", True, TEXT_MUTED)
-            rec_value = font_small.render(opening_name_go, True, TEXT_COLOR)
+            rec_value_text = _elide_text(
+                opening_name_go,
+                font_small,
+                max(40, BOARD_WIDTH - rec_label.get_width() - 8),
+            )
+            rec_value = font_small.render(rec_value_text, True, TEXT_COLOR)
             screen.blit(rec_label, (board_ox, rec_y))
             screen.blit(rec_value, (board_ox + rec_label.get_width() + 8, rec_y))
     else:
@@ -30207,6 +30678,9 @@ def draw_gui(
     if show_advisor_side_dialog:
         draw_advisor_side_dialog(screen)
 
+    # Worker-thread model/book loaders only publish state; the display is
+    # still drawn here, on the pygame/main thread, immediately before flip.
+    draw_loading_overlay(screen)
     pygame.display.flip()
 
 
@@ -30223,13 +30697,27 @@ def main():
     board = chess.Board()
     anim_mgr = AnimationManager()
     check_effect = CheckEffect()
-    engine_thread = EngineThread(ENGINE_PATH, config)
 
-    # Decode the GUI piece sets once at startup. The selected vision model
-    # (local CNN or chess-fen-detector) is loaded lazily when Board
-    # Detection or Auto-play first needs it.
+    # Present each expensive startup step explicitly instead of leaving a
+    # blank/frozen window. The selected vision model itself stays lazy (so
+    # ordinary play does not pay PyTorch/package import cost), but its later
+    # worker-thread load publishes the same loading overlay.
+    show_startup_loading(
+        "Loading piece styles", "Decoding board piece images", 0.12
+    )
     preload_piece_images()
+    show_startup_loading("Loading sounds", "Preparing move audio", 0.34)
     preload_game_sounds()
+    show_startup_loading(
+        "Loading openings", "Preparing the opening books", 0.56
+    )
+    preload_opening_books()
+    show_startup_loading(
+        "Starting Stockfish", "Initialising the analysis engine", 0.80
+    )
+    engine_thread = EngineThread(ENGINE_PATH, config)
+    show_startup_loading("Ready", "Opening ChessBotV", 1.0)
+    finish_startup_loading()
 
     selected_sq = None
     dragging = False
@@ -30304,14 +30792,20 @@ def main():
                 anim_mgr, board, board.peek(), reverse=True
             )
             history_redo.append(board.pop())
+            # The reversed piece still lands on a square, so it gets the
+            # ordinary move sound; replaying a check/capture sound while
+            # undoing that move would describe the wrong transition.
+            play_sound("move")
             changed = True
         elif delta > 0 and history_redo:
             move = history_redo[-1]
+            board_before = board.copy()
             add_move_animation_for_move(
                 anim_mgr, board, move, reverse=False
             )
             history_redo.pop()
             board.push(move)
+            play_move_sound(board_before, move)
             changed = True
         if changed:
             sync_after_history_step()
@@ -31882,14 +32376,18 @@ def main():
                         if board.move_stack:
                             add_move_animation_for_move(anim_mgr, board, board.move_stack[-1], reverse=True)
                             history_redo.append(board.pop())
+                            play_sound("move")
                             sync_after_history_step()
                             if game_review_is_active():
                                 set_game_review_playing(False)
                     else:
                         # Next move — only if it has actually been played
                         if history_redo:
-                            add_move_animation_for_move(anim_mgr, board, history_redo[-1], reverse=False)
+                            next_move = history_redo[-1]
+                            board_before = board.copy()
+                            add_move_animation_for_move(anim_mgr, board, next_move, reverse=False)
                             board.push(history_redo.pop())
+                            play_move_sound(board_before, next_move)
                             sync_after_history_step()
                             if game_review_is_active():
                                 set_game_review_playing(False)
