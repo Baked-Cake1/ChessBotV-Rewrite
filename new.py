@@ -55,6 +55,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ANALYSIS_ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 APP_VERSION = "v2-beta1"
 AUDIO_DIR = os.path.join(SCRIPT_DIR, "audio")
+GAME_REVIEW_VOICE_DIR = os.path.join(AUDIO_DIR, "voices")
 GAME_REVIEW_OPENING_DIR = os.path.join(SCRIPT_DIR, "opening")
 GAME_REVIEW_PIPER_DIR = os.path.join(SCRIPT_DIR, "piper")
 GAME_REVIEW_PIPER_VOICE_ID = "en_GB-northern_english_male-medium"
@@ -909,6 +910,9 @@ _game_review_speech_lock = threading.Lock()
 _game_review_speech_queue = queue.Queue()
 _game_review_speech_thread = None
 _game_review_speech_cache = {}
+_game_review_voice_clip_index_cache = {"signature": None, "clips": {}}
+_game_review_voice_sound_cache = {}
+_game_review_speech_playlist = []
 _game_review_piper_voice = None
 _game_review_piper_model_path = None
 _game_review_speech_channel = None
@@ -927,6 +931,10 @@ _game_review_speech = {
     "requested_at": 0.0,
     "started_at": 0.0,
     "voice": GAME_REVIEW_PIPER_VOICE_ID,
+    "audio_kind": "piper",  # piper | voice_clip
+    "clip_ids": [],
+    "clip_paths": [],
+    "clip_index": 0,
 }
 _game_review = {
     "active": False,
@@ -4392,6 +4400,225 @@ def _game_review_pointless_king_move(
     )
 
 
+def _game_review_castling_availability(board):
+    """Legal castling options for each colour if it were their turn."""
+    availability = {}
+    if board is None:
+        return availability
+    for colour in (chess.WHITE, chess.BLACK):
+        colour_name = "white" if colour == chess.WHITE else "black"
+        for side_name in ("kingside", "queenside"):
+            availability[f"{colour_name}_{side_name}"] = False
+        test_board = board.copy(stack=False)
+        test_board.turn = colour
+        test_board.ep_square = None
+        for candidate in test_board.legal_moves:
+            if not test_board.is_castling(candidate):
+                continue
+            side_name = (
+                "kingside"
+                if chess.square_file(candidate.to_square) == 6
+                else "queenside"
+            )
+            availability[f"{colour_name}_{side_name}"] = True
+    return availability
+
+
+def _game_review_new_castling_events(before_board, after_board):
+    """Castling sides that became legally available only after a move."""
+    if after_board is None or after_board.is_checkmate():
+        return []
+    before = _game_review_castling_availability(before_board)
+    after = _game_review_castling_availability(after_board)
+    return [
+        event
+        for event in (
+            "white_kingside",
+            "white_queenside",
+            "black_kingside",
+            "black_queenside",
+        )
+        if after.get(event) and not before.get(event)
+    ]
+
+
+def _game_review_fork_candidates(board, attacker_colour, defender_colour):
+    """Plausible one-move forks available to ``attacker_colour``."""
+    if board is None:
+        return []
+    search_board = board.copy(stack=False)
+    search_board.turn = attacker_colour
+    search_board.ep_square = None
+    candidates = []
+    for reply in search_board.legal_moves:
+        moving_piece = search_board.piece_at(reply.from_square)
+        if moving_piece is None or moving_piece.color != attacker_colour:
+            continue
+        captured_type = _game_review_capture_piece_type(search_board, reply)
+        immediate_capture_value = _GAME_REVIEW_PIECE_VALUES.get(
+            captured_type, 0
+        )
+        test_board = search_board.copy(stack=False)
+        test_board.push(reply)
+        attacker_piece = test_board.piece_at(reply.to_square)
+        if attacker_piece is None or attacker_piece.color != attacker_colour:
+            continue
+
+        target_types = []
+        for target_square in test_board.attacks(reply.to_square):
+            target = test_board.piece_at(target_square)
+            if target is None or target.color != defender_colour:
+                continue
+            if target.piece_type in (
+                chess.KING,
+                chess.QUEEN,
+                chess.ROOK,
+                chess.BISHOP,
+                chess.KNIGHT,
+            ):
+                target_types.append(target.piece_type)
+        if len(target_types) < 2:
+            continue
+        valuable_targets = [
+            piece_type
+            for piece_type in target_types
+            if piece_type != chess.KING
+            and _GAME_REVIEW_PIECE_VALUES.get(piece_type, 0) >= 320
+        ]
+        if not (
+            (chess.KING in target_types and valuable_targets)
+            or len(valuable_targets) >= 2
+        ):
+            continue
+
+        capture_gain = 0
+        if attacker_piece.piece_type != chess.KING:
+            capture_gain = _game_review_best_capture_gain(
+                test_board, reply.to_square, defender_colour
+            )
+        # A supposed fork is not a punishable tactic if the defender can
+        # simply take the forking piece and come out ahead on the spot.
+        if capture_gain >= 100 and immediate_capture_value < capture_gain:
+            continue
+
+        target_score = sum(
+            1000
+            if piece_type == chess.KING
+            else _GAME_REVIEW_PIECE_VALUES.get(piece_type, 0)
+            for piece_type in target_types
+        )
+        score = target_score + immediate_capture_value - int(capture_gain)
+        if test_board.is_check():
+            score += 250
+        devastating = bool(
+            (chess.KING in target_types and chess.QUEEN in target_types)
+            or (chess.QUEEN in target_types and chess.ROOK in target_types)
+            or target_types.count(chess.ROOK) >= 2
+            or target_score >= 1500
+        )
+        if attacker_piece.piece_type == chess.KNIGHT:
+            kind = "knight"
+        elif attacker_piece.piece_type == chess.PAWN:
+            kind = "pawn"
+        else:
+            kind = "devastating"
+        candidates.append(
+            {
+                "kind": kind,
+                "attacker_piece": _game_review_piece_name(
+                    attacker_piece.piece_type
+                ),
+                "move_uci": reply.uci(),
+                "score": int(score),
+                "devastating": devastating,
+            }
+        )
+    candidates.sort(
+        key=lambda item: (bool(item["devastating"]), int(item["score"])),
+        reverse=True,
+    )
+    return candidates
+
+
+def _game_review_fork_info(before_board, after_board, mover):
+    """New opponent fork created by the mover's last move, if any."""
+    opponent = not mover
+    candidates = _game_review_fork_candidates(
+        after_board, opponent, mover
+    )
+    if not candidates:
+        return None
+    chosen = candidates[0]
+    for old_candidate in _game_review_fork_candidates(
+        before_board, opponent, mover
+    ):
+        if old_candidate["move_uci"] == chosen["move_uci"] and int(
+            old_candidate["score"]
+        ) >= int(chosen["score"]) - 100:
+            return None
+    return chosen
+
+
+def _game_review_queen_moves_to_safety(
+    before_board, after_board, move, mover
+):
+    moving_piece = before_board.piece_at(move.from_square)
+    moved_piece = after_board.piece_at(move.to_square)
+    if (
+        moving_piece is None
+        or moving_piece.piece_type != chess.QUEEN
+        or moved_piece is None
+        or moved_piece.color != mover
+        or moved_piece.piece_type != chess.QUEEN
+    ):
+        return False
+    opponent = not mover
+    if not bool(before_board.attackers(opponent, move.from_square)):
+        return False
+    gain_after = _game_review_best_capture_gain(
+        after_board, move.to_square, opponent
+    )
+    return bool(gain_after < 100)
+
+
+def _game_review_knight_threatens_queen_and_centre(
+    before_board, after_board, move, mover
+):
+    moving_piece = before_board.piece_at(move.from_square)
+    moved_piece = after_board.piece_at(move.to_square)
+    if (
+        moving_piece is None
+        or moving_piece.piece_type != chess.KNIGHT
+        or moved_piece is None
+        or moved_piece.color != mover
+        or moved_piece.piece_type != chess.KNIGHT
+    ):
+        return False
+    opponent = not mover
+    queen_squares = after_board.pieces(chess.QUEEN, opponent)
+    attacked = after_board.attacks(move.to_square)
+    if not any(square in attacked for square in queen_squares):
+        return False
+
+    centre = {chess.D4, chess.E4, chess.D5, chess.E5}
+    attacked_centre = attacked & centre
+    destination_file = chess.square_file(move.to_square)
+    destination_rank = chess.square_rank(move.to_square)
+    fights_for_centre = bool(
+        len(attacked_centre) >= 2
+        or (2 <= destination_file <= 5 and 2 <= destination_rank <= 5)
+    )
+    if not fights_for_centre:
+        return False
+    centre_squares_to_check = set(attacked_centre)
+    if move.to_square in centre:
+        centre_squares_to_check.add(move.to_square)
+    return any(
+        not bool(after_board.attackers(opponent, square))
+        for square in centre_squares_to_check
+    )
+
+
 def _analyse_game_review_special_context(
     before_board,
     after_board,
@@ -4402,6 +4629,8 @@ def _analyse_game_review_special_context(
     centipawn_loss,
     is_best_move,
     legal_move_count,
+    previous_move_uci=None,
+    previous_move_was_capture=False,
 ):
     """Detect special ratings/notes around one reviewed move."""
     _before_cp, before_mate = _game_review_eval_for_mover(
@@ -4442,6 +4671,47 @@ def _analyse_game_review_special_context(
     second_best_gap = _game_review_second_best_gap(
         before_evaluation, move.uci(), mover
     )
+    castle_ready_events = _game_review_new_castling_events(
+        before_board, after_board
+    )
+    fork_info = None
+    if cpl >= 75 and not is_checkmate:
+        fork_info = _game_review_fork_info(
+            before_board, after_board, mover
+        )
+    queen_to_safety = _game_review_queen_moves_to_safety(
+        before_board, after_board, move, mover
+    )
+    queen_threat_centre = (
+        _game_review_knight_threatens_queen_and_centre(
+            before_board, after_board, move, mover
+        )
+    )
+    is_recapture = False
+    if previous_move_uci and previous_move_was_capture:
+        try:
+            previous_move = chess.Move.from_uci(str(previous_move_uci))
+        except Exception:
+            previous_move = None
+        is_recapture = bool(
+            previous_move is not None
+            and before_board.is_capture(move)
+            and move.to_square == previous_move.to_square
+        )
+    road_to_checkmate_stage = ""
+    if (
+        not is_checkmate
+        and after_mate is not None
+        and int(after_mate) > 0
+    ):
+        if (
+            before_mate is not None
+            and int(before_mate) > 0
+            and int(after_mate) <= int(before_mate) + 1
+        ):
+            road_to_checkmate_stage = "continuing"
+        elif before_mate is None or int(before_mate) <= 0:
+            road_to_checkmate_stage = "started"
 
     strong_move = bool(is_best_move or cpl <= 10)
     decisive_after = bool(
@@ -4532,6 +4802,16 @@ def _analyse_game_review_special_context(
         "sacrifice_piece": sacrifice["piece_name"] if sacrifice else "",
         "sacrifice_gain": int(sacrifice["gain"]) if sacrifice else 0,
         "second_best_gap_cp": int(second_best_gap),
+        "castle_ready_events": list(castle_ready_events),
+        "fork_kind": fork_info["kind"] if fork_info else "",
+        "fork_attacker_piece": (
+            fork_info["attacker_piece"] if fork_info else ""
+        ),
+        "fork_move_uci": fork_info["move_uci"] if fork_info else "",
+        "queen_to_safety": bool(queen_to_safety),
+        "queen_threat_centre": bool(queen_threat_centre),
+        "is_recapture": bool(is_recapture),
+        "road_to_checkmate_stage": road_to_checkmate_stage,
     }
 
 
@@ -5068,7 +5348,11 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
         evaluator = evaluator_factory()
         board = chess.Board(root_fen)
         opening_book = load_game_review_opening_book()
+        root_is_starting = " ".join(
+            str(root_fen or "").split()[:4]
+        ) == " ".join(chess.STARTING_FEN.split()[:4])
         played_sequence = []
+        previous_move_was_capture = False
         before = _evaluate_game_review_position(evaluator, board, multipv=2)
         with _game_review_lock:
             if int(_game_review.get("generation", 0)) != int(generation):
@@ -5088,6 +5372,10 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
             legal_move_count = len(legal_moves)
             before_board = board.copy(stack=False)
             move_san = board.san(move)
+            previous_move_uci = (
+                played_sequence[-1] if played_sequence else None
+            )
+            move_is_capture = bool(board.is_capture(move))
             candidate_sequence = played_sequence + [move_uci]
             book_info = get_game_review_book_move(
                 board,
@@ -5120,6 +5408,8 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                 cpl,
                 is_best,
                 legal_move_count,
+                previous_move_uci=previous_move_uci,
+                previous_move_was_capture=previous_move_was_capture,
             )
             rating = classify_game_review_move(
                 cpl,
@@ -5186,6 +5476,23 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                 "second_best_gap_cp": int(
                     special.get("second_best_gap_cp", 0)
                 ),
+                "castle_ready_events": list(
+                    special.get("castle_ready_events", ())
+                ),
+                "fork_kind": special.get("fork_kind", ""),
+                "fork_attacker_piece": special.get(
+                    "fork_attacker_piece", ""
+                ),
+                "fork_move_uci": special.get("fork_move_uci", ""),
+                "queen_to_safety": bool(special.get("queen_to_safety")),
+                "queen_threat_centre": bool(
+                    special.get("queen_threat_centre")
+                ),
+                "is_recapture": bool(special.get("is_recapture")),
+                "road_to_checkmate_stage": special.get(
+                    "road_to_checkmate_stage", ""
+                ),
+                "root_is_starting": bool(root_is_starting),
                 "centipawn_loss": int(cpl),
                 "is_best_move": bool(is_best),
                 "bestmove_uci": before.get("bestmove_uci"),
@@ -5206,6 +5513,7 @@ def _run_game_review_analysis(generation, root_fen, moves_uci, evaluator_factory
                     _game_review["evaluations"][position_index] = dict(after)
                 _game_review["results"][result["ply"]] = result
                 _game_review["analysed_positions"] = position_index + 1
+            previous_move_was_capture = move_is_capture
             before = after
 
         with _game_review_lock:
@@ -5288,7 +5596,427 @@ def start_game_review(board, history_redo=None, evaluator_factory=None):
     return True
 
 
-# --- Game Review Piper speech ---
+# --- Game Review prerecorded voice clips ---
+# Coach Nolan's natural recordings live in ``audio/voices``. The catalogue
+# below is deliberately filename-driven: each logical clip names the file
+# supplied with the recordings plus a few punctuation/case aliases. The
+# resolver also normalises names, so files such as ``1.a4.mp3`` and
+# ``1a4.mp3`` are treated as the same clip. Piper remains only as a fallback
+# for a missing/unreadable recording (or for older callers that ask for an
+# arbitrary line without clip IDs).
+GAME_REVIEW_VOICE_CLIP_EXTENSIONS = (".mp3", ".wav", ".ogg")
+GAME_REVIEW_VOICE_CLIPS = {
+    "book1": {"filename": "book1.mp3", "text": "Book move — still following known opening theory."},
+    "book2": {"filename": "book2.mp3", "text": "Straight from the opening book."},
+    "book3": {"filename": "book3.mp3", "text": "Theory — that one has been played many times before."},
+    "best1": {"filename": "best1.mp3", "text": "That's the engine's top choice. Beautifully played."},
+    "best2": {"filename": "best2.mp3", "text": "Perfect! You found the strongest move."},
+    "best3": {"filename": "best3.mp3", "text": "Best move. No notes from me."},
+    "great1": {"filename": "great1.mp3", "text": "Great move! That was the only good move."},
+    "great2": {"filename": "great2.mp3", "text": "Great move! The alternatives all ran into trouble."},
+    "great3": {"filename": "great3.mp3", "text": "Great move! Precisely what the position demanded."},
+    "great4": {"filename": "great4.mp3", "text": "You're lucky you didn't miss that only good move!"},
+    "great5": {"filename": "great5.mp3", "text": "Surprising! Any other move would've put you down the ranks."},
+    "brilliant1": {"filename": "brilliant1.mp3", "text": "Brilliant! That sacrifice turns the position on its head."},
+    "brilliant2": {"filename": "brilliant2.mp3", "text": "The material offer is completely justified."},
+    "brilliant3": {"filename": "brilliant3.mp3", "text": "Brilliant! A spectacular way to seize the game!"},
+    "brilliant4": {"filename": "brilliant4.mp3", "text": "Holy! That sacrifice flips the whole game. That was a hard one to catch!"},
+    "brilliant5": {"filename": "brilliant5.mp3", "text": "Well, that's like the best move... wait, THAT'S A BRILLIANT!"},
+    "brilliant6": {"filename": "brilliant6.mp3", "text": "Adios, opponent!"},
+    "brilliant7": {"filename": "brilliant7.mp3", "text": "How did you... find that?"},
+    "brilliant8": {"filename": "brilliant8.mp3", "text": "Are you the next Magnus Carlsen?"},
+    "brilliant9": {"filename": "brilliant9.mp3", "text": "Are you the next Hikaru?"},
+    "brilliant10": {"filename": "brilliant10.mp3", "text": "Are you... Faustino Oro?"},
+    "brilliant11": {"filename": "brilliant11.mp3", "text": "Where did you learn this from? Duolingo?"},
+    "excellent1": {"filename": "excellent1.mp3", "text": "Excellent — you gave away almost nothing!"},
+    "excellent2": {"filename": "excellent2.mp3", "text": "Very strong! That's right up with the engine's best ideas!"},
+    "excellent3": {"filename": "excellent3.mp3", "text": "Lovely move! The position barely changed."},
+    "good1": {"filename": "good1.mp3", "text": "Good move! The position stays healthy."},
+    "good2": {"filename": "good2.mp3", "text": "Solid and sensible. Keep building!"},
+    "good3": {"filename": "good3.mp3", "text": "That works nicely, even if it wasn't the sharpest try."},
+    "forced1": {"filename": "forced1.mp3", "text": "That was the only legal move."},
+    "forced2": {"filename": "forced2.mp3", "text": "Forced — there was no alternative."},
+    "forced3": {"filename": "forced3.mp3", "text": "Only one legal move was available there."},
+    "forced4": {"filename": "forced4.mp3", "text": "The one and only legal move."},
+    "forced5": {"filename": "forced5.mp3", "text": "There was nothing else he could do."},
+    "inaccuracy1": {"filename": "inaccuracy1.mp3", "text": "A small slip — there was a sharper continuation."},
+    "inaccuracy2": {"filename": "inaccuracy2.mp3", "text": "That lets a little of the advantage drift away."},
+    "inaccuracy3": {"filename": "inaccuracy3.mp3", "text": "Not a disaster, but we can tighten that up."},
+    "mistake1": {"filename": "mistake1.mp3", "text": "That gives away too much. Let's learn from it."},
+    "mistake2": {"filename": "mistake2.mp3", "text": "A real wobble there! The engine wanted something else."},
+    "mistake3": {"filename": "mistake3.mp3", "text": "Careful. That move makes the game much harder."},
+    "miss1": {"filename": "miss1.mp3", "text": "A missed opportunity there."},
+    "miss2": {"filename": "miss2.mp3", "text": "That lets a big chance slip away."},
+    "miss3": {"filename": "miss3.mp3", "text": "So close! There was a stronger idea available."},
+    "blunder1": {"filename": "blunder1.mp3", "text": "Oh no! That changes the whole game."},
+    "blunder2": {"filename": "blunder2.mp3", "text": "That's a blunder. Take a breath and see what was missed."},
+    "blunder3": {"filename": "blunder3.mp3", "text": "Yikes! The evaluation swings hard after that."},
+    "blunder4": {"filename": "blunder4.mp3", "text": "Geez! I didn't expect a blunder like that!"},
+    "blunder5": {"filename": "blunder5.mp3", "text": "That's a huge loss."},
+    "blunder6": {"filename": "blunder6.mp3", "text": "Devastating."},
+    "blunder7": {"filename": "blunder7.mp3", "text": "Very unexpected."},
+    "blunder8": {"filename": "blunder8.mp3", "text": "The evaluation bar is flipping after this one."},
+    "blunder9": {"filename": "blunder9.mp3", "text": "Welp, that's a blunder. I don't have too much to say about that."},
+    "overview": {
+        "filename": "let's look at your game together.mp3",
+        "aliases": ("lets look at your game together.mp3", "overview1.mp3"),
+        "text": "Let's look at your game together!",
+    },
+    "middlegame_strategy": {
+        "filename": "middlegamestrategy.mp3",
+        "aliases": ("middlegame_strategy.mp3", "overview2.mp3"),
+        "text": "Your middlegame strategy was solid, and led you to the win.",
+    },
+    "opening_solid": {
+        "filename": "openingsolid.mp3",
+        "aliases": ("opening_solid.mp3", "overview3.mp3"),
+        "text": "Your opening was solid, and gained you a large advantage early on in the game.",
+    },
+    "play_one_move": {
+        "filename": "playonemove.mp3",
+        "aliases": ("play_one_move.mp3",),
+        "text": "Play at least one move, then I'll happily review the game with you.",
+    },
+    "review_engine_fail1": {
+        "filename": "reviewenginefail1.mp3",
+        "aliases": ("review_engine_fail1.mp3",),
+        "text": "The review engine could not start.",
+    },
+    "review_engine_fail2": {
+        "filename": "reviewenginefail2.mp3",
+        "aliases": ("review_engine_fail2.mp3",),
+        "text": "Check the Stockfish path and try again.",
+    },
+    "use_arrows": {
+        "filename": "usearrows.mp3",
+        "aliases": ("use_arrows.mp3",),
+        "text": "Use the arrows or play button, and I'll react to each move.",
+    },
+    "boa_constrictor": {
+        "filename": "yousqueezedyouropponentboacontrictor.mp3",
+        "aliases": (
+            "yousqueezedyouropponentboaconstrictor.mp3",
+            "boaconstrictor.mp3",
+            "boa_constrictor.mp3",
+        ),
+        "text": "You squeezed your opponent like a boa constrictor killing its prey.",
+    },
+    "you_won": {
+        "filename": "youwon.mp3",
+        "aliases": ("you_won.mp3",),
+        "text": "You won. Nice work!",
+    },
+    "you_won_lets_review": {
+        "filename": "youwonletsreview.mp3",
+        "aliases": ("you_won_lets_review.mp3", "youwonlet'sreview.mp3"),
+        "text": "You won. Let's review.",
+    },
+    "opening_1a4": {
+        "filename": "1.a4.mp3",
+        "aliases": ("1a4.mp3", "a4.mp3"),
+        "text": "This opening — the Ware Opening — tries to get White's dark-squared rook into action early.",
+    },
+    "opening_1b4": {
+        "filename": "1.b4.mp3",
+        "aliases": ("1b4.mp3", "b4.mp3"),
+        "text": "This opening — the Polish Opening, which can also be called the Orangutan Opening — strategizes queenside advantage rather than fighting for the center.",
+    },
+    "opening_1c4": {
+        "filename": "1.c4.mp3",
+        "aliases": ("1c4.mp3", "c4.mp3"),
+        "text": "This opening — the English — is a flexible opening that usually transitions into a powerful gambit.",
+    },
+    "opening_1d4": {
+        "filename": "1.d4.mp3",
+        "aliases": ("1d4.mp3", "d4.mp3"),
+        "text": "This opening — the Queen's Pawn — allows the pawn on d4 to control two center squares, just like the King's Pawn opening, but c5 and e5.",
+    },
+    "opening_1e4": {
+        "filename": "1.e4.mp3",
+        "aliases": ("1e4.mp3", "e4.mp3"),
+        "text": "This opening — the King's Pawn — allows the pawn on e4 to control two center squares, d5 and f5.",
+    },
+    "opening_1f4": {
+        "filename": "1.f4.mp3",
+        "aliases": ("1f4.mp3", "f4.mp3"),
+        "text": "This opening — the Bird's Opening — is designed to surprise your opponent. The main downside is that it weakens your king and can be punished if moves are not done properly.",
+    },
+    "opening_1g4": {
+        "filename": "1.g4.mp3",
+        "aliases": ("1g4.mp3", "g4.mp3"),
+        "text": "The Grob Opening is usually considered the worst first move for White. It is used to catch quick wins in bullet and blitz, but weakens the kingside and makes it harder to castle.",
+    },
+    "opening_1h4": {
+        "filename": "1.h4.mp3",
+        "aliases": ("1h4.mp3", "h4.mp3"),
+        "text": "The Kadas Opening is an uncommon opening where White attempts to bring the light-squared rook out early. It does little in development.",
+    },
+    "black_kingside_ready": {
+        "filename": "blackkingsideready.mp3",
+        "aliases": ("black_kingside_ready.mp3",),
+        "text": "Black is now ready to castle kingside.",
+    },
+    "white_kingside_ready": {
+        "filename": "whitekingsideready.mp3",
+        "aliases": ("white_kingside_ready.mp3",),
+        "text": "White is now ready to castle kingside.",
+    },
+    "white_queenside_ready": {
+        "filename": "whitequeensideready.mp3",
+        "aliases": ("white_queenside_ready.mp3",),
+        "text": "White is now ready to castle queenside.",
+    },
+    "black_queenside_ready": {
+        "filename": "blackqueensideready.mp3",
+        "aliases": ("black_queenside_ready.mp3",),
+        "text": "Black is now ready to castle queenside.",
+    },
+    "blunder_knight_fork": {
+        "filename": "blunderknightfork.mp3",
+        "aliases": ("blunder_knight_fork.mp3",),
+        "text": "This move allows the opponent's knight to fork.",
+    },
+    "blunder_pawn_fork": {
+        "filename": "blunderpawnfork.mp3",
+        "aliases": ("blunder_pawn_fork.mp3",),
+        "text": "This move allows the opponent's pawn to fork.",
+    },
+    "devastating_fork": {
+        "filename": "devastatingfork.mp3",
+        "aliases": ("devastating_fork.mp3",),
+        "text": "This move allows for a devastating fork.",
+    },
+    "checkmate": {"filename": "checkmate.mp3", "text": "That's checkmate!"},
+    "escape_eventual_mate": {
+        "filename": "escapeevenmate.mp3",
+        "aliases": ("escape_eventual_mate.mp3", "escapeevenmate.mp3"),
+        "text": "This move allows the opponent to escape from eventual mate.",
+    },
+    "eventual_checkmate": {
+        "filename": "evencheckmate.mp3",
+        "aliases": ("eventual_checkmate.mp3", "evencheckmate.mp3"),
+        "text": "This move permits the opponent to force eventual checkmate.",
+    },
+    "free_pawn_miss": {
+        "filename": "freepawnmiss.mp3",
+        "aliases": ("free_pawn_miss.mp3",),
+        "text": "This misses an opportunity to capture a free pawn.",
+    },
+    "hang_bishop": {"filename": "hangbishop.mp3", "text": "This hangs your bishop."},
+    "hang_knight": {"filename": "hangknight.mp3", "text": "This hangs your knight."},
+    "hang_queen": {"filename": "hangqueen.mp3", "text": "This hangs your queen."},
+    "hang_rook": {"filename": "hangrook.mp3", "text": "This hangs your rook."},
+    "immediate_checkmate": {
+        "filename": "immediatecheckmate.mp3",
+        "aliases": ("immediate_checkmate.mp3",),
+        "text": "This move causes immediate checkmate.",
+    },
+    "king_cannot_castle": {
+        "filename": "kingcantcastle.mp3",
+        "aliases": ("king_cannot_castle.mp3", "kingcantcastle.mp3"),
+        "text": "Now, the king cannot castle to safety.",
+    },
+    "queen_safety": {
+        "filename": "queensafety.mp3",
+        "aliases": ("queen_safety.mp3",),
+        "text": "Moving the queen to safety.",
+    },
+    "queen_threaten": {
+        "filename": "queenthreaten.mp3",
+        "aliases": ("queen_threaten.mp3", "queenthreat.mp3"),
+        "text": "This move threatens the queen and fights for the center squares.",
+    },
+    "recapture": {"filename": "recapture.mp3", "text": "This is a recapture."},
+    "road_to_checkmate": {
+        "filename": "roadtocheckmate.mp3",
+        "aliases": ("road_to_checkmate.mp3",),
+        "text": "On the road to checkmate!",
+    },
+    "road_to_checkmate2": {
+        "filename": "roadtocheckmate2.mp3",
+        "aliases": ("road_to_checkmate2.mp3",),
+        "text": "Still continuing the checkmate attack!",
+    },
+    "sacrifice_the_rook": {
+        "filename": "sactherook!.mp3",
+        "aliases": ("sactherook.mp3", "sacrifice_the_rook.mp3"),
+        "text": "SACRIFICE THE ROOOOOOOOOOOOK!!!!!",
+    },
+}
+GAME_REVIEW_RATING_VOICE_CLIP_IDS = {
+    rating: tuple(
+        f"{prefix}{index}"
+        for index in range(1, count + 1)
+    )
+    for rating, prefix, count in (
+        ("book", "book", 3),
+        ("brilliant", "brilliant", 11),
+        ("great", "great", 5),
+        ("forced", "forced", 5),
+        ("best", "best", 3),
+        ("excellent", "excellent", 3),
+        ("good", "good", 3),
+        ("inaccuracy", "inaccuracy", 3),
+        ("mistake", "mistake", 3),
+        ("miss", "miss", 3),
+        ("blunder", "blunder", 9),
+    )
+}
+GAME_REVIEW_FIRST_MOVE_VOICE_CLIPS = {
+    "a2a4": "opening_1a4",
+    "b2b4": "opening_1b4",
+    "c2c4": "opening_1c4",
+    "d2d4": "opening_1d4",
+    "e2e4": "opening_1e4",
+    "f2f4": "opening_1f4",
+    "g2g4": "opening_1g4",
+    "h2h4": "opening_1h4",
+}
+GAME_REVIEW_CASTLE_READY_VOICE_CLIPS = {
+    "white_kingside": "white_kingside_ready",
+    "white_queenside": "white_queenside_ready",
+    "black_kingside": "black_kingside_ready",
+    "black_queenside": "black_queenside_ready",
+}
+
+
+def _normalise_game_review_voice_clip_name(value):
+    name = os.path.basename(os.fspath(value or ""))
+    stem, extension = os.path.splitext(name)
+    if extension.lower() in GAME_REVIEW_VOICE_CLIP_EXTENSIONS:
+        name = stem
+    name = name.replace("’", "").replace("'", "").lower()
+    return re.sub(r"[^a-z0-9]+", "", name)
+
+
+def _game_review_voice_clip_index():
+    """Map normalised clip stems to files below ``audio/voices``."""
+    voice_dir = os.fspath(GAME_REVIEW_VOICE_DIR)
+    candidates = []
+    signature_items = []
+    if os.path.isdir(voice_dir):
+        for root, dirnames, filenames in os.walk(voice_dir):
+            dirnames.sort()
+            for filename in sorted(filenames):
+                extension = os.path.splitext(filename)[1].lower()
+                if extension not in GAME_REVIEW_VOICE_CLIP_EXTENSIONS:
+                    continue
+                path = os.path.join(root, filename)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                signature_items.append(
+                    (path, int(stat.st_size), int(stat.st_mtime_ns))
+                )
+                candidates.append(
+                    (
+                        GAME_REVIEW_VOICE_CLIP_EXTENSIONS.index(extension),
+                        path,
+                    )
+                )
+    signature = tuple(signature_items)
+    if _game_review_voice_clip_index_cache.get("signature") == signature:
+        return dict(_game_review_voice_clip_index_cache.get("clips", {}))
+
+    clips = {}
+    for _extension_rank, path in sorted(candidates):
+        key = _normalise_game_review_voice_clip_name(path)
+        if key and key not in clips:
+            clips[key] = path
+    _game_review_voice_clip_index_cache.update(
+        {"signature": signature, "clips": dict(clips)}
+    )
+    return clips
+
+
+def find_game_review_voice_clip(clip_id):
+    """First local recording for a catalogue clip ID, if present."""
+    entry = GAME_REVIEW_VOICE_CLIPS.get(str(clip_id or ""), {})
+    names = [
+        entry.get("filename", ""),
+        *tuple(entry.get("aliases", ())),
+        str(clip_id or ""),
+    ]
+    clips = _game_review_voice_clip_index()
+    for name in names:
+        path = clips.get(_normalise_game_review_voice_clip_name(name))
+        if path:
+            return path
+    return None
+
+
+def game_review_voice_clip_text(clip_id):
+    entry = GAME_REVIEW_VOICE_CLIPS.get(str(clip_id or ""), {})
+    return str(entry.get("text") or "").strip()
+
+
+def game_review_voice_clips_text(clip_ids):
+    return " ".join(
+        text
+        for text in (
+            game_review_voice_clip_text(clip_id)
+            for clip_id in tuple(clip_ids or ())
+        )
+        if text
+    ).strip()
+
+
+def _load_game_review_voice_sound(path):
+    path = os.path.abspath(os.fspath(path))
+    stat = os.stat(path)
+    cache_key = (path, int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _game_review_voice_sound_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    preload_game_sounds()
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
+    sound = pygame.mixer.Sound(path)
+    _game_review_voice_sound_cache[cache_key] = sound
+    return sound
+
+
+def preload_game_review_voice_clips():
+    """Load every available Coach Nolan recording; return how many loaded."""
+    loaded = 0
+    for clip_id in GAME_REVIEW_VOICE_CLIPS:
+        path = find_game_review_voice_clip(clip_id)
+        if not path:
+            continue
+        try:
+            _load_game_review_voice_sound(path)
+        except Exception as exc:
+            print(f"Could not load Game Review voice clip {path}: {exc}")
+            continue
+        loaded += 1
+    if loaded:
+        print(f"Loaded {loaded} Game Review voice clip(s) from {GAME_REVIEW_VOICE_DIR}.")
+    return loaded
+
+
+def _prepare_game_review_voice_playlist(clip_ids):
+    """Resolve and load a complete clip sequence, or return ``None``."""
+    clip_ids = tuple(str(clip_id) for clip_id in tuple(clip_ids or ()) if clip_id)
+    if not clip_ids:
+        return None
+    paths = []
+    sounds = []
+    for clip_id in clip_ids:
+        path = find_game_review_voice_clip(clip_id)
+        if not path:
+            return None
+        try:
+            sound = _load_game_review_voice_sound(path)
+        except Exception as exc:
+            print(f"Could not load Game Review voice clip {path}: {exc}")
+            return None
+        paths.append(path)
+        sounds.append(sound)
+    return {"clip_ids": clip_ids, "paths": paths, "sounds": sounds}
+
+
+# --- Game Review Piper speech (fallback) ---
 def game_review_san_to_speech(san):
     """Convert SAN such as ``Nf3``, ``exd5`` or ``O-O+`` to spoken words."""
     text = str(san or "").strip()
@@ -5600,7 +6328,9 @@ def _stop_game_review_speech_channel():
 
 def stop_game_review_speech():
     """Stop Coach Nolan and invalidate any queued/synthesising line."""
+    global _game_review_speech_playlist
     _stop_game_review_speech_channel()
+    _game_review_speech_playlist = []
     with _game_review_speech_lock:
         _game_review_speech["request_id"] = (
             int(_game_review_speech.get("request_id", 0)) + 1
@@ -5618,16 +6348,24 @@ def stop_game_review_speech():
                 "requested_at": 0.0,
                 "started_at": 0.0,
                 "voice": GAME_REVIEW_PIPER_VOICE_ID,
+                "audio_kind": "piper",
+                "clip_ids": [],
+                "clip_paths": [],
+                "clip_index": 0,
             }
         )
 
 
 def reset_game_review_speech_for_tests():
-    """Clear cached Piper voice/audio; used by the headless test suites."""
+    """Clear cached Piper/clip audio; used by the headless test suites."""
     global _game_review_piper_voice, _game_review_piper_model_path
     stop_game_review_speech()
     with _game_review_speech_lock:
         _game_review_speech_cache.clear()
+    _game_review_voice_sound_cache.clear()
+    _game_review_voice_clip_index_cache.update(
+        {"signature": None, "clips": {}}
+    )
     _game_review_piper_voice = None
     _game_review_piper_model_path = None
 
@@ -5700,30 +6438,57 @@ def _ensure_game_review_speech_worker():
     return _game_review_speech_thread
 
 
-def request_game_review_speech(key, text):
-    """Queue one coach line; repeated requests for the same key are ignored."""
+def request_game_review_speech(key, text, clip_ids=None):
+    """Queue one coach line, preferring complete prerecorded clip sequences.
+
+    ``text`` remains the Piper fallback/caption text. If every requested
+    recording in ``clip_ids`` is present and loadable, those MP3s are played
+    in order and Piper is not used for the line.
+    """
+    global _game_review_speech_playlist
     clean_text = _normalise_game_review_speech_text(text)
+    requested_clip_ids = tuple(
+        str(clip_id) for clip_id in tuple(clip_ids or ()) if clip_id
+    )
     if key is None or not clean_text:
         return False
     with _game_review_speech_lock:
-        if _game_review_speech.get("status") == "unavailable":
-            return False
         if (
             _game_review_speech.get("key") == key
             and _game_review_speech.get("text") == clean_text
+            and tuple(_game_review_speech.get("clip_ids") or ())
+            == requested_clip_ids
             and _game_review_speech.get("status")
             in {"queued", "loading", "downloading", "synthesising", "ready", "playing"}
         ):
             return False
 
+    prepared = _prepare_game_review_voice_playlist(requested_clip_ids)
+    with _game_review_speech_lock:
+        if _game_review_speech.get("status") == "unavailable" and prepared is None:
+            return False
+
     _stop_game_review_speech_channel()
+    _game_review_speech_playlist = (
+        list(prepared["sounds"]) if prepared is not None else []
+    )
     cache_key = (GAME_REVIEW_PIPER_VOICE_ID, clean_text)
     with _game_review_speech_lock:
         request_id = int(_game_review_speech.get("request_id", 0)) + 1
-        cached = _game_review_speech_cache.get(cache_key)
+        cached = (
+            None
+            if prepared is not None
+            else _game_review_speech_cache.get(cache_key)
+        )
+        first_duration = 0.0
+        if prepared is not None:
+            try:
+                first_duration = float(prepared["sounds"][0].get_length())
+            except Exception:
+                first_duration = 0.0
         _game_review_speech.update(
             {
-                "status": "ready" if cached else "queued",
+                "status": "ready" if (prepared is not None or cached) else "queued",
                 "request_id": request_id,
                 "key": key,
                 "text": clean_text,
@@ -5731,13 +6496,29 @@ def request_game_review_speech(key, text):
                 "wav_bytes": cached[0] if cached else None,
                 "envelope": list(cached[1]) if cached else [],
                 "sample_rate": int(cached[3]) if cached else 0,
-                "duration": float(cached[2]) if cached else 0.0,
+                "duration": (
+                    float(first_duration)
+                    if prepared is not None
+                    else (float(cached[2]) if cached else 0.0)
+                ),
                 "requested_at": time.monotonic(),
                 "started_at": 0.0,
-                "voice": GAME_REVIEW_PIPER_VOICE_ID,
+                "voice": (
+                    "prerecorded"
+                    if prepared is not None
+                    else GAME_REVIEW_PIPER_VOICE_ID
+                ),
+                "audio_kind": (
+                    "voice_clip" if prepared is not None else "piper"
+                ),
+                "clip_ids": list(requested_clip_ids),
+                "clip_paths": (
+                    list(prepared["paths"]) if prepared is not None else []
+                ),
+                "clip_index": 0,
             }
         )
-    if cached:
+    if prepared is not None or cached:
         return True
     _ensure_game_review_speech_worker()
     _game_review_speech_queue.put((request_id, key, clean_text))
@@ -5747,25 +6528,39 @@ def request_game_review_speech(key, text):
 def update_game_review_speech():
     """Start/finish coach playback. Call only from the pygame main thread."""
     global _game_review_speech_channel, _game_review_speech_sound
+    global _game_review_speech_playlist
     with _game_review_speech_lock:
         status = _game_review_speech.get("status")
         request_id = int(_game_review_speech.get("request_id", 0))
         wav_bytes = _game_review_speech.get("wav_bytes")
+        audio_kind = _game_review_speech.get("audio_kind", "piper")
+        clip_index = int(_game_review_speech.get("clip_index", 0))
 
-    if status == "ready" and wav_bytes:
+    if status == "ready" and (wav_bytes or audio_kind == "voice_clip"):
         try:
             preload_game_sounds()
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
-            sound = pygame.mixer.Sound(io.BytesIO(wav_bytes))
+            if audio_kind == "voice_clip":
+                if not (0 <= clip_index < len(_game_review_speech_playlist)):
+                    raise RuntimeError("Game Review voice clip is missing")
+                sound = _game_review_speech_playlist[clip_index]
+            else:
+                sound = pygame.mixer.Sound(io.BytesIO(wav_bytes))
             channel = pygame.mixer.find_channel(True)
             if channel is None:
                 raise RuntimeError("No pygame mixer channel is available")
+            try:
+                sound_duration = float(sound.get_length())
+            except Exception:
+                sound_duration = 0.0
             with _game_review_speech_lock:
                 if int(_game_review_speech.get("request_id", 0)) != request_id:
                     return get_game_review_speech_snapshot()
                 _game_review_speech["status"] = "playing"
                 _game_review_speech["started_at"] = time.monotonic()
+                if audio_kind == "voice_clip":
+                    _game_review_speech["duration"] = float(sound_duration)
             _game_review_speech_sound = sound
             _game_review_speech_channel = channel
             channel.play(sound)
@@ -5788,6 +6583,29 @@ def update_game_review_speech():
                 busy = False
         if not busy:
             _stop_game_review_speech_channel()
+            if (
+                audio_kind == "voice_clip"
+                and clip_index + 1 < len(_game_review_speech_playlist)
+            ):
+                next_sound = _game_review_speech_playlist[clip_index + 1]
+                try:
+                    next_duration = float(next_sound.get_length())
+                except Exception:
+                    next_duration = 0.0
+                advance = False
+                with _game_review_speech_lock:
+                    if int(_game_review_speech.get("request_id", 0)) == request_id:
+                        _game_review_speech.update(
+                            {
+                                "status": "ready",
+                                "clip_index": clip_index + 1,
+                                "started_at": 0.0,
+                                "duration": float(next_duration),
+                            }
+                        )
+                        advance = True
+                if advance:
+                    return update_game_review_speech()
             with _game_review_speech_lock:
                 if int(_game_review_speech.get("request_id", 0)) == request_id:
                     # Keep the key in a distinct finished state so sync does
@@ -5795,6 +6613,7 @@ def update_game_review_speech():
                     _game_review_speech["status"] = "finished"
                     _game_review_speech["wav_bytes"] = None
                     _game_review_speech["started_at"] = 0.0
+            _game_review_speech_playlist = []
             mark_game_review_advanced()
     return get_game_review_speech_snapshot()
 
@@ -5804,6 +6623,10 @@ def get_game_review_speech_snapshot():
     with _game_review_speech_lock:
         snapshot = dict(_game_review_speech)
         snapshot["envelope"] = list(_game_review_speech.get("envelope", []))
+        snapshot["clip_ids"] = list(_game_review_speech.get("clip_ids", []))
+        snapshot["clip_paths"] = list(
+            _game_review_speech.get("clip_paths", [])
+        )
         snapshot.pop("wav_bytes", None)
 
     mouth_open = 0.0
@@ -5857,7 +6680,7 @@ def game_review_speech_is_busy(max_wait_seconds=6.0):
 
 
 def sync_game_review_speech(board, allow_new=True):
-    """Make Piper follow the dialogue for the currently displayed ply."""
+    """Make coach audio follow the dialogue for the displayed ply."""
     if board is None:
         return None
     update_game_review_speech()
@@ -5871,7 +6694,11 @@ def sync_game_review_speech(board, allow_new=True):
     if allow_new:
         if dialogue.get("speak"):
             if current_key != speech_key:
-                request_game_review_speech(speech_key, dialogue.get("spoken_text", ""))
+                request_game_review_speech(
+                    speech_key,
+                    dialogue.get("spoken_text", ""),
+                    clip_ids=dialogue.get("voice_clip_ids", ()),
+                )
         elif current_key not in (None, speech_key):
             stop_game_review_speech()
     update_game_review_speech()
@@ -18369,61 +19196,10 @@ def game_review_control_at(pos):
 
 
 _GAME_REVIEW_LINES = {
-    "book": (
-        "Book move — still following known opening theory.",
-        "Straight from the opening book.",
-        "Theory. That one has been played many times before.",
-    ),
-    "brilliant": (
-        "Brilliant! That sacrifice turns the position on its head.",
-        "Brilliant! The material offer is completely justified.",
-        "Brilliant! A spectacular way to seize the game.",
-    ),
-    "great": (
-        "Great move — that was the only good move.",
-        "Great move. The alternatives all ran into trouble.",
-        "Great move — precisely what the position demanded.",
-    ),
-    "forced": (
-        "That was the only legal move.",
-        "Forced — there was no alternative.",
-        "Only one legal move was available there.",
-    ),
-    "best": (
-        "That's the engine's top choice — beautifully played.",
-        "Perfect. You found the strongest move.",
-        "Best move. No notes from me.",
-    ),
-    "excellent": (
-        "Excellent — you gave away almost nothing.",
-        "Very strong. That's right up with the engine's best ideas.",
-        "Lovely move; the position barely changed.",
-    ),
-    "good": (
-        "Good move. The position stays healthy.",
-        "Solid and sensible — keep building.",
-        "That works nicely, even if it wasn't the sharpest try.",
-    ),
-    "inaccuracy": (
-        "A small slip. There was a sharper continuation.",
-        "That lets a little of the advantage drift away.",
-        "Not a disaster, but we can tighten that up.",
-    ),
-    "mistake": (
-        "That gives away too much — let's learn from it.",
-        "A real wobble there. The engine wanted something else.",
-        "Careful: that move makes the game much harder.",
-    ),
-    "miss": (
-        "A missed opportunity there.",
-        "That lets a big chance slip away.",
-        "So close — there was a stronger idea available.",
-    ),
-    "blunder": (
-        "Oh no — that changes the whole game!",
-        "That's a blunder. Take a breath and see what was missed.",
-        "Yikes — the evaluation swings hard after that.",
-    ),
+    rating: tuple(
+        game_review_voice_clip_text(clip_id) for clip_id in clip_ids
+    )
+    for rating, clip_ids in GAME_REVIEW_RATING_VOICE_CLIP_IDS.items()
 }
 
 
@@ -18436,7 +19212,7 @@ def _game_review_result_spoken_text(result, display_speech):
     is converted to words, but the move that was played is not announced.
     """
     if result and result.get("is_checkmate"):
-        return "That's checkmate."
+        return "That's checkmate!"
     main_text = str(display_speech or "").strip()
     best_clause = ""
     marker = " Best was "
@@ -18452,13 +19228,321 @@ def _game_review_result_spoken_text(result, display_speech):
     return f"{main_text}{best_clause}".strip()
 
 
+def _game_review_stable_choice(values, *seed_parts):
+    values = tuple(values or ())
+    if not values:
+        return ""
+    seed = ":".join(str(part) for part in seed_parts)
+    return values[random.Random(seed).randrange(len(values))]
+
+
+def _game_review_rating_voice_clip_id(rating, result, generation):
+    clip_ids = GAME_REVIEW_RATING_VOICE_CLIP_IDS.get(rating, ())
+    return _game_review_stable_choice(
+        clip_ids,
+        "game-review-voice",
+        int(generation or 0),
+        int((result or {}).get("ply", 0) or 0),
+        str((result or {}).get("move_uci", "")),
+        str(rating or ""),
+    )
+
+
+def _game_review_result_voice_clip_ids(result, generation):
+    """Ordered prerecorded clips for one rated move."""
+    if not result:
+        return ()
+    if result.get("is_checkmate"):
+        return ("checkmate",)
+
+    rating = str(result.get("rating") or "")
+    primary = ""
+    if int(result.get("ply", 0) or 0) == 1 and result.get(
+        "root_is_starting", True
+    ):
+        primary = GAME_REVIEW_FIRST_MOVE_VOICE_CLIPS.get(
+            str(result.get("move_uci") or ""), ""
+        )
+
+    if not primary and rating == "miss":
+        primary = {
+            "missed_mate": "escape_eventual_mate",
+            "free_pawn": "free_pawn_miss",
+            "king_castling": "king_cannot_castle",
+        }.get(str(result.get("miss_reason") or ""), "")
+    if not primary and rating == "blunder":
+        if result.get("allows_opponent_mate"):
+            primary = (
+                "immediate_checkmate"
+                if result.get("opponent_mate_in") == 1
+                else "eventual_checkmate"
+            )
+        elif result.get("hanging_piece"):
+            primary = {
+                "queen": "hang_queen",
+                "rook": "hang_rook",
+                "bishop": "hang_bishop",
+                "knight": "hang_knight",
+            }.get(str(result.get("hanging_piece") or ""), "")
+    if (
+        not primary
+        and rating in {"blunder", "mistake", "miss"}
+        and result.get("fork_kind")
+    ):
+        primary = {
+            "knight": "blunder_knight_fork",
+            "pawn": "blunder_pawn_fork",
+            "devastating": "devastating_fork",
+        }.get(str(result.get("fork_kind") or ""), "")
+    if (
+        not primary
+        and rating == "brilliant"
+        and str(result.get("sacrifice_piece") or "") == "rook"
+    ):
+        primary = "sacrifice_the_rook"
+    if not primary:
+        primary = _game_review_rating_voice_clip_id(
+            rating, result, generation
+        )
+
+    clip_ids = [primary] if primary else []
+    try:
+        centipawn_loss = int(result.get("centipawn_loss", 0) or 0)
+    except Exception:
+        centipawn_loss = 0
+    if centipawn_loss <= 75 and result.get("queen_to_safety"):
+        clip_ids.append("queen_safety")
+    if centipawn_loss <= 75 and result.get("queen_threat_centre"):
+        clip_ids.append("queen_threaten")
+    if centipawn_loss <= 30 and result.get("is_recapture"):
+        clip_ids.append("recapture")
+    road_stage = str(result.get("road_to_checkmate_stage") or "")
+    if road_stage == "started":
+        clip_ids.append("road_to_checkmate")
+    elif road_stage == "continuing":
+        clip_ids.append("road_to_checkmate2")
+    for event in result.get("castle_ready_events", ()) or ():
+        castle_clip = GAME_REVIEW_CASTLE_READY_VOICE_CLIPS.get(str(event))
+        if castle_clip:
+            clip_ids.append(castle_clip)
+
+    ordered = []
+    for clip_id in clip_ids:
+        if clip_id and clip_id not in ordered:
+            ordered.append(clip_id)
+    return tuple(ordered)
+
+
+_GAME_REVIEW_OVERVIEW_CLIP_CACHE = {"key": None, "clip_id": "overview"}
+
+
+def _game_review_phase_metrics(results, mover_name, first_ply, last_ply):
+    selected = [
+        result
+        for _ply, result in sorted((results or {}).items())
+        if result
+        and result.get("mover") == mover_name
+        and first_ply <= int(result.get("ply", 0) or 0) <= last_ply
+    ]
+    if not selected:
+        return None
+    strong_ratings = {
+        "book",
+        "brilliant",
+        "great",
+        "best",
+        "excellent",
+        "good",
+        "forced",
+    }
+    total_loss = 0
+    for result in selected:
+        try:
+            total_loss += max(0, int(result.get("centipawn_loss", 0) or 0))
+        except Exception:
+            pass
+    return {
+        "count": len(selected),
+        "average_loss": total_loss / float(len(selected)),
+        "strong_share": sum(
+            1 for result in selected if result.get("rating") in strong_ratings
+        )
+        / float(len(selected)),
+        "best_like": sum(
+            1
+            for result in selected
+            if result.get("rating") in {"brilliant", "great", "best"}
+        ),
+        "mistakes": sum(
+            1 for result in selected if result.get("rating") == "mistake"
+        ),
+        "blunders": sum(
+            1 for result in selected if result.get("rating") == "blunder"
+        ),
+    }
+
+
+def _game_review_overview_voice_clip_id(snapshot):
+    """Choose the intro/overview recording for a reviewed game."""
+    moves_uci = tuple(snapshot.get("moves_uci", ()) or ())
+    if not moves_uci:
+        return "overview"
+    results = snapshot.get("results", {}) or {}
+    status = str(snapshot.get("status") or "")
+    cache_key = (
+        int(snapshot.get("generation", 0) or 0),
+        status,
+        str(snapshot.get("root_fen") or ""),
+        moves_uci,
+        tuple(
+            (
+                int(ply),
+                str((result or {}).get("rating") or ""),
+                int((result or {}).get("centipawn_loss", 0) or 0),
+                int((result or {}).get("eval_after_cp", 0) or 0),
+                str((result or {}).get("mate_after")),
+            )
+            for ply, result in sorted(results.items())
+            if result
+        ),
+    )
+    if _GAME_REVIEW_OVERVIEW_CLIP_CACHE.get("key") == cache_key:
+        return str(
+            _GAME_REVIEW_OVERVIEW_CLIP_CACHE.get("clip_id") or "overview"
+        )
+
+    selected = "overview"
+    final_board = chess.Board(
+        snapshot.get("root_fen") or chess.STARTING_FEN
+    )
+    try:
+        for move_uci in moves_uci:
+            final_board.push_uci(str(move_uci))
+    except Exception:
+        _GAME_REVIEW_OVERVIEW_CLIP_CACHE.update(
+            {"key": cache_key, "clip_id": selected}
+        )
+        return selected
+
+    winner = None
+    won_by_checkmate = bool(final_board.is_checkmate())
+    if won_by_checkmate:
+        winner = not final_board.turn
+    else:
+        evaluations = [
+            evaluation
+            for evaluation in (snapshot.get("evaluations", ()) or ())
+            if isinstance(evaluation, dict)
+        ]
+        if evaluations:
+            final_cp, final_mate = _game_review_eval_for_mover(
+                evaluations[-1], chess.WHITE
+            )
+            if final_mate is not None and int(final_mate) != 0:
+                winner = chess.WHITE if int(final_mate) > 0 else chess.BLACK
+            elif abs(int(final_cp)) >= 500:
+                winner = chess.WHITE if int(final_cp) > 0 else chess.BLACK
+
+    if status == "complete" and results:
+        total_moves = len(moves_uci)
+        if winner is not None:
+            winner_name = "white" if winner == chess.WHITE else "black"
+            loser_name = "black" if winner == chess.WHITE else "white"
+            winner_metrics = _game_review_phase_metrics(
+                results, winner_name, 1, total_moves
+            )
+            loser_metrics = _game_review_phase_metrics(
+                results, loser_name, 1, total_moves
+            )
+            if winner_metrics is not None:
+                outplayed = bool(
+                    loser_metrics is None
+                    or winner_metrics["average_loss"] + 25.0
+                    <= loser_metrics["average_loss"]
+                    or won_by_checkmate
+                )
+                if bool(
+                    winner_metrics["count"] >= 8
+                    and winner_metrics["average_loss"] <= 25.0
+                    and winner_metrics["strong_share"] >= 0.80
+                    and winner_metrics["best_like"] >= 4
+                    and winner_metrics["blunders"] == 0
+                    and winner_metrics["mistakes"] <= 1
+                    and outplayed
+                ):
+                    selected = "boa_constrictor"
+                else:
+                    middlegame = _game_review_phase_metrics(
+                        results, winner_name, 17, min(60, total_moves)
+                    )
+                    if middlegame is not None and bool(
+                        middlegame["count"] >= 4
+                        and middlegame["average_loss"] <= 40.0
+                        and middlegame["strong_share"] >= 0.70
+                        and middlegame["blunders"] == 0
+                    ):
+                        selected = "middlegame_strategy"
+
+        if selected == "overview" and total_moves >= 8:
+            opening_end = min(16, total_moves)
+            evaluations = snapshot.get("evaluations", ()) or ()
+            opening_evaluation = (
+                evaluations[opening_end]
+                if opening_end < len(evaluations)
+                else None
+            )
+            opening_cp, opening_mate = _game_review_eval_for_mover(
+                opening_evaluation, chess.WHITE
+            )
+            opening_side = None
+            if opening_mate is not None and int(opening_mate) != 0:
+                opening_side = (
+                    chess.WHITE if int(opening_mate) > 0 else chess.BLACK
+                )
+            elif abs(int(opening_cp)) >= 150:
+                opening_side = (
+                    chess.WHITE if int(opening_cp) > 0 else chess.BLACK
+                )
+            if opening_side is not None:
+                opening_name = (
+                    "white" if opening_side == chess.WHITE else "black"
+                )
+                opening_metrics = _game_review_phase_metrics(
+                    results, opening_name, 1, opening_end
+                )
+                if opening_metrics is not None and bool(
+                    opening_metrics["count"] >= 4
+                    and opening_metrics["average_loss"] <= 35.0
+                    and opening_metrics["strong_share"] >= 0.75
+                    and opening_metrics["blunders"] == 0
+                ):
+                    selected = "opening_solid"
+
+    if selected == "overview" and won_by_checkmate:
+        win_choice = random.Random(
+            "game-review-win:"
+            f"{snapshot.get('generation', 0)}:{snapshot.get('root_fen', '')}:"
+            + ",".join(moves_uci)
+        ).randrange(3)
+        if win_choice == 1:
+            selected = "you_won"
+        elif win_choice == 2:
+            selected = "you_won_lets_review"
+
+    _GAME_REVIEW_OVERVIEW_CLIP_CACHE.update(
+        {"key": cache_key, "clip_id": selected}
+    )
+    return selected
+
+
 def get_game_review_dialogue(board, snapshot=None):
     """Dialogue/reaction for the displayed Game Review position.
 
-    The dock renderer and Piper speech share this helper, so Coach Nolan
-    speaks the same line that is shown in his speech bubble. ``speak`` is
-    deliberately false for transient "still analysing" states; Piper waits
-    for the actual rating instead of interrupting himself moments later.
+    The dock renderer and coach audio share this helper, so Coach Nolan's
+    prerecorded clips match the line shown in his speech bubble. ``speak``
+    is deliberately false for transient "still analysing" states; playback
+    waits for the actual rating instead of interrupting itself moments
+    later.
     """
     if board is None:
         return None
@@ -18485,6 +19569,7 @@ def get_game_review_dialogue(board, snapshot=None):
     else:
         reaction = "thinking"
 
+    voice_clip_ids = ()
     if result:
         ply = int(result.get("ply", current_ply))
         move_number = (ply + 1) // 2
@@ -18495,23 +19580,19 @@ def get_game_review_dialogue(board, snapshot=None):
         title_text = (
             f"{move_number}{dots} {result.get('move_san', '')} — {rating_label}"
         )
-        lines = _GAME_REVIEW_LINES.get(reaction, ())
-        speech = lines[(ply - 1) % len(lines)] if lines else ""
-        result_note = str(result.get("note") or "").strip()
-        if result.get("is_checkmate"):
-            speech = "That's checkmate."
-        elif result_note:
-            speech = result_note
-        elif reaction == "book" and result.get("opening_name"):
-            opening_name = str(result.get("opening_name")).strip()
-            book_variants = (
-                f"Book move — this is {opening_name}.",
-                f"Still in the book: {opening_name}.",
-                f"Opening theory — {opening_name}.",
-            )
-            speech = book_variants[(ply - 1) % len(book_variants)]
-        elif (
-            reaction != "book"
+        voice_clip_ids = _game_review_result_voice_clip_ids(
+            result, snapshot.get("generation", 0)
+        )
+        speech = game_review_voice_clips_text(voice_clip_ids)
+        if not speech:
+            speech = str(result.get("note") or "").strip()
+        if not speech:
+            lines = _GAME_REVIEW_LINES.get(reaction, ())
+            speech = lines[(ply - 1) % len(lines)] if lines else ""
+        if (
+            not result.get("is_checkmate")
+            and reaction != "book"
+            and len(speech) <= 150
             and not result.get("is_best_move")
             and result.get("bestmove_san")
             not in (None, "", result.get("move_san"))
@@ -18521,20 +19602,42 @@ def get_game_review_dialogue(board, snapshot=None):
         speak = True
     elif status == "empty":
         title_text = GAME_REVIEW_COACH_NAME
-        speech = "Play at least one move, then I'll happily review the game with you."
+        voice_clip_ids = ("play_one_move",)
+        speech = game_review_voice_clips_text(voice_clip_ids)
         spoken_text = speech
         speak = True
     elif status == "error":
         title_text = f"{GAME_REVIEW_COACH_NAME} hit a snag"
-        speech = snapshot.get("error") or (
-            "The review engine could not start. "
-            "Check the Stockfish path and try again."
+        raw_error = str(snapshot.get("error") or "").strip()
+        try:
+            analysed_positions = int(
+                snapshot.get("analysed_positions", 0) or 0
+            )
+        except Exception:
+            analysed_positions = 0
+        engine_start_error = bool(
+            not raw_error
+            or analysed_positions <= 1
+            or any(
+                token in raw_error.lower()
+                for token in ("stockfish", "engine", "uci", "executable")
+            )
         )
-        spoken_text = "Sorry, I hit a snag while reviewing that game."
+        if "replay legally" in raw_error.lower() or not engine_start_error:
+            speech = raw_error or "Sorry, I hit a snag while reviewing that game."
+            spoken_text = "Sorry, I hit a snag while reviewing that game."
+        else:
+            voice_clip_ids = (
+                "review_engine_fail1",
+                "review_engine_fail2",
+            )
+            speech = game_review_voice_clips_text(voice_clip_ids)
+            spoken_text = speech
         speak = True
     elif current_ply == 0:
         title_text = f"{GAME_REVIEW_COACH_NAME} · Game Review"
-        speech = "Let's look at your game together. I'm checking every move at depth 12."
+        voice_clip_ids = (_game_review_overview_voice_clip_id(snapshot),)
+        speech = game_review_voice_clips_text(voice_clip_ids)
         spoken_text = speech
         speak = status in {"analysing", "complete", "idle"}
     elif status == "analysing":
@@ -18544,9 +19647,10 @@ def get_game_review_dialogue(board, snapshot=None):
         speak = False
     else:
         title_text = f"{GAME_REVIEW_COACH_NAME} · Game Review"
-        speech = "Use the arrows or play button and I'll react to each move."
+        voice_clip_ids = ("use_arrows",)
+        speech = game_review_voice_clips_text(voice_clip_ids)
         spoken_text = speech
-        speak = False
+        speak = True
 
     # Do not include ``status`` in the key: a result already being spoken
     # should not restart merely because background analysis of later plies
@@ -18556,6 +19660,7 @@ def get_game_review_dialogue(board, snapshot=None):
         int(current_ply),
         reaction,
         spoken_text,
+        tuple(voice_clip_ids),
     )
     return {
         "snapshot": snapshot,
@@ -18567,6 +19672,7 @@ def get_game_review_dialogue(board, snapshot=None):
         "title": title_text,
         "speech": speech,
         "spoken_text": spoken_text,
+        "voice_clip_ids": tuple(voice_clip_ids),
         "speak": bool(speak and not snapshot.get("closing")),
         "speech_key": speech_key,
     }
@@ -18667,12 +19773,22 @@ def draw_game_review_coach(screen, board, mouse_pos):
         (35, 38, 52),
     )
     screen.blit(title, (bubble.x + 50, bubble.y + 9))
-    speech_font = _game_review_font(15, False)
+    long_speech = len(str(speech or "")) > 125
+    speech_font = _game_review_font(13 if long_speech else 15, False)
+    speech_line_height = 15 if long_speech else 18
     for index, line in enumerate(
-        _wrap_game_review_text(speech, speech_font, bubble.width - 66, 2)
+        _wrap_game_review_text(
+            speech,
+            speech_font,
+            bubble.width - 66,
+            3 if long_speech else 2,
+        )
     ):
         rendered = speech_font.render(line, True, (72, 76, 92))
-        screen.blit(rendered, (bubble.x + 50, bubble.y + 36 + index * 18))
+        screen.blit(
+            rendered,
+            (bubble.x + 50, bubble.y + 35 + index * speech_line_height),
+        )
     if speech_snapshot.get("speaking"):
         equaliser_x = bubble.right - 48
         equaliser_y = bubble.y + 22
@@ -30708,6 +31824,7 @@ def main():
     preload_piece_images()
     show_startup_loading("Loading sounds", "Preparing move audio", 0.34)
     preload_game_sounds()
+    preload_game_review_voice_clips()
     show_startup_loading(
         "Loading openings", "Preparing the opening books", 0.56
     )
