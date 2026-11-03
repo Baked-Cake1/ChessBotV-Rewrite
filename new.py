@@ -577,6 +577,7 @@ ANALYSIS_OVERLAY_KEYS = (
     "checkable_king",
     "unprotected_pieces",
     "piece_mobility",
+    "live_ratings",
     "backwards_pawn",
     "isolated_pawn",
     "passed_pawn",
@@ -584,7 +585,7 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
 _STRING_CONFIG_KEYS = (
     "theme",
     "board_theme",
@@ -629,12 +630,25 @@ def _snap_hash_down(value):
     return step
 
 
+def _normalise_config_int(cfg, key, default, low, high):
+    """Clamp one numeric saved setting in place and return its value."""
+    try:
+        value = round(float(cfg.get(key, default)))
+    except Exception:
+        value = int(default)
+    cfg[key] = max(int(low), min(int(high), value))
+    return cfg[key]
+
+
 def _clamp_config_limits(cfg):
     """Never let a saved config exceed this machine's safe limits."""
     try:
         cfg["threads"] = max(1, min(int(cfg.get("threads", 4)), MAX_THREADS))
     except Exception:
         cfg["threads"] = min(4, MAX_THREADS)
+    _normalise_config_int(cfg, "skill", 20, 0, 20)
+    _normalise_config_int(cfg, "depth", 25, 5, 40)
+    _normalise_config_int(cfg, "multipv", 1, 1, 5)
     try:
         h = int(cfg.get("hash", 2048))
     except Exception:
@@ -953,6 +967,27 @@ _game_review = {
     "last_advance_at": 0.0,
     "error": "",
 }
+# Live Ratings is the coach-free sibling of Game Review: one background
+# depth-12 job rates the currently displayed last move, caches it by the
+# exact root+move line, and publishes only a badge/highlight. It never
+# opens the coach dock or plays rating speech/sound effects.
+LIVE_RATING_DEPTH = GAME_REVIEW_DEPTH
+_live_rating_lock = threading.Lock()
+_live_rating_condition = threading.Condition(_live_rating_lock)
+_live_rating_thread = None
+_live_rating_evaluator_factory = None
+_live_rating_result_cache = {}
+_live_rating = {
+    "status": "idle",  # idle | analysing | ready | error
+    "request_id": 0,
+    "observed_key": None,
+    "key": None,
+    "pending_job": None,
+    "result": None,
+    "error": "",
+    "shutdown": False,
+    "reset_evaluator": False,
+}
 analysis_settings_button_hover_amount = 0.0
 analysis_settings_button_pulse_phase = 0.0
 game_review_button_hover_amount = 0.0
@@ -993,7 +1028,9 @@ autoplay_depth = AUTOPLAY_DEFAULT_DEPTH
 autoplay_side_preference = "ask"
 autoplay_broadcast_mode = "ask"
 autoplay_broadcast_target = None
-AUTOPLAY_POLL_SECONDS = 0.4
+# Screenshot polls are one-at-a-time background jobs; 50 ms keeps very
+# fast opponent replies responsive without launching overlapping captures.
+AUTOPLAY_POLL_SECONDS = 0.05
 # Nominal one-square drag time. The physical drag varies this by travel
 # distance and a small per-move random factor rather than always taking
 # exactly the same time between two square centres.
@@ -1216,6 +1253,8 @@ def set_analysis_overlay_enabled(key, enabled, persist=True):
     )
     if persist:
         save_config()
+    if key == "live_ratings" and not analysis_overlay_enabled[key]:
+        clear_live_rating()
     return analysis_overlay_enabled[key]
 
 
@@ -1998,7 +2037,10 @@ TITLE_SLIDE_SPEED = 1.0 / 48.0  # about 0.8 seconds at 60 FPS
 
 images = get_piece_images(current_theme)
 openings = load_openings()
-ANALYSIS_DEPTH = config.get("depth", 25)
+# The saved Engine Settings depth is the live analysis depth from the
+# moment the app starts. Keep this as the sole module-level assignment:
+# a later ``ANALYSIS_DEPTH = 25`` used to silently discard a saved 40.
+ANALYSIS_DEPTH = _normalise_config_int(config, "depth", 25, 5, 40)
 
 # Live engine handle (assigned in main()); used by the Engine Settings page.
 engine_thread = None
@@ -3461,7 +3503,8 @@ def update_menu_animation():
 
 
 # --- Stockfish Threading ---
-ANALYSIS_DEPTH = 25  # overwritten from config after load
+# ANALYSIS_DEPTH is synchronised from the saved configuration above and
+# by apply_engine_settings(); deliberately do not reset it to 25 here.
 
 
 class EngineThread:
@@ -3476,15 +3519,27 @@ class EngineThread:
     """
 
     def __init__(self, path, cfg):
+        global ANALYSIS_DEPTH
+        # A thread constructed from a saved config must search to that
+        # config's depth even if some other module-level default changed.
+        if isinstance(cfg, dict):
+            ANALYSIS_DEPTH = _normalise_config_int(cfg, "depth", 25, 5, 40)
         self.running = True
         self.board = chess.Board()
         self.lock = threading.Lock()
         # The main thread also talks to the engine ("stop" when a move is
         # played), so stdin writes need their own lock to never interleave.
         self.send_lock = threading.Lock()
+        # Serialises update_position's stop+publish pair with the loop's
+        # check+go pair. Without it, two very fast moves could both send
+        # their stops before the intermediate position's ``go``; Stockfish
+        # would then spend a full search on that stale position while the
+        # current readout sat at depth/NPS 0 with no PV.
+        self.search_start_lock = threading.Lock()
         # Bumped every time update_position publishes a board; lets the
         # loop tell a completed search apart from one aborted by "stop".
         self.search_token = 0
+        self._last_watchdog_repair_at = 0.0
 
         self.info = {
             "score": 0,
@@ -3495,6 +3550,10 @@ class EngineThread:
             "lines": {},  # multipv number -> {score, mate, pv}
             "fen": self.board.fen(),
             "token": self.search_token,
+            "searching": False,
+            "published_at": time.monotonic(),
+            "search_started_at": 0.0,
+            "updated_at": time.monotonic(),
         }
 
         # Parameters waiting to be applied before the next search so we
@@ -3556,30 +3615,38 @@ class EngineThread:
 
     def update_position(self, board):
         # Ask the engine to wrap up any running search BEFORE publishing
-        # the new board. UCI commands are processed in order, so this
-        # "stop" can only end a search of the OLD position - it can never
-        # cancel the fresh search the loop is about to start. When the
-        # engine is idle it simply ignores the stop.
-        try:
-            self._send("stop")
-        except Exception:
-            pass
-        with self.lock:
-            self.board = board.copy()
-            self.search_token += 1
-            # Invalidate the previous search immediately. Without this, a
-            # just-imported Auto-play position could briefly inherit the
-            # old position's depth/PV even though engine.board is new.
-            self.info = {
-                "score": 0,
-                "depth": 0,
-                "nps": 0,
-                "pv": [],
-                "mate": None,
-                "lines": {},
-                "fen": self.board.fen(),
-                "token": self.search_token,
-            }
+        # the new board, and hold search_start_lock across both steps.
+        # That makes the pair atomic against _search_position's check+go:
+        # either this stop is queued after an old ``go`` (and ends it), or
+        # the new board is already published when the loop checks its
+        # token (so it skips the stale position instead of searching it).
+        with self.search_start_lock:
+            try:
+                self._send("stop")
+            except Exception:
+                pass
+            published_at = time.monotonic()
+            with self.lock:
+                self.board = board.copy()
+                self.search_token += 1
+                # Invalidate the previous search immediately. Without
+                # this, a just-imported Auto-play position could briefly
+                # inherit the old position's depth/PV even though
+                # engine.board is new.
+                self.info = {
+                    "score": 0,
+                    "depth": 0,
+                    "nps": 0,
+                    "pv": [],
+                    "mate": None,
+                    "lines": {},
+                    "fen": self.board.fen(),
+                    "token": self.search_token,
+                    "searching": False,
+                    "published_at": published_at,
+                    "search_started_at": 0.0,
+                    "updated_at": published_at,
+                }
 
     def _reset_info(self, fen=None, token=None):
         """Zero the readout; called when the loop picks up a new position."""
@@ -3597,6 +3664,10 @@ class EngineThread:
                 "lines": {},
                 "fen": fen,
                 "token": token,
+                "searching": False,
+                "published_at": time.monotonic(),
+                "search_started_at": 0.0,
+                "updated_at": time.monotonic(),
             }
 
     def set_pending_parameters(self, params):
@@ -3617,6 +3688,72 @@ class EngineThread:
         with self.lock:
             current = self.board.copy()
         self.update_position(current)
+
+    def ensure_current_analysis(self, board, stale_seconds=1.5):
+        """Repair a diverged or apparently forgotten live search.
+
+        Fast Auto-play replies can publish two positions in the same GUI
+        frame. The atomic search-start lock prevents the known stale-go
+        race; this is a second line of defence. If the engine's board or
+        readout token no longer describes ``board``, republish it. If it
+        does describe the board but no depth/NPS/PV has appeared for a
+        while, restart that one search (rate-limited by the fresh
+        publication timestamp created by the restart itself).
+        """
+        if board is None or not getattr(self, "engine_active", False):
+            return False
+        try:
+            if board.is_game_over(claim_draw=True):
+                return False
+        except Exception:
+            return False
+
+        target_fen = board.fen()
+        now = time.monotonic()
+        try:
+            stale_seconds = max(0.25, float(stale_seconds))
+        except Exception:
+            stale_seconds = 1.5
+        with self.lock:
+            engine_fen = self.board.fen() if self.board is not None else None
+            info = dict(self.info or {})
+            current_token = int(self.search_token)
+            last_repair = float(self._last_watchdog_repair_at or 0.0)
+
+        diverged = bool(
+            engine_fen != target_fen
+            or info.get("fen") != target_fen
+            or int(info.get("token", -1)) != current_token
+        )
+        if diverged:
+            if now - last_repair < 0.25:
+                return False
+            self._last_watchdog_repair_at = now
+            self.update_position(board)
+            return True
+
+        try:
+            depth = int(info.get("depth", 0) or 0)
+            nps = int(info.get("nps", 0) or 0)
+        except Exception:
+            depth = 0
+            nps = 0
+        if depth > 0 or nps > 0 or bool(info.get("pv")):
+            return False
+
+        reference = 0.0
+        for key in ("search_started_at", "published_at", "updated_at"):
+            try:
+                reference = max(reference, float(info.get(key, 0.0) or 0.0))
+            except Exception:
+                pass
+        if reference <= 0.0 or now - reference < stale_seconds:
+            return False
+        if now - last_repair < stale_seconds:
+            return False
+        self._last_watchdog_repair_at = now
+        self.recalculate_current()
+        return True
 
     def _analyze_loop(self):
         last_searched_fen = None
@@ -3653,11 +3790,19 @@ class EngineThread:
             self._reset_info(fen, token)
 
             try:
-                self._search_position(fen, current_board.turn == chess.WHITE, token=token)
+                searched = self._search_position(
+                    fen, current_board.turn == chess.WHITE, token=token
+                )
             except Exception as e:
                 print(f"Analysis error: {e}")
                 self.engine_active = False
                 break
+
+            if not searched:
+                # A newer position was published before ``go`` could be
+                # sent. Do not mark the skipped FEN searched; loop at
+                # once and pick up the current board/token.
+                continue
 
             # Store the token as it was when the search STARTED: if a move
             # arrives mid-search, update_position bumps search_token and the
@@ -3667,15 +3812,41 @@ class EngineThread:
             last_searched_token = token
 
     def _search_position(self, fen, white_to_move, token=None):
-        """Run one depth-limited search, streaming live info into self.info."""
-        # position + go go out as a single atomic write so a "stop" from
-        # the main thread can never squeeze in between them.
-        self._send(f"position fen {fen}\ngo depth {ANALYSIS_DEPTH}")
+        """Run one depth-limited search, streaming live info into self.info.
+
+        Returns ``False`` without sending ``go`` if a newer position was
+        published after the loop snapshotted this one. The token/FEN
+        recheck and the position+go write are held under
+        ``search_start_lock`` so update_position's stop+publish pair
+        cannot slip between them during very fast consecutive moves.
+        """
+        try:
+            depth = max(1, min(40, round(float(ANALYSIS_DEPTH))))
+        except Exception:
+            depth = 25
+        with self.search_start_lock:
+            with self.lock:
+                if token is not None and int(token) != int(self.search_token):
+                    return False
+                if self.board.fen() != fen:
+                    return False
+                started_at = time.monotonic()
+                if int(self.info.get("token", -1)) == int(self.search_token):
+                    self.info["searching"] = True
+                    self.info["search_started_at"] = started_at
+                    self.info["updated_at"] = started_at
+            # position + go go out as a single atomic write so a "stop"
+            # from the main thread can never squeeze in between them.
+            self._send(f"position fen {fen}\ngo depth {depth}")
 
         while True:
             line = self._read_line()
             if line.startswith("bestmove"):
-                return
+                with self.lock:
+                    if token is None or int(token) == int(self.search_token):
+                        self.info["searching"] = False
+                        self.info["updated_at"] = time.monotonic()
+                return True
             if line.startswith("info") and not line.startswith("info string"):
                 self._parse_info_line(line, white_to_move, token=token)
 
@@ -3739,6 +3910,8 @@ class EngineThread:
             # parsed. Never let the old search repopulate the new readout.
             if token is not None and token != self.search_token:
                 return
+            self.info["searching"] = True
+            self.info["updated_at"] = time.monotonic()
             if "depth" in updates:
                 self.info["depth"] = updates["depth"]
             if "nps" in updates:
@@ -5594,6 +5767,459 @@ def start_game_review(board, history_redo=None, evaluator_factory=None):
     )
     _game_review_thread.start()
     return True
+
+
+# --- Live Ratings (coach-free last-move ratings) ---
+def _live_rating_snapshot_locked():
+    snapshot = dict(_live_rating)
+    result = snapshot.get("result")
+    snapshot["result"] = dict(result) if isinstance(result, dict) else result
+    snapshot["pending"] = snapshot.get("pending_job") is not None
+    snapshot.pop("pending_job", None)
+    return snapshot
+
+
+def get_live_rating_snapshot():
+    """Thread-safe snapshot of the Live Ratings worker/result."""
+    with _live_rating_lock:
+        return _live_rating_snapshot_locked()
+
+
+def _live_rating_board_observed_key(board):
+    if board is None or not board.move_stack:
+        return None
+    return (
+        board.fen(),
+        tuple(move.uci() for move in board.move_stack),
+    )
+
+
+def _live_rating_root_fen(board):
+    root = board.copy()
+    while root.move_stack:
+        root.pop()
+    return root.fen()
+
+
+def clear_live_rating():
+    """Invalidate the displayed/pending live rating, preserving its cache."""
+    with _live_rating_condition:
+        if (
+            _live_rating.get("status") == "idle"
+            and _live_rating.get("observed_key") is None
+            and _live_rating.get("key") is None
+            and _live_rating.get("pending_job") is None
+            and _live_rating.get("result") is None
+        ):
+            return _live_rating_snapshot_locked()
+        _live_rating.update(
+            {
+                "status": "idle",
+                "request_id": int(_live_rating.get("request_id", 0)) + 1,
+                "observed_key": None,
+                "key": None,
+                "pending_job": None,
+                "result": None,
+                "error": "",
+            }
+        )
+        _live_rating_condition.notify_all()
+        return _live_rating_snapshot_locked()
+
+
+def _live_rating_evaluate_cached(evaluator, board, evaluation_cache):
+    cache_key = board.fen()
+    cached = evaluation_cache.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    if get_game_status(board)[2]:
+        evaluation = _game_review_terminal_evaluation(board)
+    else:
+        evaluation = _evaluate_game_review_position(
+            evaluator, board, multipv=2
+        )
+    evaluation = dict(evaluation or {})
+    evaluation_cache[cache_key] = dict(evaluation)
+    if len(evaluation_cache) > 512:
+        oldest = next(iter(evaluation_cache))
+        evaluation_cache.pop(oldest, None)
+    return evaluation
+
+
+def _analyse_live_rating_job(
+    job, evaluator, opening_book=None, evaluation_cache=None
+):
+    """Rate one job's last move with the Game Review classifier."""
+    if evaluation_cache is None:
+        evaluation_cache = {}
+    root_fen = str(job.get("root_fen") or chess.STARTING_FEN)
+    sequence = [str(move_uci) for move_uci in job.get("moves_uci", ())]
+    if not sequence:
+        raise ValueError("live rating job has no move")
+
+    board = chess.Board(root_fen)
+    previous_move_uci = None
+    previous_move_was_capture = False
+    for move_uci in sequence[:-1]:
+        move = chess.Move.from_uci(move_uci)
+        if move not in board.legal_moves:
+            raise ValueError(f"live rating move is no longer legal: {move_uci}")
+        previous_move_was_capture = bool(board.is_capture(move))
+        previous_move_uci = move_uci
+        board.push(move)
+
+    move_uci = sequence[-1]
+    move = chess.Move.from_uci(move_uci)
+    if move not in board.legal_moves:
+        raise ValueError(f"live rating move is no longer legal: {move_uci}")
+    mover = board.turn
+    legal_move_count = board.legal_moves.count()
+    before_board = board.copy(stack=False)
+    move_san = board.san(move)
+    book_info = get_game_review_book_move(
+        board,
+        move,
+        sequence,
+        book=opening_book,
+    )
+    before = _live_rating_evaluate_cached(
+        evaluator, before_board, evaluation_cache
+    )
+    board.push(move)
+    after_board = board.copy(stack=False)
+    after = _live_rating_evaluate_cached(
+        evaluator, after_board, evaluation_cache
+    )
+
+    centipawn_loss = game_review_centipawn_loss(
+        before.get("cp", 0), after.get("cp", 0), mover
+    )
+    is_best_move = before.get("bestmove_uci") == move_uci
+    special = _analyse_game_review_special_context(
+        before_board,
+        after_board,
+        move,
+        mover,
+        before,
+        after,
+        centipawn_loss,
+        is_best_move,
+        legal_move_count,
+        previous_move_uci=previous_move_uci,
+        previous_move_was_capture=previous_move_was_capture,
+    )
+    rating = classify_game_review_move(
+        centipawn_loss,
+        is_best_move=is_best_move,
+        is_book_move=bool(book_info),
+        is_forced=special.get("is_forced_move", False),
+        is_brilliant=special.get("is_brilliant", False),
+        is_great=special.get("is_great", False),
+        is_miss=special.get("is_miss", False),
+        is_special_blunder=special.get("is_special_blunder", False),
+    )
+    return {
+        "key": job.get("key"),
+        "observed_key": job.get("observed_key"),
+        "root_fen": root_fen,
+        "moves_uci": tuple(sequence),
+        "ply": len(sequence),
+        "move_uci": move_uci,
+        "move_san": move_san,
+        "mover": "white" if mover == chess.WHITE else "black",
+        "rating": rating,
+        "centipawn_loss": int(centipawn_loss),
+        "is_best_move": bool(is_best_move),
+        "bestmove_uci": before.get("bestmove_uci"),
+        "bestmove_san": before.get("bestmove_san") or "—",
+        "eval_before_cp": int(before.get("cp", 0) or 0),
+        "eval_after_cp": int(after.get("cp", 0) or 0),
+        "mate_before": before.get("mate"),
+        "mate_after": after.get("mate"),
+        "depth": int(after.get("depth", LIVE_RATING_DEPTH) or LIVE_RATING_DEPTH),
+        "from_square": int(move.from_square),
+        "to_square": int(move.to_square),
+        "is_book_move": bool(book_info),
+        "opening_eco": (book_info or {}).get("opening_eco", ""),
+        "opening_name": (book_info or {}).get("opening_name", ""),
+        "is_checkmate": bool(special.get("is_checkmate")),
+        "is_forced_move": bool(special.get("is_forced_move")),
+        "is_brilliant_move": bool(special.get("is_brilliant")),
+        "is_great_move": bool(special.get("is_great")),
+        "is_miss": bool(special.get("is_miss")),
+        "miss_reason": special.get("miss_reason", ""),
+        "is_special_blunder": bool(special.get("is_special_blunder")),
+        "hanging_piece": special.get("hanging_piece", ""),
+        "sacrifice_piece": special.get("sacrifice_piece", ""),
+    }
+
+
+def _live_rating_worker():
+    global _live_rating_thread
+    evaluator = None
+    opening_book = None
+    evaluation_cache = {}
+    try:
+        while True:
+            with _live_rating_condition:
+                while (
+                    _live_rating.get("pending_job") is None
+                    and not _live_rating.get("shutdown")
+                    and not _live_rating.get("reset_evaluator")
+                ):
+                    _live_rating_condition.wait()
+                if _live_rating.get("shutdown"):
+                    break
+                reset_evaluator = bool(_live_rating.get("reset_evaluator"))
+                if reset_evaluator:
+                    _live_rating["reset_evaluator"] = False
+                job = _live_rating.get("pending_job")
+                _live_rating["pending_job"] = None
+                if job is not None and int(job.get("request_id", -1)) == int(
+                    _live_rating.get("request_id", 0)
+                ):
+                    _live_rating["status"] = "analysing"
+                    _live_rating["error"] = ""
+
+            if reset_evaluator and evaluator is not None:
+                try:
+                    evaluator.quit()
+                except Exception:
+                    pass
+                evaluator = None
+                evaluation_cache = {}
+            if job is None:
+                continue
+
+            try:
+                if evaluator is None:
+                    factory = _live_rating_evaluator_factory
+                    if callable(factory):
+                        evaluator = factory()
+                    elif factory is not None:
+                        evaluator = factory
+                    else:
+                        evaluator = _GameReviewEngine(ENGINE_PATH, config)
+                if opening_book is None:
+                    try:
+                        opening_book = load_game_review_opening_book()
+                    except Exception:
+                        opening_book = {}
+                result = _analyse_live_rating_job(
+                    job,
+                    evaluator,
+                    opening_book=opening_book,
+                    evaluation_cache=evaluation_cache,
+                )
+                with _live_rating_condition:
+                    _live_rating_result_cache[job.get("key")] = dict(result)
+                    if len(_live_rating_result_cache) > 256:
+                        oldest = next(iter(_live_rating_result_cache))
+                        _live_rating_result_cache.pop(oldest, None)
+                    if (
+                        not _live_rating.get("shutdown")
+                        and int(job.get("request_id", -1))
+                        == int(_live_rating.get("request_id", 0))
+                        and _live_rating.get("observed_key")
+                        == job.get("observed_key")
+                    ):
+                        _live_rating.update(
+                            {
+                                "status": "ready",
+                                "result": dict(result),
+                                "error": "",
+                            }
+                        )
+            except Exception as exc:
+                if evaluator is not None:
+                    try:
+                        evaluator.quit()
+                    except Exception:
+                        pass
+                    evaluator = None
+                with _live_rating_condition:
+                    if (
+                        not _live_rating.get("shutdown")
+                        and int(job.get("request_id", -1))
+                        == int(_live_rating.get("request_id", 0))
+                        and _live_rating.get("observed_key")
+                        == job.get("observed_key")
+                    ):
+                        _live_rating.update(
+                            {
+                                "status": "error",
+                                "result": None,
+                                "error": str(exc),
+                            }
+                        )
+                print(f"Live rating unavailable: {exc}")
+    finally:
+        if evaluator is not None:
+            try:
+                evaluator.quit()
+            except Exception:
+                pass
+        with _live_rating_condition:
+            if _live_rating_thread is threading.current_thread():
+                _live_rating_thread = None
+
+
+def _ensure_live_rating_worker():
+    global _live_rating_thread
+    with _live_rating_condition:
+        if _live_rating_thread is not None and _live_rating_thread.is_alive():
+            _live_rating_condition.notify_all()
+            return _live_rating_thread
+        _live_rating["shutdown"] = False
+        thread = threading.Thread(
+            target=_live_rating_worker,
+            name="ChessBotV-LiveRating",
+            daemon=True,
+        )
+        _live_rating_thread = thread
+    try:
+        thread.start()
+    except Exception as exc:
+        with _live_rating_condition:
+            if _live_rating_thread is thread:
+                _live_rating_thread = None
+            _live_rating.update(
+                {"status": "error", "result": None, "error": str(exc)}
+            )
+        return None
+    with _live_rating_condition:
+        _live_rating_condition.notify_all()
+    return thread
+
+
+def sync_live_rating(board):
+    """Queue/cache the coach-free rating for the displayed last move."""
+    if board is None:
+        return get_live_rating_snapshot()
+    if not analysis_overlay_enabled.get("live_ratings", False):
+        return clear_live_rating()
+    if game_review_is_active():
+        return get_live_rating_snapshot()
+
+    observed_key = _live_rating_board_observed_key(board)
+    if observed_key is None:
+        return clear_live_rating()
+    snapshot = get_live_rating_snapshot()
+    if snapshot.get("observed_key") == observed_key:
+        return snapshot
+
+    root_fen = _live_rating_root_fen(board)
+    moves_uci = tuple(observed_key[1])
+    key = (root_fen, moves_uci)
+    needs_worker = False
+    with _live_rating_condition:
+        if _live_rating.get("observed_key") == observed_key:
+            return _live_rating_snapshot_locked()
+        request_id = int(_live_rating.get("request_id", 0)) + 1
+        cached = _live_rating_result_cache.get(key)
+        _live_rating.update(
+            {
+                "request_id": request_id,
+                "observed_key": observed_key,
+                "key": key,
+                "error": "",
+            }
+        )
+        if cached is not None:
+            _live_rating.update(
+                {
+                    "status": "ready",
+                    "pending_job": None,
+                    "result": dict(cached),
+                }
+            )
+        else:
+            _live_rating.update(
+                {
+                    "status": "analysing",
+                    "pending_job": {
+                        "request_id": request_id,
+                        "observed_key": observed_key,
+                        "key": key,
+                        "root_fen": root_fen,
+                        "moves_uci": moves_uci,
+                    },
+                    "result": None,
+                }
+            )
+            needs_worker = True
+        snapshot = _live_rating_snapshot_locked()
+        _live_rating_condition.notify_all()
+
+    if needs_worker:
+        _ensure_live_rating_worker()
+        snapshot = get_live_rating_snapshot()
+    return snapshot
+
+
+def get_live_rating_current_result(board):
+    """Ready Live Rating for ``board``'s last move, if it is current."""
+    if (
+        board is None
+        or not board.move_stack
+        or not analysis_overlay_enabled.get("live_ratings", False)
+        or game_review_is_active()
+    ):
+        return None
+    observed_key = _live_rating_board_observed_key(board)
+    snapshot = get_live_rating_snapshot()
+    if snapshot.get("status") != "ready" or snapshot.get("observed_key") != observed_key:
+        return None
+    result = snapshot.get("result")
+    if not isinstance(result, dict):
+        return None
+    move = board.move_stack[-1]
+    if (
+        result.get("move_uci") != move.uci()
+        or int(result.get("from_square", -1)) != int(move.from_square)
+        or int(result.get("to_square", -1)) != int(move.to_square)
+        or result.get("rating") not in GAME_REVIEW_RATINGS
+    ):
+        return None
+    return dict(result)
+
+
+def shutdown_live_rating_worker():
+    """Ask the Live Ratings worker/evaluator to stop at app shutdown."""
+    with _live_rating_condition:
+        _live_rating.update(
+            {
+                "status": "idle",
+                "request_id": int(_live_rating.get("request_id", 0)) + 1,
+                "observed_key": None,
+                "key": None,
+                "pending_job": None,
+                "result": None,
+                "error": "",
+                "shutdown": True,
+            }
+        )
+        _live_rating_condition.notify_all()
+
+
+def reset_live_rating_for_tests():
+    """Clear live-rating caches and force a fresh evaluator in tests."""
+    with _live_rating_condition:
+        _live_rating_result_cache.clear()
+        _live_rating.update(
+            {
+                "status": "idle",
+                "request_id": int(_live_rating.get("request_id", 0)) + 1,
+                "observed_key": None,
+                "key": None,
+                "pending_job": None,
+                "result": None,
+                "error": "",
+                "shutdown": False,
+                "reset_evaluator": True,
+            }
+        )
+        _live_rating_condition.notify_all()
 
 
 # --- Game Review prerecorded voice clips ---
@@ -17618,6 +18244,22 @@ def draw_game_review_rating_badge(screen, board):
     )
 
 
+def draw_live_rating_badge(screen, board):
+    """Badge the last move for Live Ratings, without coach or sound."""
+    result = get_live_rating_current_result(board)
+    if not result or not board.move_stack:
+        return False
+    move = board.move_stack[-1]
+    x, y = square_to_screen(move.to_square)
+    draw_game_review_rating_icon(
+        screen,
+        result.get("rating"),
+        (x + SQUARE_SIZE - 13, y + 13),
+        26,
+    )
+    return True
+
+
 def _wrap_game_review_text(text, font, max_width, max_lines=2):
     words = str(text).split()
     if not words:
@@ -19867,7 +20509,7 @@ def draw_game_review_coach(screen, board, mouse_pos):
 
 
 # The new Analysis page deliberately uses very large rows and scrolling
-# instead of reducing seven separate board overlays to cramped controls.
+# instead of reducing eight separate board overlays to cramped controls.
 ANALYSIS_OVERLAY_ROW_WIDTH = 600
 ANALYSIS_OVERLAY_ROW_HEIGHT = 112
 ANALYSIS_OVERLAY_ROW_GAP = 18
@@ -19901,6 +20543,12 @@ ANALYSIS_OVERLAY_SECTIONS = (
                 "Piece Mobility",
                 "Legal-move percentage at each piece's lower-left",
                 "percent",
+            ),
+            (
+                "live_ratings",
+                "Live Ratings",
+                "Depth-12 rating badge and highlight on the last move",
+                "live_ratings",
             ),
         ),
     ),
@@ -20068,6 +20716,8 @@ def _draw_analysis_overlay_toggle_icon(screen, icon, centre):
             screen.blit(image, image.get_rect(center=(cx, cy)))
         else:
             _draw_fallback_unprotected_icon(screen, (cx, cy), 34)
+    elif icon == "live_ratings":
+        draw_game_review_rating_icon(screen, "brilliant", (cx, cy), 44)
     elif icon == "percent":
         text = font_large.render("%", True, (64, 165, 245))
         shadow = font_large.render("%", True, (18, 34, 54))
@@ -21542,7 +22192,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
     """Draw the Settings-main Analysis Settings navigation row.
 
     The caller owns the original 400x50 row, hover gating and navigation.
-    This visual-only renderer summarises the seven board overlays and the
+    This visual-only renderer summarises the eight board overlays and the
     Game Review coach with a magnified-board medallion, live eval trace and
     the eleven coach rating badges on the right.
     """
@@ -21702,8 +22352,9 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         border_radius=8,
     )
 
-    # Bottom inlay: seven overlay pips, lit only for enabled overlays.
+    # Bottom inlay: eight overlay pips, lit only for enabled overlays.
     pip_y = visual_rect.bottom - 5
+    pip_start_x = visual_rect.centerx - (len(ANALYSIS_OVERLAY_KEYS) - 1) * 10
     for index, key in enumerate(ANALYSIS_OVERLAY_KEYS):
         enabled = bool(analysis_overlay_enabled.get(key, False))
         colour = (
@@ -21714,7 +22365,7 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         pygame.draw.circle(
             screen,
             colour,
-            (visual_rect.centerx - 60 + index * 20, pip_y),
+            (pip_start_x + index * 20, pip_y),
             2,
         )
 
@@ -21798,7 +22449,10 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
         subtitle_text = "Coach review ready"
         subtitle_colour = (160, 240, 190)
     else:
-        subtitle_text = f"{enabled_count} of 7 overlays on · Coach review"
+        subtitle_text = (
+            f"{enabled_count} of {len(ANALYSIS_OVERLAY_KEYS)} overlays on "
+            "· Coach review"
+        )
         subtitle_colour = _lerp_color(
             (203, 205, 235), (240, 242, 255), hover_amount
         )
@@ -22593,27 +23247,30 @@ def reset_engine_settings():
 def apply_engine_settings():
     global ANALYSIS_DEPTH, engine_has_changes
     changed=False
-    multipv_changed=False
     for k in ENGINE_ROW_KEYS:
         if engine_draft.get(k) != config.get(k):
             config[k]=engine_draft[k]
             changed=True
-            if k == "multipv":
-                multipv_changed=True
-            if k == "depth":
-                ANALYSIS_DEPTH = engine_draft[k]
             if engine_thread is not None and k in ENGINE_PARAM_NAMES:
                 engine_thread.set_pending_parameters({ENGINE_PARAM_NAMES[k]: engine_draft[k]})
+    # The saved depth is a runtime value, not just a config entry. Sync
+    # it even if Save was somehow reached with a stale mirror, then save
+    # the normalised config before restarting the current search.
+    saved_depth = _normalise_config_int(config, "depth", 25, 5, 40)
+    depth_was_stale = int(ANALYSIS_DEPTH) != int(saved_depth)
+    ANALYSIS_DEPTH = saved_depth
     if changed:
         save_config()
-    # MultiPV changes the number/shape of lines for the position already
-    # on screen, so applying it must immediately recalculate that board
-    # rather than waiting for the next move.
-    if multipv_changed and engine_thread is not None:
+    # Every saved engine row affects the position already on screen:
+    # depth/skill change the search itself, while Threads/Hash/MultiPV
+    # are queued UCI options. Recalculate once so all of them apply now
+    # rather than waiting for the next move. This also repairs a stale
+    # depth mirror if the config and ANALYSIS_DEPTH ever diverge again.
+    if (changed or depth_was_stale) and engine_thread is not None:
         try:
             engine_thread.recalculate_current()
         except Exception as exc:
-            print(f"Failed to recalculate after MultiPV change: {exc}")
+            print(f"Failed to recalculate after engine settings change: {exc}")
     engine_has_changes=False
 
 
@@ -31204,6 +31861,18 @@ def draw_gui(
 
     # 2. Board — supports flip and smooth evaluation-side slide
     board_ox = int(get_board_ox())
+    live_last_move = None
+    live_move_highlight = {}
+    if (
+        analysis_overlay_enabled.get("live_ratings", False)
+        and board.move_stack
+        and not game_review_is_active()
+    ):
+        live_last_move = board.move_stack[-1]
+        live_move_highlight = {
+            int(live_last_move.from_square): 105,
+            int(live_last_move.to_square): 150,
+        }
     for r in range(8):
         for f in range(8):
             color = LIGHT_SQ if (r + f) % 2 == 0 else DARK_SQ
@@ -31227,6 +31896,11 @@ def draw_gui(
                 vis_file = f
                 vis_rank = 7 - r
             sq = chess.square(vis_file, vis_rank)
+            live_highlight_alpha = live_move_highlight.get(int(sq), 0)
+            if live_highlight_alpha:
+                s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+                s.fill((246, 199, 49, int(live_highlight_alpha)))
+                screen.blit(s, sq_rect.topleft)
             if sq == selected_sq:
                 s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
                 s.fill(HIGHLIGHT_COLOR)
@@ -31597,8 +32271,10 @@ def draw_gui(
     else:
         anim_mgr.reset_drag_grab_pose()
 
-    # The Game Review badge is deliberately the last board marker, so it
-    # sits over the same-corner Unprotected Pieces icon as requested.
+    # Live Ratings and Game Review badges are deliberately the last board
+    # markers, so they sit over the same-corner Unprotected Pieces icon.
+    # The live helper suppresses itself while Game Review is active.
+    draw_live_rating_badge(screen, board)
     draw_game_review_rating_badge(screen, board)
 
     # Promotion choice overlay (must be over board but under menu)
@@ -32328,7 +33004,7 @@ def main():
         else:
             _autoplay_set_status(
                 f"Auto-play played {move_san}; checking the board in "
-                f"{AUTOPLAY_POLL_SECONDS:.1f}s..."
+                f"{round(AUTOPLAY_POLL_SECONDS * 1000)}ms..."
             )
         return True
 
@@ -33068,6 +33744,11 @@ def main():
         update_slider_display()
         update_global_anims()
         update_board_detection()
+        try:
+            engine_thread.ensure_current_analysis(board)
+        except Exception as exc:
+            print(f"Engine analysis watchdog failed: {exc}")
+        sync_live_rating(board)
         update_autoplay()
         update_advisor()
         update_game_review()
@@ -33541,6 +34222,7 @@ def main():
                 apply_always_on_top(True, persist=False)
         clock.tick(FPS)
 
+    shutdown_live_rating_worker()
     engine_thread.quit()
     pygame.quit()
     if restart_requested:
