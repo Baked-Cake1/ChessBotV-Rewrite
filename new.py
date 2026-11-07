@@ -8,6 +8,7 @@ import json
 import math
 import os
 import queue
+import sqlite3
 import random
 import re
 import subprocess
@@ -3507,6 +3508,191 @@ def update_menu_animation():
 # by apply_engine_settings(); deliberately do not reset it to 25 here.
 
 
+# Training data is local, never part of the source checkout.
+TRAINING_DEPTH = 40
+
+
+class TrainingStore:
+    """Atomic JSON position book plus a disk-backed, resumable BFS frontier."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.path = self.directory / "positions.json"
+        self.records = {}
+        self.error = None
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if data.get("version") != 1 or not isinstance(data.get("positions"), dict):
+                    raise ValueError("Unsupported training file")
+                self.records = data["positions"]
+        except Exception as exc:
+            # Never overwrite a damaged or incompatible existing book.
+            self.error = str(exc)
+
+    def lookup(self, board):
+        record = self.records.get(board.fen())
+        if not isinstance(record, dict):
+            return None
+        try:
+            pv = [chess.Move.from_uci(m) for m in record["pv"]]
+            clone = board.copy()
+            for move in pv:
+                if move not in clone.legal_moves:
+                    return None
+                clone.push(move)
+            if pv and int(record["depth"]) > 0:
+                return record
+        except (KeyError, ValueError, TypeError):
+            pass
+        return None
+
+    def save(self, board, info):
+        if self.error:
+            raise RuntimeError(self.error)
+        if info.get("fen") != board.fen():
+            return False
+        pv = list(info.get("pv", []))
+        depth = int(info.get("depth", 0))
+        if not pv or pv[0] not in board.legal_moves or depth <= 0:
+            return False
+        previous = self.lookup(board)
+        if previous and previous["depth"] >= depth:
+            return True
+        record = {"fen": board.fen(), "side_to_move": "white" if board.turn else "black",
+                  "best_move": pv[0].uci(), "best_move_san": board.san(pv[0]),
+                  "depth": depth, "score_cp_white": info.get("score"),
+                  "mate_white": info.get("mate"), "pv": [m.uci() for m in pv],
+                  "updated_at": time.time()}
+        updated = dict(self.records)
+        updated[board.fen()] = record
+        self.directory.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=str(self.directory), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "positions": updated}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            self.records = updated
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return True
+
+
+training_store = TrainingStore(os.path.join(SCRIPT_DIR, "training"))
+
+
+class TrainingSession:
+    def __init__(self):
+        self.mode = None
+        self.fen = None
+        self.ready = False
+        self.status = "Training idle"
+        self.db = None
+
+    def blocked(self):
+        return self.mode == "auto" or (self.mode == "manual" and not self.ready)
+
+    def start(self, mode, board, engine):
+        if training_store.error:
+            self.status = "Training file error: " + training_store.error
+            return
+        if not engine.engine_active:
+            self.status = "Training requires a working engine"
+            return
+        self.mode, self.fen, self.ready = mode, None, False
+        engine.training_depth = TRAINING_DEPTH
+        engine.recalculate_current()
+        if mode == "auto":
+            training_store.directory.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(str(training_store.directory / "frontier.sqlite3"))
+            self.db.execute("CREATE TABLE IF NOT EXISTS frontier (id INTEGER PRIMARY KEY, fen TEXT UNIQUE, done INTEGER DEFAULT 0)")
+            if not self.db.execute("SELECT 1 FROM frontier LIMIT 1").fetchone():
+                root = chess.Board()
+                for move in list(root.legal_moves):
+                    child = root.copy(); child.push(move)
+                    self.db.execute("INSERT OR IGNORE INTO frontier(fen) VALUES (?)", (child.fen(),))
+                self.db.commit()
+        self.status = mode.title() + " training started"
+
+    def stop(self, board, engine):
+        if self.mode:
+            self.persist(board, engine)
+        self.mode = None
+        engine.training_depth = None
+        if self.db:
+            self.db.close(); self.db = None
+        engine.recalculate_current()
+        self.status = "Training stopped; saved progress"
+
+    def persist(self, board, engine):
+        with engine.lock:
+            info = dict(engine.info)
+        try:
+            return training_store.save(board, info)
+        except Exception as exc:
+            self.status = "Save failed: " + str(exc)
+            return False
+
+    def finish(self, board):
+        if self.mode == "auto":
+            # Expand even cached nodes: a completed position is not a completed subtree.
+            with self.db:
+                if not board.is_game_over(claim_draw=True):
+                    for move in list(board.legal_moves):
+                        child = board.copy(); child.push(move)
+                        self.db.execute("INSERT OR IGNORE INTO frontier(fen) VALUES (?)", (child.fen(),))
+                self.db.execute("UPDATE frontier SET done=1 WHERE fen=?", (board.fen(),))
+            self.fen = None
+        else:
+            self.ready = True
+
+    def skip(self, board, engine):
+        if self.mode and not self.ready:
+            if self.persist(board, engine):
+                self.status = "Skipped; saved achieved depth"
+                self.finish(board)
+            else:
+                self.status = "Waiting for first engine result before skip"
+
+    def tick(self, board, engine):
+        if not self.mode:
+            return
+        if self.mode == "auto" and self.fen is None:
+            row = self.db.execute("SELECT fen FROM frontier WHERE done=0 ORDER BY id LIMIT 1").fetchone()
+            if not row:
+                self.stop(board, engine)
+                return
+            board.set_fen(row[0])
+            engine.update_position(board)
+        if self.fen != board.fen():
+            self.fen, self.ready = board.fen(), False
+            record = training_store.lookup(board)
+            if record and record["depth"] >= TRAINING_DEPTH:
+                self.status = "Position already done; skipped"
+                self.finish(board)
+                return
+        if self.ready:
+            return
+        if board.is_game_over(claim_draw=True):
+            self.status = "Terminal position; no analysis needed"
+            self.finish(board)
+            return
+        with engine.lock:
+            info = dict(engine.info)
+        self.status = f"{self.mode.title()} training: depth {info.get('depth', 0)}/40"
+        if info.get("fen") == self.fen and info.get("depth", 0) >= TRAINING_DEPTH:
+            if self.persist(board, engine):
+                self.status = "Saved depth 40; next move ready"
+                self.finish(board)
+
+
+training_session = TrainingSession()
+training_action = None
+
+
 class EngineThread:
     """Runs Stockfish in a background thread and reports live search info.
 
@@ -3524,6 +3710,7 @@ class EngineThread:
         # config's depth even if some other module-level default changed.
         if isinstance(cfg, dict):
             ANALYSIS_DEPTH = _normalise_config_int(cfg, "depth", 25, 5, 40)
+        self.training_depth = None
         self.running = True
         self.board = chess.Board()
         self.lock = threading.Lock()
@@ -3788,6 +3975,20 @@ class EngineThread:
             # Fresh position (a move was played): zero the readout so
             # depth/nps restart from 0 and climb during the new search.
             self._reset_info(fen, token)
+            cached = training_store.lookup(current_board)
+            target = self.training_depth or ANALYSIS_DEPTH
+            if cached:
+                with self.lock:
+                    if self.search_token == token:
+                        moves = [chess.Move.from_uci(m) for m in cached["pv"]]
+                        self.info.update(depth=cached["depth"], pv=moves,
+                                         score=cached.get("score_cp_white", 0),
+                                         mate=cached.get("mate_white"),
+                                         lines={1: {"pv": moves, "score": cached.get("score_cp_white", 0),
+                                                    "mate": cached.get("mate_white")}})
+                if cached["depth"] >= target and not pending:
+                    last_searched_fen, last_searched_token = fen, token
+                    continue
 
             try:
                 searched = self._search_position(
@@ -3821,7 +4022,7 @@ class EngineThread:
         cannot slip between them during very fast consecutive moves.
         """
         try:
-            depth = max(1, min(40, round(float(ANALYSIS_DEPTH))))
+            depth = max(1, min(40, round(float(self.training_depth or ANALYSIS_DEPTH))))
         except Exception:
             depth = 25
         with self.search_start_lock:
@@ -7504,6 +7705,8 @@ def get_castling_info(board, from_sq, to_sq):
 def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=True):
     """Attempt to push from_sq->to_sq (with promotion/castling/capture).
     Returns True if the move was legal and executed."""
+    if training_session.blocked():
+        return False
     move = build_move_with_promotion(board, from_sq, to_sq)
     if move not in board.legal_moves:
         return False
@@ -7545,6 +7748,8 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
         anim_mgr.add_rook_only(rook_piece, rook_start_sq, rook_target_sq)
 
     board.push(move)
+    if training_session.mode == "manual":
+        training_session.ready = False
     engine_thread.update_position(board)
     play_move_sound(board_before, move)
     return True
@@ -7603,6 +7808,8 @@ def draw_promotion_menu(screen, color):
 
 
 def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_piece, animate=True):
+    if training_session.blocked():
+        return False
     move = chess.Move(from_sq, to_sq, promotion=promo_piece)
     if move not in board.legal_moves:
         return False
@@ -7614,6 +7821,8 @@ def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_
     if animate:
         anim_mgr.add_move(board.piece_at(from_sq), from_sq, to_sq, is_castling, rook_start_sq, rook_target_sq, rook_piece)
     board.push(move)
+    if training_session.mode == "manual":
+        training_session.ready = False
     engine_thread.update_position(board)
     play_move_sound(board_before, move)
     return True
@@ -20599,7 +20808,7 @@ def _analysis_overlay_layout(offset_x=0, offset_y=0):
             if section_index < len(ANALYSIS_OVERLAY_SECTIONS) - 1
             else 12
         )
-    total_height += GAME_REVIEW_BUTTON_HEIGHT + 24
+    total_height += GAME_REVIEW_BUTTON_HEIGHT + 24 + 104
     max_scroll = max(0, total_height - viewport.height)
     try:
         scroll = float(analysis_overlay_scroll_offset)
@@ -20652,7 +20861,7 @@ def _analysis_overlay_layout(offset_x=0, offset_y=0):
         )
     game_review_rect = pygame.Rect(
         row_x,
-        cursor_y,
+        cursor_y + 104,
         ANALYSIS_OVERLAY_ROW_WIDTH,
         GAME_REVIEW_BUTTON_HEIGHT,
     )
@@ -20808,6 +21017,14 @@ def _draw_analysis_overlay_toggle_row(screen, item, hovered):
     return pill
 
 
+def training_buttons(review_rect):
+    labels = ("Auto Training", "Manual Training", "Skip / Save", "Stop Training", "Reset Board")
+    width = (review_rect.width - 24) // 3
+    return [(label, pygame.Rect(review_rect.x + (i % 3) * (width + 8),
+                                review_rect.y - 104 + (i // 3) * 48, width, 40))
+            for i, label in enumerate(labels)]
+
+
 def draw_analysis_content(screen, offset_x=0, offset_y=0):
     """Draw the scrollable Analysis Settings page and its two sections."""
     mx, my = pygame.mouse.get_pos()
@@ -20819,6 +21036,10 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
     previous_clip = screen.get_clip()
     screen.set_clip(viewport)
     try:
+        for label, rect in training_buttons(review_rect):
+            pygame.draw.rect(screen, (56, 68, 92), rect, border_radius=8)
+            text = font_small.render(label, True, TEXT_COLOR)
+            screen.blit(text, text.get_rect(center=rect.center))
         for section in sections:
             header_rect = section["header_rect"]
             if header_rect.bottom >= viewport.y and header_rect.y <= viewport.bottom:
@@ -31437,6 +31658,7 @@ def handle_menu_click(mx, my):
     global current_theme, images, theme_scroll_offset, settings_menu_target
     global engine_slider_dragging, restart_requested
     global show_auto_color_dialog, auto_color_dialog_anim
+    global training_action
 
     if menu_anim_progress < 1.0 or menu_transition_direction != "none":
         return True
@@ -31453,6 +31675,12 @@ def handle_menu_click(mx, my):
             return True
 
     if settings_menu_state == "analysis":
+        viewport, _, _, _, _, review_rect = _analysis_overlay_layout()
+        for label, rect in training_buttons(review_rect):
+            if viewport.collidepoint(mx, my) and rect.collidepoint(mx, my):
+                training_action = label
+                begin_settings_menu_close()
+                return True
         if _game_review_button_at((mx, my)):
             request_game_review()
             begin_settings_menu_close()
@@ -32477,6 +32705,7 @@ def draw_gui(
 
 
 def main():
+    global training_action
     global menu_anim_progress, menu_anim_opening, menu_anim_closing
     global menu_transition_direction, engine_thread, promotion_pending, restart_requested, engine_slider_dragging
     global show_newgame_confirm, confirm_anim, board_flipped, board_ox_current, eval_bar_x_current, board_ox_target, eval_bar_x_target, board_anim_t, eval_bar_side
@@ -33739,6 +33968,30 @@ def main():
         advisor_refresh_overlay()
 
     while running:
+        if training_action:
+            action, training_action = training_action, None
+            if action in ("Auto Training", "Manual Training"):
+                if training_session.mode:
+                    training_session.stop(board, engine_thread)
+                set_auto_move(False)
+                stop_autoplay()
+                stop_advisor()
+                cancel_game_review()
+                selected_sq = None
+                dragging = False
+                promotion_pending = None
+                history_redo.clear()
+                training_session.start("auto" if action == "Auto Training" else "manual", board, engine_thread)
+            elif action == "Skip / Save":
+                training_session.skip(board, engine_thread)
+            elif action == "Stop Training":
+                training_session.stop(board, engine_thread)
+            elif action == "Reset Board":
+                if training_session.mode == "auto":
+                    training_session.stop(board, engine_thread)
+                reset_game()
+                training_session.fen = None
+        training_session.tick(board, engine_thread)
         anim_mgr.update()
         update_board_layout_anim()
         update_slider_display()
@@ -33821,6 +34074,7 @@ def main():
             auto_pos_frames += 1
         if (
             auto_move_enabled
+            and not training_session.mode
             and not game_review_is_active()
             and not _autoplay.get("enabled")
             and not _advisor.get("enabled")
@@ -34108,6 +34362,14 @@ def main():
                     scroll_theme_list(-event.y * theme_scroll_speed)
 
             elif event.type == pygame.KEYDOWN:
+                if training_session.mode and event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE):
+                    continue
+                if training_session.mode and event.key == pygame.K_F6:
+                    training_session.skip(board, engine_thread)
+                    continue
+                if training_session.mode and event.key == pygame.K_F7:
+                    training_session.stop(board, engine_thread)
+                    continue
                 if show_board_detection_dialog:
                     handle_board_detection_key(event.key)
                     continue
@@ -34213,6 +34475,10 @@ def main():
             view_ply=len(board.move_stack),
             total_ply=len(board.move_stack) + len(history_redo),
         )
+        if training_session.mode or training_session.status != "Training idle":
+            text = font_tiny.render(training_session.status + " | F6 Skip  F7 Stop", True, TEXT_COLOR)
+            screen.blit(text, (PADDING, HEIGHT - 18))
+            pygame.display.update(pygame.Rect(0, HEIGHT - 20, WIDTH, 20))
         # The import-time SetWindowPos can race SDL actually presenting
         # the native window; assert the saved topmost preference once
         # more after the first presented frame.
@@ -34222,6 +34488,8 @@ def main():
                 apply_always_on_top(True, persist=False)
         clock.tick(FPS)
 
+    if training_session.mode:
+        training_session.stop(board, engine_thread)
     shutdown_live_rating_worker()
     engine_thread.quit()
     pygame.quit()
