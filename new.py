@@ -18954,66 +18954,38 @@ def _draw_game_review_coach_character(
             pygame.draw.ellipse(blush, (238, 130, 116, 62), blush.get_rect())
             canvas.blit(blush, p(head_cx + side * 20 - 8, 66 + head_y))
 
-    if reaction == "best":
-        # Lifted-cheek creases work for both the static grin and Piper's
-        # animated speaking mouth.
-        for side in (-1, 1):
-            line(
-                skin_shadow,
-                [
-                    (head_cx + side * 4.5, 68 + head_y),
-                    (head_cx + side * 10.5, 71 + head_y),
-                    (head_cx + side * 16.0, 72.5 + head_y),
-                ],
-                0.8,
-            )
-            line(
-                skin_shadow,
-                [
-                    (head_cx + side * 13.5, 75 + head_y),
-                    (head_cx + side * 15.5, 72.5 + head_y),
-                ],
-                0.9,
-            )
-        line(
-            skin_shadow,
-            [(head_cx - 2.2, 87 + head_y), (head_cx + 2.2, 87 + head_y)],
-            0.7,
-        )
-
     mouth_y = 76 + head_y
     if reaction == "best":
-        # Keep Best's mouth deliberately ordinary: a small friendly smile
-        # with only a modest opening while Piper is speaking. The former
-        # broad tooth/tongue construction looked over-polished and odd at
-        # dock size, especially with a large animated teeth oval.
-        mouth_h = 3.2 + 5.2 * mouth_open
-        ellipse(
-            (112, 50, 45),
-            (head_cx - 8, mouth_y - 1.5, 16, mouth_h + 3.0),
-        )
-        ellipse(skin, (head_cx - 9, mouth_y - 5.0, 18, 5.0))
-        if mouth_open > 0.08:
-            ellipse(
-                (246, 248, 248),
-                (head_cx - 5.5, mouth_y - 1.0, 11, 2.3),
+        # One continuous smile silhouette, rather than overlapping arcs,
+        # skin masks and an always-open oval. Keep the corners anchored
+        # as the speech envelope lowers the bottom lip. At rest this is
+        # a slim closed-mouth smile, not a second mouth below a grin.
+        smile_width = 15.0 - 1.5 * mouth_open
+        smile_height = 1.0 + 6.0 * mouth_open
+
+        def smile_point(t, lower=False):
+            curve = 4.0 * t * (1.0 - t)
+            return (
+                head_cx + (t - 0.5) * smile_width,
+                mouth_y - 0.8 + (1.8 + (smile_height if lower else 0.0)) * curve,
             )
-        pygame.draw.arc(
-            canvas,
-            (126, 55, 48),
-            r(head_cx - 9, mouth_y - 6.0, 18, 12),
-            math.pi * 1.08,
-            math.pi * 1.92,
-            max(1, round(1.7 * sx)),
-        )
-        for side in (-1, 1):
-            line(
-                (126, 55, 48),
-                [
-                    (head_cx + side * 8.5, mouth_y + 0.4),
-                    (head_cx + side * 11.0, mouth_y - 0.8),
-                ],
-                0.9,
+
+        smile_steps = 24
+        smile_top = [smile_point(i / smile_steps) for i in range(smile_steps + 1)]
+        smile_bottom = [smile_point(i / smile_steps, True)
+                        for i in range(smile_steps, -1, -1)]
+        poly((112, 50, 45), smile_top + smile_bottom)
+
+        # A short tooth highlight stays entirely inside the opening and
+        # fades in geometrically with speech; no floating white oval or
+        # extra lip arc crosses the mouth.
+        tooth_height = max(0.0, min(1.2, (mouth_open - 0.15) * 2.0))
+        if tooth_height > 0.0:
+            tooth_top = [smile_point(0.24 + i * 0.52 / 12) for i in range(13)]
+            poly(
+                (246, 238, 220),
+                [(x, y + 0.25) for x, y in tooth_top]
+                + [(x, y + 0.25 + tooth_height) for x, y in reversed(tooth_top)],
             )
     elif mouth_open > 0.03:
         # Speaking mouth: Piper's RMS envelope opens the jaw while the
