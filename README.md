@@ -351,9 +351,9 @@ Bug reports / visual issues / ideas → open an **Issue**. Pull requests welcome
 In **Analysis Settings**, scroll to the training controls above Game Review:
 
 - **Auto Training** starts with the 20 legal White opening moves, analyses each
-  resulting position to depth 40, then explores every legal reply breadth-first.
+  resulting position to depth 35, then explores every legal reply breadth-first.
   The disk-backed frontier resumes when Auto Training is started again.
-- **Manual Training** analyses the current position to depth 40 before enabling
+- **Manual Training** analyses the current position to depth 35 before enabling
   the next move. Move either colour to explore your own opening lines.
 - **Skip / Save** (or **F6**) saves the latest available result at its actual
   depth and advances/unlocks the board. Wait for at least one engine result.
@@ -366,12 +366,12 @@ UCI/SAN best moves, depth, White-relative centipawn/mate evaluation, PV, and
 update time. New results merge atomically without replacing deeper results.
 Normal engine recommendations read the book first; sufficiently deep records
 avoid another search, while shallow records still receive further analysis.
-Training skips existing depth-40 records, but revisits shallower skipped ones
+Training skips existing depth-35 records, but revisits shallower skipped ones
 when encountered again. Auto mode still expands cached positions' replies.
 `training/frontier.sqlite3` stores the resumable queue; both files are local and
 Git-ignored. Back up the JSON to transfer the position book. Delete the frontier
 with the app closed to restart traversal while keeping the book.
 
-Depth 40 can take a very long time. Exhaustive chess exploration is not
+Depth 35 can take a very long time. Exhaustive chess exploration is not
 practically finishable, and the frontier/book can grow very large. Stop or skip
 as needed. Training requires a working configured Stockfish executable.

@@ -3509,7 +3509,7 @@ def update_menu_animation():
 
 
 # Training data is local, never part of the source checkout.
-TRAINING_DEPTH = 40
+TRAINING_DEPTH = 35
 
 
 class TrainingStore:
@@ -3682,10 +3682,10 @@ class TrainingSession:
             return
         with engine.lock:
             info = dict(engine.info)
-        self.status = f"{self.mode.title()} training: depth {info.get('depth', 0)}/40"
+        self.status = f"{self.mode.title()} training: depth {info.get('depth', 0)}/{TRAINING_DEPTH}"
         if info.get("fen") == self.fen and info.get("depth", 0) >= TRAINING_DEPTH:
             if self.persist(board, engine):
-                self.status = "Saved depth 40; next move ready"
+                self.status = f"Saved depth {TRAINING_DEPTH}; next move ready"
                 self.finish(board)
 
 
