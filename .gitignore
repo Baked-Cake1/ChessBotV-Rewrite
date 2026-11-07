@@ -10,44 +10,53 @@ piper/*
 board_debug/
 board_vision_assistant/
 
-# New folder dataset: keep only the training/validation class-folder
-# placeholders in Git. Local dataset images, board crops/debug files, and
-# metadata stay ignored.
+# Multi-model folder dataset: one folder per model under datasets/<model>/,
+# each holding training/ and validation/ class folders. Git tracks only the
+# default model's empty class-folder placeholders; dataset images, board
+# crops/debug files, metadata and every other model stay local.
 datasets/*
-!datasets/training/
-!datasets/validation/
-datasets/training/*
-datasets/validation/*
-!datasets/training/white_king/
-!datasets/training/white_queen/
-!datasets/training/white_rook/
-!datasets/training/white_bishop/
-!datasets/training/white_knight/
-!datasets/training/white_pawn/
-!datasets/training/black_king/
-!datasets/training/black_queen/
-!datasets/training/black_rook/
-!datasets/training/black_bishop/
-!datasets/training/black_knight/
-!datasets/training/black_pawn/
-!datasets/training/empty/
-!datasets/validation/white_king/
-!datasets/validation/white_queen/
-!datasets/validation/white_rook/
-!datasets/validation/white_bishop/
-!datasets/validation/white_knight/
-!datasets/validation/white_pawn/
-!datasets/validation/black_king/
-!datasets/validation/black_queen/
-!datasets/validation/black_rook/
-!datasets/validation/black_bishop/
-!datasets/validation/black_knight/
-!datasets/validation/black_pawn/
-!datasets/validation/empty/
-datasets/training/*/*
-datasets/validation/*/*
-!datasets/training/*/.gitkeep
-!datasets/validation/*/.gitkeep
+!datasets/default/
+datasets/default/*
+!datasets/default/training/
+!datasets/default/validation/
+datasets/default/training/*
+!datasets/default/training/white_king/
+!datasets/default/training/white_queen/
+!datasets/default/training/white_rook/
+!datasets/default/training/white_bishop/
+!datasets/default/training/white_knight/
+!datasets/default/training/white_pawn/
+!datasets/default/training/black_king/
+!datasets/default/training/black_queen/
+!datasets/default/training/black_rook/
+!datasets/default/training/black_bishop/
+!datasets/default/training/black_knight/
+!datasets/default/training/black_pawn/
+!datasets/default/training/empty/
+datasets/default/validation/*
+!datasets/default/validation/white_king/
+!datasets/default/validation/white_queen/
+!datasets/default/validation/white_rook/
+!datasets/default/validation/white_bishop/
+!datasets/default/validation/white_knight/
+!datasets/default/validation/white_pawn/
+!datasets/default/validation/black_king/
+!datasets/default/validation/black_queen/
+!datasets/default/validation/black_rook/
+!datasets/default/validation/black_bishop/
+!datasets/default/validation/black_knight/
+!datasets/default/validation/black_pawn/
+!datasets/default/validation/empty/
+datasets/default/training/*/*
+!datasets/default/training/*/.gitkeep
+datasets/default/validation/*/*
+!datasets/default/validation/*/.gitkeep
 
-# Local engine training book and resumable frontier
-training/
+# Exported CNN models: one <model>.pth per trained model. The folder
+# placeholder is tracked; checkpoints stay local.
+models/*
+!models/.gitkeep
+
+# Local engine training book and resumable frontier. Anchored to the
+# repository root so `datasets/<model>/training/` placeholders stay tracked.
+/training/

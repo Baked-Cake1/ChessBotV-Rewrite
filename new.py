@@ -623,7 +623,7 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
 _STRING_CONFIG_KEYS = (
     "theme",
     "board_theme",
@@ -634,6 +634,7 @@ _STRING_CONFIG_KEYS = (
     "autoplay_broadcast_title",
     "autoplay_broadcast_process",
     "autoplay_broadcast_screen_device",
+    "vision_model",
 )
 
 
@@ -653,6 +654,53 @@ def _normalise_autoplay_broadcast_kind(value):
     """Return a saved Auto-play capture-source kind (blank means none)."""
     kind = str(value or "").strip().lower()
     return kind if kind in ("window", "screen") else ""
+
+
+VISION_MODELS_DIR_NAME = "models"
+VISION_DEFAULT_MODEL = "default"
+VISION_LEGACY_MODEL_FILENAME = "chessbotv_cnn.pth"
+_VISION_MODEL_NAME_SANITISE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _normalise_vision_model_name(value):
+    """A safe model name, defaulting to ``default`` when blank/invalid."""
+    cleaned = _VISION_MODEL_NAME_SANITISE.sub(
+        "_", str(value or "").strip()
+    ).strip("._")
+    return cleaned or VISION_DEFAULT_MODEL
+
+
+def vision_models_dir():
+    """Folder holding every exported CNN checkpoint (``models/``)."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), VISION_MODELS_DIR_NAME
+    )
+
+
+def vision_model_path(name):
+    """Checkpoint path for one model name (``models/<name>.pth``)."""
+    return os.path.join(
+        vision_models_dir(), f"{_normalise_vision_model_name(name)}.pth"
+    )
+
+
+def vision_model_names():
+    """Every exported model, with the configured one always present."""
+    names = set()
+    folder = vision_models_dir()
+    try:
+        for entry in os.listdir(folder):
+            if entry.lower().endswith(".pth"):
+                names.add(entry[:-4])
+    except OSError:
+        pass
+    try:
+        configured = _normalise_vision_model_name(globals().get("vision_model_name"))
+    except Exception:
+        configured = VISION_DEFAULT_MODEL
+    names.add(configured)
+    names.add(VISION_DEFAULT_MODEL)
+    return sorted(names, key=lambda item: (item != configured, item.lower()))
 
 
 def _clean_config_text(value, limit=240):
@@ -698,6 +746,9 @@ def _clamp_config_limits(cfg):
     cfg["auto_move_color"] = color if color in ("white", "black", "both") else "both"
     cfg["always_on_top"] = 1 if cfg.get("always_on_top", 1) else 0
     cfg["use_package"] = 1 if cfg.get("use_package", 0) else 0
+    cfg["vision_model"] = _normalise_vision_model_name(
+        cfg.get("vision_model", VISION_DEFAULT_MODEL)
+    )
     for config_key in ANALYSIS_OVERLAY_CONFIG_KEYS.values():
         cfg[config_key] = 1 if cfg.get(config_key, 0) else 0
     # Auto-Move's on/off state is deliberately session-only. Even if an
@@ -874,7 +925,7 @@ auto_move_color = "both"  # "white" | "black" | "both"
 auto_move_depth = 0  # 0 means "use the configured Depth Limit"
 auto_move_arm_reset = False  # main() consumes this to re-arm Auto-Move
 auto_move_status_text = ""  # human-readable arming state for the Analysis page
-use_package_enabled = False  # chess-fen-detector instead of chessbotv_cnn.pth
+use_package_enabled = False  # chess-fen-detector instead of the local CNN model
 analysis_overlay_enabled = {key: False for key in ANALYSIS_OVERLAY_KEYS}
 analysis_overlay_scroll_offset = 0.0
 
@@ -1267,7 +1318,7 @@ def set_use_package(enabled, persist=True):
 
     ``True`` uses the optional ``chess-fen-detector`` package on the board
     crop ChessBotV has already located; ``False`` keeps the local
-    ``chessbotv_cnn.pth`` classifier. The choice is an ordinary saved
+    ``models/<model>.pth`` classifier. The choice is an ordinary saved
     preference, but it is snapshotted when Board Detection or an Auto-play
     scan starts so one live operation never mixes two recognisers.
     """
@@ -1279,6 +1330,23 @@ def set_use_package(enabled, persist=True):
     backend = "chess-fen-detector package" if use_package_enabled else "built-in CNN"
     print(f"Board vision backend for the next detection/scan: {backend}.")
     return use_package_enabled
+
+
+def set_vision_model(name, persist=True):
+    """Choose which ``models/<name>.pth`` the built-in CNN loads.
+
+    The choice is an ordinary saved preference. A classifier that is already
+    loaded is dropped so the next Board Detection / Auto-play scan loads the
+    newly selected checkpoint.
+    """
+    global vision_model_name, _cnn_classifier_cache
+    vision_model_name = _normalise_vision_model_name(name)
+    config["vision_model"] = vision_model_name
+    if persist:
+        save_config()
+    _cnn_classifier_cache = None
+    print(f"Built-in CNN model for the next detection/scan: {vision_model_name}.")
+    return vision_model_name
 
 
 def set_analysis_overlay_enabled(key, enabled, persist=True):
@@ -2004,6 +2072,9 @@ if autoplay_broadcast_mode == "saved" and not autoplay_broadcast_target:
     autoplay_broadcast_mode = "ask"
     config["autoplay_broadcast_mode"] = "ask"
 use_package_enabled = bool(config.get("use_package", 0))
+vision_model_name = _normalise_vision_model_name(
+    config.get("vision_model", VISION_DEFAULT_MODEL)
+)
 analysis_overlay_enabled = {
     key: bool(config.get(ANALYSIS_OVERLAY_CONFIG_KEYS[key], 0))
     for key in ANALYSIS_OVERLAY_KEYS
@@ -10865,12 +10936,12 @@ BOARD_SB_MAX_GRID_ERROR_RATIO = 0.20
 BOARD_SB_DOWNSCALES = (0.50, 0.33, 0.25)
 
 # Piece/empty-square recognition normally uses the trained PyTorch CNN in
-# chessbotv_cnn.pth; Analysis > Use Package can select chess-fen-detector
+# models/<model>.pth; Analysis > Use Package can select chess-fen-detector
 # instead. Either model is loaded lazily the first time Board Detection or
 # Auto-play needs it; no sprite/template dataset is loaded into memory.
 # The local checkpoint's class metadata is used when present, with the
 # known ChessBotV class order as the fallback.
-CNN_MODEL_FILENAME = "chessbotv_cnn.pth"
+CNN_MODEL_FILENAME = VISION_LEGACY_MODEL_FILENAME
 CNN_MODEL_ENV_VAR = "CHESSBOTV_CNN_MODEL"
 CNN_DEFAULT_IMAGE_SIZE = 64
 CNN_CLASS_NAMES = (
@@ -11002,21 +11073,47 @@ def _cnn_symbol_for_class_name(class_name):
     return "?"
 
 
-def _find_cnn_model_path():
-    """Find chessbotv_cnn.pth beside new.py, in the cwd, or from the env."""
-    candidates = []
-    env_path = os.environ.get(CNN_MODEL_ENV_VAR)
-    if env_path:
-        candidates.append(env_path)
+def _find_cnn_model_path(use_package=True):
+    """Find the checkpoint for the model selected in Auto-Play Settings.
+
+    ``models/<model>.pth`` is the normal location: one file per trained
+    model. A root ``chessbotv_cnn.pth`` and the ``CHESSBOTV_CNN_MODEL``
+    environment variable still work for older checkouts, but are skipped
+    when ``use_package`` is False so the built-in recogniser cannot
+    silently load a different model than the one selected.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    for base in (script_dir, os.getcwd()):
-        path = os.path.join(base, CNN_MODEL_FILENAME)
-        if path not in candidates:
-            candidates.append(path)
+    return _find_cnn_model_path_for(script_dir, None, use_package=use_package)
+
+
+def _find_cnn_model_path_for(script_dir, model_name=None, use_package=True):
+    """Path search behind :func:`_find_cnn_model_path` (also used by tests)."""
+    name = _normalise_vision_model_name(
+        model_name
+        if model_name is not None
+        else globals().get("vision_model_name", VISION_DEFAULT_MODEL)
+    )
+    candidates = [
+        os.path.join(script_dir, VISION_MODELS_DIR_NAME, f"{name}.pth"),
+    ]
+    if use_package:
+        env_path = os.environ.get(CNN_MODEL_ENV_VAR)
+        if env_path:
+            candidates.append(env_path)
+        for base in (script_dir, os.getcwd()):
+            path = os.path.join(base, CNN_MODEL_FILENAME)
+            if path not in candidates:
+                candidates.append(path)
     for path in candidates:
         if os.path.isfile(path):
             return path
     searched = ", ".join(candidates)
+    if not use_package:
+        raise FileNotFoundError(
+            f"Could not find models/{name}.pth. Train it with cnn_trainer.py "
+            f"or choose another model in Auto-Play Settings. "
+            f"Searched: {searched}"
+        )
     raise FileNotFoundError(
         f"Could not find {CNN_MODEL_FILENAME}. Searched: {searched}"
     )
@@ -11128,7 +11225,7 @@ def _cnn_normalization_from_checkpoint(checkpoint):
 
 
 def _build_chess_cnn_model(torch, state_dict):
-    """Build the ChessCNN architecture described by chessbotv_cnn.pth."""
+    """Build the ChessCNN architecture described by a local checkpoint."""
     nn = torch.nn
 
     def shape(name):
@@ -11201,17 +11298,27 @@ def _torch_load_checkpoint(torch, path, device):
 
 
 def _load_cnn_classifier():
-    """Load chessbotv_cnn.pth once and return its cached runtime details."""
+    """Load the selected models/<model>.pth once and cache its details."""
     global _cnn_classifier_cache
     if _cnn_classifier_cache is not None:
         return _cnn_classifier_cache
+    model_name = _normalise_vision_model_name(
+        globals().get("vision_model_name", VISION_DEFAULT_MODEL)
+    )
+    if (
+        _cnn_classifier_cache is not None
+        and _cnn_classifier_cache.get("model_name", VISION_DEFAULT_MODEL)
+        != model_name
+    ):
+        # A different model was chosen in Auto-Play Settings.
+        _cnn_classifier_cache = None
     with _cnn_classifier_lock:
         if _cnn_classifier_cache is not None:
             return _cnn_classifier_cache
 
         import torch
 
-        path = _find_cnn_model_path()
+        path = _find_cnn_model_path(use_package=_use_package_selected())
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         checkpoint = _torch_load_checkpoint(torch, path, device)
 
@@ -11255,6 +11362,9 @@ def _load_cnn_classifier():
             "model": model,
             "device": device,
             "path": path,
+            "model_name": _normalise_vision_model_name(
+                globals().get("vision_model_name", VISION_DEFAULT_MODEL)
+            ),
             "class_names": class_names,
             "symbols": symbols,
             "image_size": image_size,
@@ -11273,7 +11383,11 @@ def _get_cnn_classifier():
         return _cnn_classifier_cache
     token = _begin_loading_activity(
         "Loading vision model",
-        "Built-in CNN · chessbotv_cnn.pth",
+        "Built-in CNN · models/"
+        + _normalise_vision_model_name(
+            globals().get("vision_model_name", VISION_DEFAULT_MODEL)
+        )
+        + ".pth",
     )
     try:
         return _load_cnn_classifier()
@@ -17639,7 +17753,7 @@ def handle_autoplay_gameover_click(mx, my):
 def get_board_detection_button_rect(offset_x=0, offset_y=0):
     # Sit below the always-visible Auto-Move depth row, and below the
     # colour/status controls too when Auto-Move is enabled.
-    y = 494 if auto_move_enabled else 386
+    y = 494 if auto_move_enabled else 374
     return pygame.Rect(
         (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
         y + offset_y,
@@ -22437,6 +22551,34 @@ def get_use_package_toggle_rect(offset_x=0, offset_y=0):
     )
 
 
+def get_vision_model_row_rect(offset_x=0, offset_y=0):
+    """Model selector under the Use Package row (Analysis page)."""
+    toggle = get_use_package_toggle_rect(offset_x, offset_y)
+    return pygame.Rect(toggle.x, toggle.bottom + 6, toggle.width, 46)
+
+
+def get_vision_model_button_rects(offset_x=0, offset_y=0):
+    """Previous/next model chevrons and the selector's name plate."""
+    row = get_vision_model_row_rect(offset_x, offset_y)
+    prev_rect = pygame.Rect(row.x + 12, row.y + 7, 32, 32)
+    next_rect = pygame.Rect(row.right - 44, row.y + 7, 32, 32)
+    plate = pygame.Rect(prev_rect.right + 10, row.y + 6, 0, 34)
+    plate.width = max(80, next_rect.x - 10 - plate.x)
+    return {"row": row, "prev": prev_rect, "next": next_rect, "plate": plate}
+
+
+def _set_vision_model_step(delta):
+    """Move the saved model choice by one entry in the sorted model list."""
+    names = vision_model_names()
+    if not names:
+        return vision_model_name
+    try:
+        index = names.index(vision_model_name)
+    except ValueError:
+        index = 0
+    return set_vision_model(names[(index + int(delta)) % len(names)])
+
+
 def get_advisor_toggle_rect(offset_x=0, offset_y=0):
     """Compact Advisor row in the Analysis header space.
 
@@ -23553,6 +23695,62 @@ def draw_polished_autoplay_settings_button(screen, rect, hovered):
         screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 
+def _draw_vision_model_selector(screen, mouse_pos, offset_x=0, offset_y=0):
+    """Compact model picker: models/<name>.pth for the built-in CNN.
+
+    Each trained checkpoint lives in ``models/``, so this row picks the one
+    Board Detection and Auto-play load. It is shown as inactive while the
+    external package backend is selected, because that backend does not use
+    a local checkpoint.
+    """
+    mx, my = mouse_pos
+    rects = get_vision_model_button_rects(offset_x, offset_y)
+    row = rects["row"]
+    enabled = not use_package_enabled
+    pygame.draw.rect(screen, (52, 52, 62), row, border_radius=10)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, row, 1, border_radius=10)
+    label_x = rects["prev"].right + 12
+    available = max(60, rects["next"].x - 12 - label_x)
+    label = font_small.render(
+        _elide_text(f"models/{vision_model_name}.pth", font_small, available),
+        True,
+        TEXT_COLOR if enabled else TEXT_MUTED,
+    )
+    screen.blit(label, (label_x, row.centery - label.get_height() // 2))
+    hint = font_tiny.render(
+        "Model used by the built-in CNN"
+        if enabled
+        else "Unused while Use Package is on",
+        True,
+        TEXT_ACCENT if enabled else TEXT_MUTED,
+    )
+    screen.blit(hint, (row.x + 2, row.bottom + 1))
+    for key, symbol in (("prev", "‹"), ("next", "›")):
+        rect = rects[key]
+        hovered = enabled and rect.collidepoint(mx, my)
+        pygame.draw.rect(
+            screen,
+            (92, 92, 120)
+            if hovered
+            else (70, 70, 82)
+            if enabled
+            else (48, 48, 56),
+            rect,
+            border_radius=8,
+        )
+        pygame.draw.rect(
+            screen,
+            (150, 170, 255) if hovered else MENU_BORDER_COLOR,
+            rect,
+            1,
+            border_radius=8,
+        )
+        symbol_s = font_large.render(
+            symbol, True, TEXT_COLOR if enabled else TEXT_MUTED
+        )
+        screen.blit(symbol_s, symbol_s.get_rect(center=rect.center))
+
+
 def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
@@ -23761,6 +23959,11 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         use_package_enabled,
         use_package_anim,
         idle and use_package_rect.collidepoint(mx, my),
+    )
+
+    # Which exported model (models/<name>.pth) the built-in CNN loads.
+    _draw_vision_model_selector(
+        screen, (mx, my) if idle else (-9999, -9999), offset_x, offset_y
     )
 
 
@@ -32221,6 +32424,19 @@ def handle_menu_click(mx, my):
             return True
         if get_use_package_toggle_rect().collidepoint(mx, my):
             set_use_package(not use_package_enabled)
+            return True
+        model_rects = get_vision_model_button_rects()
+        if model_rects["prev"].collidepoint(mx, my):
+            if not use_package_enabled:
+                _set_vision_model_step(-1)
+            return True
+        if model_rects["next"].collidepoint(mx, my):
+            if not use_package_enabled:
+                _set_vision_model_step(1)
+            return True
+        if model_rects["row"].collidepoint(mx, my):
+            # Only the chevrons change the model; the row is still a control
+            # surface so a stray click cannot fall through to Auto-play.
             return True
 
     elif settings_menu_state == "board":

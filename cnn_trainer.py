@@ -43,9 +43,95 @@ from tqdm import tqdm
 
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "datasets"
+MODELS_DIR = BASE_DIR / "models"
+DEFAULT_MODEL_NAME = "default"
+LEGACY_MODEL_FILENAME = "chessbotv_cnn.pth"
 LEGACY_DATASET_DIR = BASE_DIR / "board_debug"
 DEFAULT_CSV = LEGACY_DATASET_DIR / "dataset.csv"
-OUTPUT_MODEL = BASE_DIR / "chessbotv_cnn.pth"
+# The default export path lives in models/ so several models can coexist.
+OUTPUT_MODEL = MODELS_DIR / "chessbotv_cnn.pth"
+_MODEL_NAME_SANITISE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def models_dir():
+    """Folder that holds every exported ``<model>.pth`` checkpoint."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return MODELS_DIR
+
+
+def sanitise_model_name(name):
+    """A safe, non-empty folder/stem name for one model."""
+    cleaned = _MODEL_NAME_SANITISE.sub("_", str(name or "").strip()).strip("._")
+    return cleaned or DEFAULT_MODEL_NAME
+
+
+def model_dataset_dir(name):
+    """Dataset folder for one model (``datasets/<name>``)."""
+    return DATASET_DIR / sanitise_model_name(name)
+
+
+def model_output_path(name):
+    """Export path for one model (``models/<name>.pth``)."""
+    return models_dir() / f"{sanitise_model_name(name)}.pth"
+
+
+def list_model_names():
+    """Names of every model with a dataset folder and/or a checkpoint."""
+    names = set()
+    if DATASET_DIR.is_dir():
+        for item in DATASET_DIR.iterdir():
+            if item.is_dir() and (item / "training").is_dir():
+                names.add(item.name)
+    if MODELS_DIR.is_dir():
+        for item in MODELS_DIR.glob("*.pth"):
+            names.add(item.stem)
+    names.discard("_boards")
+    names.discard("training")
+    names.discard("validation")
+    return sorted(names)
+
+
+def resolve_model_name(args, *, ask=False):
+    """Model name for a run, from ``--model``/``--output`` or the folders.
+
+    ``ask`` makes an interactive run prompt for the model, which is what a
+    plain ``python cnn_trainer.py`` (or ``--start``) in a terminal does.
+    """
+    explicit = getattr(args, "model", None)
+    if explicit:
+        return sanitise_model_name(explicit)
+    output = getattr(args, "output", None)
+    if output:
+        output = Path(output)
+        if output.parent.resolve() == MODELS_DIR.resolve():
+            return sanitise_model_name(output.stem)
+    dataset_dir = getattr(args, "dataset_dir", None)
+    if dataset_dir:
+        dataset_dir = Path(dataset_dir)
+        if dataset_dir.parent.resolve() == DATASET_DIR.resolve():
+            return sanitise_model_name(dataset_dir.name)
+    if ask:
+        names = list_model_names()
+        if names:
+            print("\nExisting models:")
+            for index, name in enumerate(names, 1):
+                marker = " (trained)" if model_output_path(name).is_file() else ""
+                print(f"  {index}. {name}{marker}")
+        print(
+            "Choose the model to train "
+            f"[number or name, Enter = {DEFAULT_MODEL_NAME}]: ",
+            end="",
+            flush=True,
+        )
+        try:
+            answer = input("").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return DEFAULT_MODEL_NAME
+        if answer.isdigit() and names and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        return sanitise_model_name(answer) if answer else DEFAULT_MODEL_NAME
+    return DEFAULT_MODEL_NAME
 
 IMAGE_SIZE = 64
 BATCH_SIZE = 32
@@ -906,7 +992,7 @@ def discover_images(
 
     Preferred layout::
 
-        datasets/
+        datasets/<model>/
           training/
             white_king/*.png
             white_queen/*.png
@@ -930,9 +1016,9 @@ def discover_images(
     if not dataset_dir.exists():
         raise FileNotFoundError(
             f"Dataset folder does not exist: {dataset_dir}\n"
-            "Run board-vision.py to create datasets/training/<class>/ and "
-            "datasets/validation/<class>/ folders, or pass "
-            "--dataset-dir/--csv for a legacy dataset."
+            "Run board-vision.py to create datasets/<model>/training/<class>/ "
+            "and datasets/<model>/validation/<class>/ folders, or pass "
+            "--model/--dataset-dir/--csv for a legacy dataset."
         )
 
     candidates, unknown_folders = _class_folder_candidates(dataset_dir)
@@ -1112,10 +1198,18 @@ def _dataset_has_discoverable_images(dataset_dir):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train the ChessBotV square CNN")
     parser.add_argument(
-        "--dataset-dir", type=Path, default=DATASET_DIR,
+        "--model", default=None,
+        help=(
+            "Model to train: reads datasets/<model>/ and exports to "
+            "models/<model>.pth (default: ask, or 'default')"
+        ),
+    )
+    parser.add_argument(
+        "--dataset-dir", type=Path, default=None,
         help=(
             "Dataset root containing training/<class>/ and "
-            "validation/<class>/ folders (default: datasets/)"
+            "validation/<class>/ folders (default: the chosen model's "
+            "datasets/<model>/ folder)"
         ),
     )
     parser.add_argument(
@@ -1135,8 +1229,8 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
-        "--output", type=Path, default=OUTPUT_MODEL,
-        help="Output .pth model path",
+        "--output", type=Path, default=None,
+        help="Output .pth model path (default: models/<model>.pth)",
     )
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
@@ -1172,8 +1266,22 @@ def train_model(args, *, event_callback=None, cancel_event=None):
     validation batches, and epochs.
     """
     run_started_at = time.perf_counter()
-    dataset_dir = Path(getattr(args, "dataset_dir", DATASET_DIR))
-    output_model = Path(getattr(args, "output", OUTPUT_MODEL))
+    model_name = resolve_model_name(args)
+    raw_dataset_dir = getattr(args, "dataset_dir", None)
+    dataset_dir = (
+        Path(raw_dataset_dir) if raw_dataset_dir else model_dataset_dir(model_name)
+    )
+    raw_output = getattr(args, "output", None)
+    output_model = Path(raw_output) if raw_output else model_output_path(model_name)
+    if output_model.suffix.lower() != ".pth":
+        output_model = output_model.with_suffix(".pth")
+    try:
+        output_model.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    print(f"Model: {model_name}")
+    print(f"Dataset folder: {dataset_dir}")
+    print(f"Exporting model to: {output_model}")
     epochs = max(1, int(getattr(args, "epochs", EPOCHS)))
     configured_batch_size = max(
         1, int(getattr(args, "batch_size", BATCH_SIZE))
@@ -1234,7 +1342,7 @@ def train_model(args, *, event_callback=None, cancel_event=None):
             show_progress=show_progress,
         )
     elif (
-        dataset_dir.resolve() == DATASET_DIR.resolve()
+        dataset_dir.resolve() == model_dataset_dir(DEFAULT_MODEL_NAME).resolve()
         and DEFAULT_CSV.is_file()
         and not _dataset_has_discoverable_images(dataset_dir)
     ):
@@ -1243,8 +1351,8 @@ def train_model(args, *, event_callback=None, cancel_event=None):
         # data is still in board_debug/. New folder data always wins.
         dataset_layout = "legacy_csv_fallback"
         print(
-            "No images found in datasets/training/ or datasets/validation/ "
-            f"yet; using the legacy board_debug CSV at {DEFAULT_CSV}."
+            "No images found in the dataset folders yet; using the legacy "
+            f"board_debug CSV at {DEFAULT_CSV}."
         )
         records = load_csv_records(
             DEFAULT_CSV,
@@ -1810,15 +1918,24 @@ def run_training_ui(initial_args):
             self.metric_labels = {}
             self.detail_labels = {}
 
+            self.model_var = tk.StringVar(
+                value=resolve_model_name(args)
+            )
             self.dataset_var = tk.StringVar(
-                value=str(getattr(args, "dataset_dir", DATASET_DIR))
+                value=str(
+                    getattr(args, "dataset_dir", None)
+                    or model_dataset_dir(self.model_var.get())
+                )
             )
             csv_value = getattr(args, "csv", None)
             self.csv_var = tk.StringVar(
                 value="" if csv_value is None else str(csv_value)
             )
             self.output_var = tk.StringVar(
-                value=str(getattr(args, "output", OUTPUT_MODEL))
+                value=str(
+                    getattr(args, "output", None)
+                    or model_output_path(self.model_var.get())
+                )
             )
             self.epochs_var = tk.StringVar(value=str(self.total_epochs))
             self.batch_size_var = tk.StringVar(
@@ -2156,6 +2273,23 @@ def run_training_ui(initial_args):
 
             setup_card, setup = self._card(left, "Training setup")
             setup_card.pack(fill="x")
+            self._small_label(setup, "Model").pack(
+                fill="x", pady=(8, 3)
+            )
+            model_row = tk.Frame(setup, bg=colours["panel"])
+            model_row.pack(fill="x")
+            self.model_combo = ttk.Combobox(
+                model_row,
+                textvariable=self.model_var,
+                values=self._model_choices(),
+                state="normal",
+            )
+            self.model_combo.pack(side="left", fill="x", expand=True)
+            self.model_combo.bind(
+                "<<ComboboxSelected>>", self._on_model_selected
+            )
+            self.input_widgets.append(self.model_combo)
+
             self._path_row(
                 setup, "Dataset folder", self.dataset_var,
                 self._browse_dataset,
@@ -2503,6 +2637,36 @@ def run_training_ui(initial_args):
                 return str(path.parent)
             return str(BASE_DIR)
 
+        def _model_choices(self):
+            """Every known model, plus the current name if it is new."""
+            names = list_model_names()
+            current = self.model_var.get().strip() if hasattr(
+                self, "model_var"
+            ) else ""
+            if current and current not in names:
+                names.append(current)
+            if DEFAULT_MODEL_NAME not in names:
+                names.insert(0, DEFAULT_MODEL_NAME)
+            return names
+
+        def _refresh_model_choices(self):
+            self.model_combo.configure(values=self._model_choices())
+
+        def _on_model_selected(self, _event=None):
+            """Point the dataset/export rows at the newly chosen model."""
+            name = sanitise_model_name(self.model_var.get())
+            self.model_var.set(name)
+            dataset_dir = model_dataset_dir(name)
+            if not _dataset_has_discoverable_images(dataset_dir):
+                # Start the selected model from scratch: a new folder gets
+                # the training/validation class layout on first training.
+                for split in ("training", "validation"):
+                    (dataset_dir / split).mkdir(parents=True, exist_ok=True)
+            self.dataset_var.set(str(dataset_dir))
+            self.output_var.set(str(model_output_path(name)))
+            self._refresh_model_choices()
+
+
         def _browse_dataset(self):
             selected = filedialog.askdirectory(
                 title="Choose the dataset folder",
@@ -2568,12 +2732,16 @@ def run_training_ui(initial_args):
 
         def _read_form_args(self):
             errors = []
+            model_name = sanitise_model_name(self.model_var.get())
+            self.model_var.set(model_name)
             dataset_dir = self.dataset_var.get().strip()
             if not dataset_dir:
                 errors.append("Choose a dataset folder.")
             output = self.output_var.get().strip()
             if not output:
-                errors.append("Choose an output model path.")
+                # The model name is enough: exports land in models/<model>.pth.
+                output = str(model_output_path(model_name))
+                self.output_var.set(output)
 
             def parse_int(name, variable, minimum, maximum):
                 try:
@@ -2624,6 +2792,8 @@ def run_training_ui(initial_args):
 
             csv_text = self.csv_var.get().strip()
             return argparse.Namespace(
+                model=model_name,
+
                 dataset_dir=Path(dataset_dir),
                 csv=Path(csv_text) if csv_text else None,
                 dedupe=dedupe,
@@ -2808,7 +2978,8 @@ def run_training_ui(initial_args):
             self._append_log("")
             self._append_log("=" * 72)
             self._append_log(
-                f"Starting training: dataset={run_args.dataset_dir} · "
+                f"Starting training: model={run_args.model} · "
+                f"dataset={run_args.dataset_dir} · "
                 f"output={run_args.output} · epochs={run_args.epochs} · "
                 f"batch={run_args.batch_size} · lr={run_args.learning_rate:g}"
             )
@@ -3646,9 +3817,33 @@ def run_training_ui(initial_args):
     return int(app.exit_code)
 
 
+def _prompt_for_model(args):
+    """Ask which model to train when an interactive run did not specify one.
+
+    ``board-vision.py`` always passes ``--model``, so it never prompts. A
+    plain ``python cnn_trainer.py`` (dashboard or ``--start``) does, and
+    fills in that model's dataset folder and export path.
+    """
+    if getattr(args, "model", None):
+        return args
+    if not sys.stdin or not sys.stdin.isatty():
+        return args
+    args.model = resolve_model_name(args, ask=True)
+    if not getattr(args, "dataset_dir", None):
+        args.dataset_dir = model_dataset_dir(args.model)
+    if not getattr(args, "output", None):
+        args.output = model_output_path(args.model)
+    return args
+
+
 def main(argv=None):
     """Command-line entry point for the dashboard or terminal trainer."""
     args = parse_args(argv)
+    args = _prompt_for_model(args)
+    if not getattr(args, "dataset_dir", None):
+        args.dataset_dir = model_dataset_dir(resolve_model_name(args))
+    if not getattr(args, "output", None):
+        args.output = model_output_path(resolve_model_name(args))
 
     if bool(getattr(args, "ui", True)):
         try:
