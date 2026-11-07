@@ -18692,7 +18692,7 @@ def _draw_game_review_coach_character(
 
     if reaction == "best":
         # Raised shoulders make the Best pose read as "top choice" even
-        # before the hands (and the medal held in the right one) appear.
+        # before the hands (and the medal in the viewer-left fist) appear.
         body_y = bob * 0.25
         ellipse((58, 139, 150), (23, 98 + body_y, 28, 13))
         ellipse((58, 139, 150), (69, 98 + body_y, 28, 13))
@@ -18702,7 +18702,7 @@ def _draw_game_review_coach_character(
         line(jacket_dark, [(85, 113 + body_y), (78, 124 + body_y)], 0.9)
 
         # The Best medal is not worn around his neck: it hangs from the
-        # raised right hand drawn in the hand/prop pass below.
+        # viewer-left fist drawn in the hand/prop pass below.
 
     # Neck and ears. Nolan's broader neck/jaw match his male Piper voice.
     pygame.draw.rect(canvas, skin_shadow, r(head_cx - 8, 83 + head_y, 16, 17), border_radius=int(4 * sx))
@@ -19521,7 +19521,7 @@ def _draw_game_review_coach_character(
     elif reaction == "best":
         # Best gets a dedicated top-choice celebration rather than sharing
         # Excellent/Great's simple thumb: a detailed thumbs-up on the
-        # viewer's right, a left fist pump, and a floating two-tone star
+        # viewer's right, a medal-holding left fist, and a floating two-tone star
         # that bobs and slowly rocks over the raised thumb.
         body_y = bob * 0.25
         float_y = math.sin(time_ms / 390.0) * 1.05
@@ -19642,6 +19642,62 @@ def _draw_game_review_coach_character(
             r(11.5, 91.5 + head_y, 17.0, 14.0),
             border_radius=int(3.2 * sx),
         )
+        # The medal belongs in the viewer-left fist, leaving the
+        # viewer-right thumbs-up free. Draw the ribbons before the
+        # knuckles and folded thumb so they appear held, not floating.
+        medal_hand_y = head_y + 6.0
+        medal_sway = math.sin(time_ms / 390.0) * 0.55
+        medal_centre = (
+            20.0 + medal_sway,
+            106.2 + medal_hand_y + best_pulse * 0.35,
+        )
+        poly(
+            (39, 132, 76),
+            [
+                (14.3, 92.5 + medal_hand_y),
+                (18.0, 91.8 + medal_hand_y),
+                (medal_centre[0] - 1.2, medal_centre[1] - 5.2),
+                (medal_centre[0] - 4.8, medal_centre[1] - 3.4),
+            ],
+        )
+        poly(
+            (91, 184, 102),
+            [
+                (21.5, 91.8 + medal_hand_y),
+                (25.2, 92.5 + medal_hand_y),
+                (medal_centre[0] + 4.8, medal_centre[1] - 3.4),
+                (medal_centre[0] + 1.2, medal_centre[1] - 5.2),
+            ],
+        )
+        line(
+            (245, 202, 92),
+            [
+                (16.0, 94.0 + medal_hand_y),
+                (medal_centre[0] - 3.0, medal_centre[1] - 4.8),
+            ],
+            0.6,
+        )
+        line(
+            (245, 202, 92),
+            [
+                (23.5, 94.0 + medal_hand_y),
+                (medal_centre[0] + 3.0, medal_centre[1] - 4.8),
+            ],
+            0.6,
+        )
+        circle((20, 43, 39), (medal_centre[0], medal_centre[1] + 0.7), 7.9)
+        circle((245, 202, 92), medal_centre, 7.6)
+        circle((124, 190, 75), medal_centre, 6.1)
+        circle((91, 160, 58), medal_centre, 6.1, 0.75)
+        poly(
+            (255, 255, 255),
+            star_points(medal_centre, 4.7, 2.2),
+        )
+        circle(
+            (255, 246, 190),
+            (medal_centre[0] - 4.1, medal_centre[1] - 4.3),
+            1.0,
+        )
         for knuckle_x in (14.8, 18.6, 22.4, 26.0):
             circle(skin, (knuckle_x, 92.2 + head_y), 2.55)
         for groove_x in (16.7, 20.5, 24.2):
@@ -19712,62 +19768,6 @@ def _draw_game_review_coach_character(
             skin,
             r(92.3, 85.9 + head_y, 17.8, 14.8),
             border_radius=int(3.4 * sx),
-        )
-        # The green-and-gold Best medal hangs from this raised hand. Its
-        # two ribbon straps run up into the fist, and the curled-finger
-        # capsules below are drawn over the strap tops so the medal is
-        # visibly gripped rather than floating in front of the hand.
-        medal_sway = math.sin(time_ms / 390.0) * 0.55
-        medal_centre = (
-            101.0 + medal_sway,
-            106.2 + head_y + best_pulse * 0.35,
-        )
-        poly(
-            (39, 132, 76),
-            [
-                (95.3, 92.5 + head_y),
-                (99.0, 91.8 + head_y),
-                (medal_centre[0] - 1.2, medal_centre[1] - 5.2),
-                (medal_centre[0] - 4.8, medal_centre[1] - 3.4),
-            ],
-        )
-        poly(
-            (91, 184, 102),
-            [
-                (102.5, 91.8 + head_y),
-                (106.2, 92.5 + head_y),
-                (medal_centre[0] + 4.8, medal_centre[1] - 3.4),
-                (medal_centre[0] + 1.2, medal_centre[1] - 5.2),
-            ],
-        )
-        line(
-            (245, 202, 92),
-            [
-                (97.0, 94.0 + head_y),
-                (medal_centre[0] - 3.0, medal_centre[1] - 4.8),
-            ],
-            0.6,
-        )
-        line(
-            (245, 202, 92),
-            [
-                (104.5, 94.0 + head_y),
-                (medal_centre[0] + 3.0, medal_centre[1] - 4.8),
-            ],
-            0.6,
-        )
-        circle((20, 43, 39), (medal_centre[0], medal_centre[1] + 0.7), 7.9)
-        circle((245, 202, 92), medal_centre, 7.6)
-        circle((124, 190, 75), medal_centre, 6.1)
-        circle((91, 160, 58), medal_centre, 6.1, 0.75)
-        poly(
-            (255, 255, 255),
-            star_points(medal_centre, 4.7, 2.2),
-        )
-        circle(
-            (255, 246, 190),
-            (medal_centre[0] - 4.1, medal_centre[1] - 4.3),
-            1.0,
         )
         # Three stacked, outlined capsules read as curled fingers even
         # after the 3x sprite is downscaled to the Game Review dock.
