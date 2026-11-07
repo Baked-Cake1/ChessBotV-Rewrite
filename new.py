@@ -1108,7 +1108,7 @@ _autoplay_drag_thread = None
 # current best move/eval/depth to a cliv-gui ``ProcessOverlay`` drawn over
 # the target window. It is deliberately session-only; stopping clears the
 # selected window so the next start always asks again.
-ADVISOR_POLL_SECONDS = 0.25
+ADVISOR_POLL_SECONDS = 0.18
 ADVISOR_RELEASE_SETTLE_SECONDS = 0.18
 ADVISOR_OVERLAY_EXTRA_BOTTOM = 44
 ADVISOR_OVERLAY_ALPHA = 0.94
@@ -13055,6 +13055,21 @@ def _autoplay_find_legal_move(board, candidate_grid):
     return matches[0] if len(matches) == 1 else None
 
 
+def _advisor_move_changed_mask(board, move):
+    """Conservative set of squares a legal reply can alter, without pushing.
+
+    Castling is deliberately unpruned (including Chess960 rook movement).
+    En passant also alters the captured pawn's square, not just from/to.
+    """
+    if board.is_castling(move):
+        return chess.BB_ALL
+    mask = chess.BB_SQUARES[move.from_square] | chess.BB_SQUARES[move.to_square]
+    if board.is_en_passant(move):
+        captured = move.to_square - 8 if board.turn == chess.WHITE else move.to_square + 8
+        mask |= chess.BB_SQUARES[captured]
+    return mask
+
+
 def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
     """Unique 0/1/2-ply legal sequence shown by an Advisor screenshot.
 
@@ -13069,20 +13084,43 @@ def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
     if candidate_grid == before_grid:
         return []
 
-    matches = _autoplay_matching_legal_moves(board, candidate_grid)
+    # Build first-ply positions/grids once and reuse them for ordinary
+    # matching and the separate checkmate-banner recovery pass.
+    first_nodes = []
+    matches = []
+    for move in board.legal_moves:
+        clone = board.copy(stack=False)
+        clone.push(move)
+        grid = _autoplay_board_grid_from_board(clone)
+        first_nodes.append((move, clone, grid))
+        if _autoplay_candidate_matches(candidate_grid, grid, before_grid):
+            matches.append(move)
     if len(matches) == 1:
         return matches
     if len(matches) > 1 or int(max_plies or 0) < 2:
         return None
 
     sequences = []
-    for first_move in board.legal_moves:
-        clone = board.copy(stack=False)
-        clone.push(first_move)
-        for second_move in _autoplay_matching_legal_moves(clone, candidate_grid):
-            sequences.append([first_move, second_move])
-            if len(sequences) > 1:
-                return None
+    for first_move, clone, first_grid in first_nodes:
+        # Every known mismatch must be fixable by this one remaining
+        # reply. Unknown cells impose no restriction; final full matching
+        # still enforces positive evidence and uniqueness as before.
+        mismatches = 0
+        for row in range(8):
+            for col in range(8):
+                observed = candidate_grid[row][col]
+                if observed != "?" and observed != first_grid[row][col]:
+                    mismatches |= chess.BB_SQUARES[chess.square(col, 7 - row)]
+        for second_move in clone.legal_moves:
+            if mismatches & ~_advisor_move_changed_mask(clone, second_move):
+                continue
+            after = clone.copy(stack=False)
+            after.push(second_move)
+            after_grid = _autoplay_board_grid_from_board(after)
+            if _autoplay_candidate_matches(candidate_grid, after_grid, first_grid):
+                sequences.append([first_move, second_move])
+                if len(sequences) > 1:
+                    return None
     if len(sequences) == 1:
         return sequences[0]
 
@@ -13093,12 +13131,9 @@ def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
     # preserves Advisor's required full stop on checkmate without using
     # the looser test for ordinary moves.
     terminal_sequences = []
-    for move in board.legal_moves:
-        clone = board.copy(stack=False)
-        clone.push(move)
+    for move, clone, after_grid in first_nodes:
         if not clone.is_checkmate():
             continue
-        after_grid = _autoplay_board_grid_from_board(clone)
         if _autoplay_transition_matches(candidate_grid, after_grid, before_grid):
             terminal_sequences.append([move])
             if len(terminal_sequences) > 1:
@@ -13106,12 +13141,15 @@ def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
     if len(terminal_sequences) == 1:
         return terminal_sequences[0]
 
-    for first_move in board.legal_moves:
-        first_clone = board.copy(stack=False)
-        first_clone.push(first_move)
+    for first_move, first_clone, _first_grid in first_nodes:
         if first_clone.is_game_over():
             continue
         for second_move in first_clone.legal_moves:
+            # Mate must give check. Avoid copying/pushing non-checks in
+            # this fallback; do not use full-grid mismatch pruning here
+            # because banners are allowed to obscure unrelated squares.
+            if not first_clone.gives_check(second_move):
+                continue
             second_clone = first_clone.copy(stack=False)
             second_clone.push(second_move)
             if not second_clone.is_checkmate():
