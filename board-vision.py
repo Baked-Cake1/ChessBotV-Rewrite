@@ -46,6 +46,204 @@ LEGACY_DATASET_DIR = BASE_DIR / "board_debug"
 LEGACY_DATASET_CSV = LEGACY_DATASET_DIR / "dataset.csv"
 CNN_TRAINER_PATH = BASE_DIR / "cnn_trainer.py"
 
+# --- Multiple vision models ------------------------------------------------
+# One folder per model, so several CNN checkpoints can live side by side:
+#
+#   datasets/<model>/training/<class>/ , datasets/<model>/validation/<class>/
+#   models/<model>.pth
+#
+# An existing datasets/training + datasets/validation checkout (the original
+# layout) is migrated once into datasets/default/ so ordinary runs keep
+# working, and a checkout that still has chessbotv_cnn.pth beside this script
+# has that checkpoint moved into models/. Every new image goes into the model
+# chosen for that run, and ChessBotV can pick any of them from Auto-Play
+# Settings.
+MODELS_DIR = BASE_DIR / "models"
+DEFAULT_MODEL_NAME = "default"
+LEGACY_MODEL_FILENAME = "chessbotv_cnn.pth"
+_MODEL_NAME_SANITISE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def models_dir():
+    """Folder that holds every exported ``<model>.pth`` checkpoint."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return MODELS_DIR
+
+
+def sanitise_model_name(name):
+    """A safe, non-empty folder/stem name for one model."""
+    cleaned = _MODEL_NAME_SANITISE.sub("_", str(name or "").strip()).strip("._")
+    return cleaned or DEFAULT_MODEL_NAME
+
+
+def list_model_names(dataset_root=None):
+    """Names of every model that has a dataset folder and/or a checkpoint."""
+    root = Path(dataset_root or DATASET_DIR)
+    names = set()
+    if root.is_dir():
+        for item in root.iterdir():
+            if item.is_dir() and (item / TRAINING_FOLDER_NAME).is_dir():
+                names.add(item.name)
+    model_dir = Path(MODELS_DIR)
+    if model_dir.is_dir():
+        for item in model_dir.glob("*.pth"):
+            names.add(item.stem)
+    names.discard("_boards")
+    names.discard("training")
+    names.discard("validation")
+    return sorted(names)
+
+
+def model_dataset_dir(name, dataset_root=None):
+    """Dataset folder for one model (``datasets/<name>``)."""
+    root = Path(dataset_root or DATASET_DIR)
+    return root / sanitise_model_name(name)
+
+
+def model_output_path(name):
+    """Exported checkpoint path for one model (``models/<name>.pth``)."""
+    return models_dir() / f"{sanitise_model_name(name)}.pth"
+
+
+def _looks_like_split_dataset(folder):
+    """True when ``folder`` directly holds training/<class>/ images."""
+    folder = Path(folder)
+    for split in DATASET_SPLIT_NAMES:
+        split_dir = folder / split
+        if not split_dir.is_dir():
+            continue
+        for class_dir in split_dir.iterdir():
+            if class_dir.is_dir() and any(class_dir.iterdir()):
+                return True
+    return False
+
+
+def _migrate_legacy_layout(dataset_root=None):
+    """Move an original datasets/training + validation checkout into default/.
+
+    This runs once: the first time board-vision.py (or the trainer) opens the
+    new multi-model layout and finds the old split folders sitting directly in
+    ``datasets/``. Files are moved, never copied or deleted, so the data is
+    unchanged, just nested under ``datasets/default/``.
+    """
+    root = Path(dataset_root or DATASET_DIR)
+    target = model_dataset_dir(DEFAULT_MODEL_NAME, root)
+    if target.is_dir() and _looks_like_split_dataset(target):
+        return False
+    moved = False
+    for split in DATASET_SPLIT_NAMES:
+        legacy_split = root / split
+        if not legacy_split.is_dir():
+            continue
+        new_split = target / split
+        new_split.mkdir(parents=True, exist_ok=True)
+        for item in sorted(legacy_split.iterdir()):
+            destination = new_split / item.name
+            if item.is_dir():
+                destination.mkdir(exist_ok=True)
+                for child in sorted(item.iterdir()):
+                    target_path = destination / child.name
+                    if target_path.exists():
+                        continue
+                    os.replace(str(child), str(target_path))
+                    moved = True
+                if not any(item.iterdir()):
+                    item.rmdir()
+            elif not destination.exists():
+                os.replace(str(item), str(destination))
+                moved = True
+        try:
+            legacy_split.rmdir()
+        except OSError:
+            pass
+    for item in ("_boards", "metadata.csv", "duplicates.json"):
+        legacy_item = root / item
+        if legacy_item.exists():
+            destination = target / item
+            if not destination.exists():
+                os.replace(str(legacy_item), str(destination))
+                moved = True
+    if moved:
+        print(
+            "Moved the original datasets/training + datasets/validation "
+            f"images into {target} (model '{DEFAULT_MODEL_NAME}')."
+        )
+    return moved
+
+
+def _migrate_legacy_models():
+    """Move checkpoints out of the repository root into models/.
+
+    Older checkouts exported ``chessbotv_cnn.pth`` beside the scripts; that
+    single checkpoint belongs to the original dataset, so it becomes
+    ``models/default.pth``. Any other stray ``*.pth`` keeps its own name as
+    its model name. Files already in ``models/`` are never overwritten.
+    """
+    moved = []
+    models_dir()
+    for path in sorted(BASE_DIR.glob("*.pth")):
+        name = DEFAULT_MODEL_NAME if path.name == LEGACY_MODEL_FILENAME else path.stem
+        destination = model_output_path(name)
+        if destination.exists():
+            continue
+        try:
+            os.replace(str(path), str(destination))
+            moved.append((path.name, destination))
+        except OSError:
+            continue
+    for source_name, destination in moved:
+        print(f"Moved CNN model {source_name} to {destination}.")
+    return moved
+
+
+def prepare_model_layout(dataset_root=None):
+    """Create the multi-model layout and migrate older on-disk layouts.
+
+    Returns the default model's dataset folder. Safe to call repeatedly; it
+    only moves files that are still in a legacy location.
+    """
+    root = Path(dataset_root or DATASET_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    models_dir()
+    _migrate_legacy_layout(root)
+    _migrate_legacy_models()
+    default_dir = model_dataset_dir(DEFAULT_MODEL_NAME, root)
+    ensure_dataset_layout(default_dir)
+    return default_dir
+
+
+def choose_model_for_run(model_names=None, input_fn=None):
+    """Ask which model this run should add its board to.
+
+    An empty answer keeps the previous single-model behaviour by targeting
+    ``default``. A new model needs no setup step: the folder is created on
+    demand when the first board is exported into it.
+    """
+    names = list(model_names) if model_names is not None else list_model_names()
+    if names:
+        print("\nExisting models:")
+        for index, name in enumerate(names, 1):
+            suffix = " (trained)" if model_output_path(name).is_file() else ""
+            print(f"  {index}. {name}{suffix}")
+    print(
+        "Choose the model to add this board to "
+        f"[number or name, Enter = {DEFAULT_MODEL_NAME}]: ",
+        end="",
+        flush=True,
+    )
+    reader = input_fn or input
+    try:
+        raw = reader("")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return DEFAULT_MODEL_NAME
+    raw = str(raw or "").strip()
+    if not raw:
+        return DEFAULT_MODEL_NAME
+    if raw.isdigit() and names and 1 <= int(raw) <= len(names):
+        return names[int(raw) - 1]
+    return sanitise_model_name(raw)
+
 # Duplicate checks compare every tile at the trainer's canonical 64x64
 # input size. Exact SHA-256 matches are always duplicates. Near matches
 # must also be almost pixel-identical after that normalisation, so the
@@ -423,16 +621,20 @@ def canonical_tile_array(tile, size=CANONICAL_TILE_SIZE):
 def ensure_dataset_layout(dataset_dir=DATASET_DIR):
     """Create the training/validation class-folder layout if needed.
 
-    The export layout is::
+    Each model owns one dataset folder, chosen at startup, so several
+    recognisers can be built side by side::
 
-        datasets/
+        datasets/<model>/
           training/<each of the 13 classes>/
           validation/<each of the 13 classes>/
           _boards/
 
-    Existing direct ``datasets/<class>/`` folders from the previous layout
-    are left untouched and are still scanned for duplicate checks/trainer
-    fallback, but new exports are written only below training/validation.
+    The original single-model layout (``datasets/training`` +
+    ``datasets/validation``) is moved into ``datasets/default/`` once by
+    :func:`prepare_model_layout`. Direct ``datasets/<class>/`` folders from
+    an even older layout are left untouched and are still scanned for
+    duplicate checks/trainer fallback, but new exports are written only
+    below training/validation.
     """
     dataset_dir = Path(dataset_dir)
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -726,8 +928,8 @@ def print_dataset_report(records, dataset_dir=DATASET_DIR):
     print(f"Total game IDs: {total_games}")
     print(
         "New unique exports are weighted 80% training / 20% validation. "
-        "cnn_trainer.py trains from datasets/training and evaluates on "
-        "datasets/validation."
+        "cnn_trainer.py trains from this model's training folder and "
+        "evaluates on its validation folder."
     )
 
     print("\nPer-class folder counts:")
@@ -1414,8 +1616,8 @@ def import_legacy_dataset(
     return all_records
 
 
-def run_cnn_trainer(records, dataset_dir=DATASET_DIR):
-    """Run cnn_trainer.py against the physical training/validation folders."""
+def run_cnn_trainer(records, dataset_dir=DATASET_DIR, model_name=None):
+    """Run cnn_trainer.py against one model's training/validation folders."""
     if not records:
         print("\nCNN training was not started because no dataset images were found.")
         print("Review a screenshot first so unique tiles can be exported.")
@@ -1435,13 +1637,22 @@ def run_cnn_trainer(records, dataset_dir=DATASET_DIR):
         print(f"Could not find CNN trainer: {CNN_TRAINER_PATH}")
         return False
 
+    dataset_dir = Path(dataset_dir)
+    if not model_name:
+        model_name = dataset_dir.name or DEFAULT_MODEL_NAME
+    model_name = sanitise_model_name(model_name)
+    output_path = model_output_path(model_name)
+    print(f"Model: {model_name} (exported to {output_path})")
+
     command = [
         sys.executable,
         str(CNN_TRAINER_PATH),
+        "--model",
+        model_name,
         "--dataset-dir",
-        str(Path(dataset_dir)),
+        str(dataset_dir),
         "--output",
-        str(BASE_DIR / "chessbotv_cnn.pth"),
+        str(output_path),
         "--ui",
         "--start",
     ]
@@ -2437,17 +2648,23 @@ def _wait_ready_for_another(next_path=None):
 
 
 def main(argv=None):
-    """Build the training/validation dataset one manually marked board at a time.
+    """Build one model's training/validation dataset a board at a time.
 
-    Startup creates ``datasets/training/<class>/`` and
-    ``datasets/validation/<class>/`` when they do not exist. Old
+    Images live in ``datasets/<model>/training/<class>/`` and
+    ``datasets/<model>/validation/<class>/``; exported checkpoints live in
+    ``models/<model>.pth``. An original checkout with
+    ``datasets/training`` + ``datasets/validation`` (and/or a
+    ``chessbotv_cnn.pth`` beside the scripts) is migrated once at startup
+    into ``datasets/default/`` and ``models/``. The run then asks which model
+    to add boards to: press Enter for ``default``, pick a number from the
+    list, or type a new name to start another model. Old
     ``--manual-only``/``--no-semi-auto`` flags are accepted but are now
     redundant: manual marking is the only workflow, OpenCV is not used, and
     every tile is duplicate-checked before it is shown, so known duplicates
     are auto-skipped instead of saved. Unique exports are split 80%
-    training / 20% validation. Use
-    ``--import-legacy`` for a one-time duplicate-cleaning migration of an
-    old ``board_debug/dataset.csv`` dataset into those folders.
+    training / 20% validation. Use ``--import-legacy`` for a one-time
+    duplicate-cleaning migration of an old ``board_debug/dataset.csv``
+    dataset into the chosen model's folders.
     """
     args = list(sys.argv[1:] if argv is None else argv)
     ignored_flags = {"--manual-only", "--no-semi-auto", "--semi-auto"}
@@ -2455,6 +2672,7 @@ def main(argv=None):
     import_legacy = False
     legacy_dir = LEGACY_DATASET_DIR
     legacy_csv = None
+    requested_model = None
     cursor = 0
     while cursor < len(args):
         arg = args[cursor]
@@ -2464,16 +2682,21 @@ def main(argv=None):
         if arg == "--import-legacy":
             import_legacy = True
             continue
-        if arg in ("--legacy-dir", "--legacy-csv"):
+        if arg in ("--model", "--legacy-dir", "--legacy-csv"):
             if cursor >= len(args):
                 print(f"Missing value after {arg}.")
                 return False
-            value = Path(args[cursor])
+            value = args[cursor]
             cursor += 1
-            if arg == "--legacy-dir":
-                legacy_dir = value
+            if arg == "--model":
+                requested_model = sanitise_model_name(value)
+            elif arg == "--legacy-dir":
+                legacy_dir = Path(value)
             else:
-                legacy_csv = value
+                legacy_csv = Path(value)
+            continue
+        if arg.startswith("--model="):
+            requested_model = sanitise_model_name(arg.split("=", 1)[1])
             continue
         if arg.startswith("--legacy-dir="):
             legacy_dir = Path(arg.split("=", 1)[1])
@@ -2483,9 +2706,22 @@ def main(argv=None):
             continue
         image_args.append(arg)
 
-    ensure_dataset_layout(DATASET_DIR)
-    duplicate_index = DuplicateIndex.load(DATASET_DIR)
-    print(f"Dataset folder: {DATASET_DIR.resolve()}")
+    # Create the multi-model layout and migrate any legacy single-model data.
+    prepare_model_layout(DATASET_DIR)
+    model_name = (
+        requested_model
+        if requested_model
+        else choose_model_for_run()
+    )
+    model_name = sanitise_model_name(model_name)
+    dataset_dir = ensure_dataset_layout(
+        model_dataset_dir(model_name, DATASET_DIR)
+    )
+    print(f"\nAdding boards to model '{model_name}'.")
+    print(f"Dataset folder: {dataset_dir.resolve()}")
+    print(f"Model file:     {model_output_path(model_name).resolve()}")
+
+    duplicate_index = DuplicateIndex.load(dataset_dir)
     print(
         f"Loaded {duplicate_index.example_count} existing image(s) from training "
         "and validation for exact/near duplicate checks."
@@ -2501,7 +2737,7 @@ def main(argv=None):
             import_legacy_dataset(
                 legacy_dir,
                 csv_path=legacy_csv,
-                dataset_dir=DATASET_DIR,
+                dataset_dir=dataset_dir,
                 duplicate_index=duplicate_index,
             )
         except Exception as exc:
@@ -2512,9 +2748,8 @@ def main(argv=None):
     elif duplicate_index.example_count == 0 and LEGACY_DATASET_CSV.is_file():
         print(
             "An old board_debug dataset was found. To copy its unique images "
-            "into datasets/training/ and datasets/validation/ "
-            "(skipping duplicates), run: "
-            "python board-vision.py --import-legacy"
+            f"into {dataset_dir} (skipping duplicates), run: "
+            f"python board-vision.py --model {model_name} --import-legacy"
         )
 
     image_paths = list(choose_image_paths(image_args))
@@ -2531,7 +2766,7 @@ def main(argv=None):
         print(f"\nScreenshot: {image_path}")
 
         records = process_image(
-            image_path, duplicate_index=duplicate_index, dataset_dir=DATASET_DIR
+            image_path, duplicate_index=duplicate_index, dataset_dir=dataset_dir
         )
         if records is None:
             next_path = image_paths[index] if index < len(image_paths) else None
@@ -2547,7 +2782,7 @@ def main(argv=None):
 
         completed = True
         if _ask_yes_no("\nCreate the new CNN model now with cnn_trainer.py? [y/N]: "):
-            if run_cnn_trainer(records, DATASET_DIR):
+            if run_cnn_trainer(records, dataset_dir, model_name):
                 break
             print("The model was not created; you can add another screenshot.")
 
