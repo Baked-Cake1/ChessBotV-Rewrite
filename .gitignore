@@ -48,3 +48,6 @@ datasets/training/*/*
 datasets/validation/*/*
 !datasets/training/*/.gitkeep
 !datasets/validation/*/.gitkeep
+
+# Local engine training book and resumable frontier
+training/
