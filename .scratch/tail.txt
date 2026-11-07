@@ -1,0 +1,16 @@
+1) * 0.18)
+    dx = max(-max_dx, min(max_dx, rng.gauss(0.0, width * 0.085)))
+    dy = max(-max_dy, min(max_dy, rng.gauss(0.0, height * 0.085)))
+    x = round(centre_x + dx)
+    y = round(centre_y + dy)
+    if width > 2:
+        x = max(left + 1, min(right - 2, x))
+    else:
+        x = left
+    if height > 2:
+        y = max(top + 1, min(bottom - 2, y))
+    else:
+        y = top
+    return x, y
+
+
