@@ -3984,7 +3984,7 @@ class EngineThread:
                         self.info.update(depth=cached["depth"], pv=moves,
                                          score=cached.get("score_cp_white", 0),
                                          mate=cached.get("mate_white"),
-                                         lines={1: {"pv": moves, "score": cached.get("score_cp_white", 0),
+                                         lines={1: {"depth": cached["depth"], "pv": moves, "score": cached.get("score_cp_white", 0),
                                                     "mate": cached.get("mate_white")}})
                 if cached["depth"] >= target and not pending:
                     last_searched_fen, last_searched_token = fen, token
@@ -4059,6 +4059,7 @@ class EngineThread:
         mate_score = None
         pv_tokens = None
         multipv_num = None
+        bounded_score = False
 
         try:
             i = 1
@@ -4082,6 +4083,9 @@ class EngineThread:
                         mate_score = int(value)
                         score = 10000 if mate_score > 0 else -10000
                     i += 3
+                elif tok in ("lowerbound", "upperbound"):
+                    bounded_score = True
+                    i += 1
                 elif tok == "pv":
                     pv_tokens = tokens[i + 1 :]
                     break
@@ -4105,60 +4109,37 @@ class EngineThread:
                 except ValueError:
                     break
 
-        # Depth/nps are global
+        # Depth belongs to a scored PV, not to the latest arbitrary UCI
+        # message. Secondary MultiPV lines and progress-only messages can
+        # report different depths. Publish each result atomically so a
+        # depth-40 progress message cannot certify an older/shallow PV.
         with self.lock:
-            # A stop/update may have happened while this line was being
-            # parsed. Never let the old search repopulate the new readout.
             if token is not None and token != self.search_token:
                 return
             self.info["searching"] = True
             self.info["updated_at"] = time.monotonic()
-            if "depth" in updates:
-                self.info["depth"] = updates["depth"]
             if "nps" in updates:
                 self.info["nps"] = updates["nps"]
 
-            # If multipv was indicated, store per-line
-            if multipv_num is not None and moves:
-                line_data = {}
-                if score is not None:
-                    line_data["score"] = score
-                if mate_score is not None:
-                    line_data["mate"] = mate_score
-                else:
-                    line_data["mate"] = None
-                line_data["pv"] = moves
-                # Also store depth for that line
-                if "depth" in updates:
-                    line_data["depth"] = updates["depth"]
-                self.info.setdefault("lines", {})[multipv_num] = line_data
-                # Keep #1 as primary for eval bar / single-arrow compat
-                if multipv_num == 1:
-                    if score is not None:
-                        self.info["score"] = score
-                    if mate_score is not None:
-                        self.info["mate"] = mate_score
-                    else:
-                        # clear mate if this line is not mate (but keep None)
-                        if "mate" in self.info and mate_score is None and score is not None:
-                            # only clear if previous was mate but now cp
-                            self.info["mate"] = None
-                    self.info["pv"] = moves
+            depth = updates.get("depth")
+            if depth is None or not moves or score is None or bounded_score:
                 return
-
-            # Fallback for non-multipv (single PV) lines
-            if score is not None:
-                self.info["score"] = score
-                if mate_score is not None:
-                    self.info["mate"] = mate_score
-                else:
-                    self.info["mate"] = None
-            elif mate_score is not None:
-                self.info["mate"] = mate_score
-            if moves:
-                self.info["pv"] = moves
-                # also keep lines[1] in sync for unified rendering
-                self.info.setdefault("lines", {})[1] = {"score": self.info.get("score", 0), "mate": self.info.get("mate"), "pv": moves}
+            rank = multipv_num if multipv_num is not None else 1
+            lines = self.info.setdefault("lines", {})
+            previous = lines.get(rank, {})
+            minimum_depth = previous.get("depth", 0)
+            if rank == 1:
+                # Also protects a deep cached result while a fresh search
+                # works back up through its early iterative depths.
+                minimum_depth = max(minimum_depth, self.info.get("depth", 0))
+            if depth < minimum_depth:
+                return
+            line_data = {"score": score, "mate": mate_score,
+                         "pv": moves, "depth": depth}
+            lines[rank] = line_data
+            if rank == 1:
+                self.info.update(depth=depth, score=score,
+                                 mate=mate_score, pv=moves)
 
     def quit(self):
         self.running = False
