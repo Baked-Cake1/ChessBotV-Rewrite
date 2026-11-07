@@ -1868,42 +1868,57 @@ def preload_piece_images(themes=None):
 _piece_shadow_cache = {}
 
 
-def _draw_piece_ground_shadow(surface, centre, piece=None, alpha=88):
-    """Draw a cached soft elliptical shadow under a board piece.
+def _draw_piece_ground_shadow(surface, centre, piece=None, alpha=104, lift=0.0):
+    """Cached, smoothly feathered ground/contact shadow; lift is 0..1.
 
-    One small surface per piece-type/alpha is reused for every frame, so
-    settled and sliding pieces gain depth without allocating or blurring a
-    shadow sprite for each piece each frame.
+    A broad penumbra and a tighter contact core share one continuous
+    alpha field, avoiding the old nested-ellipse bands. Only geometry
+    and nine quantized lift levels are cached: opacity changes reuse the surface,
+    and no blur, pixel work or temporary surface is needed per frame.
     """
     piece_type = getattr(piece, "piece_type", None)
-    width = {
-        chess.PAWN: 38,
-        chess.KNIGHT: 46,
-        chess.BISHOP: 46,
-        chess.ROOK: 50,
-        chess.QUEEN: 56,
-        chess.KING: 56,
-    }.get(piece_type, 48)
-    height = 13
+    width_ratio = {
+        chess.PAWN: 0.64,
+        chess.KNIGHT: 0.74,
+        chess.BISHOP: 0.74,
+        chess.ROOK: 0.80,
+        chess.QUEEN: 0.86,
+        chess.KING: 0.86,
+    }.get(piece_type, 0.76)
     alpha = max(0, min(160, int(alpha)))
-    cache_key = (width, height, alpha)
+    if not alpha:
+        return
+    lift_step = round(max(0.0, min(1.0, float(lift))) * 8)
+    lift = lift_step / 8.0
+    width = max(8, round(SQUARE_SIZE * width_ratio * (1.0 + 0.24 * lift)))
+    height = max(6, round(SQUARE_SIZE * (0.25 + 0.09 * lift)))
+    cache_key = (width, height, lift_step)
     shadow = _piece_shadow_cache.get(cache_key)
     if shadow is None:
-        shadow = pygame.Surface((width + 10, height + 10), pygame.SRCALPHA)
-        for inset, fraction in ((0, 0.30), (3, 0.52), (6, 0.76), (9, 1.0)):
-            rect = pygame.Rect(
-                5 + inset,
-                5 + inset // 2,
-                max(1, width - inset * 2),
-                max(1, height - inset),
-            )
-            pygame.draw.ellipse(
-                shadow,
-                (12, 10, 8, round(alpha * fraction)),
-                rect,
-            )
+        # Transparent border keeps the Gaussian tail away from the edge
+        # even at small board sizes and fractional animation positions.
+        shadow = pygame.Surface((width + 4, height + 4), pygame.SRCALPHA)
+        cx, cy = (shadow.get_width() - 1) / 2, (shadow.get_height() - 1) / 2
+        contact_weight = 0.60 * (1.0 - lift)
+        tail = math.exp(-4.5)
+        for y in range(2, height + 2):
+            ny = (y - cy) / (height / 2)
+            for x in range(2, width + 2):
+                nx = (x - cx) / (width / 2)
+                radius_sq = nx * nx + ny * ny
+                if radius_sq >= 1.0:
+                    continue
+                soft = (math.exp(-4.5 * radius_sq) - tail) / (1.0 - tail)
+                contact = math.exp(-4.5 * ((nx / 0.68) ** 2 + (ny / 0.48) ** 2))
+                coverage = (1.0 - contact_weight) * soft + contact_weight * contact
+                shadow.set_at((x, y), (18, 16, 14, round(255 * coverage)))
         _piece_shadow_cache[cache_key] = shadow
-    surface.blit(shadow, shadow.get_rect(center=centre))
+    shadow.set_alpha(round(alpha * (1.0 - 0.38 * lift)))
+    shadow_rect = shadow.get_rect(center=(
+        round(centre[0] + SQUARE_SIZE * 0.035 * lift),
+        round(centre[1] + SQUARE_SIZE * 0.035 * lift),
+    ))
+    surface.blit(shadow, shadow_rect)
 
 
 available_themes = get_available_themes()
@@ -32466,6 +32481,13 @@ def draw_gui(
                 illegal_return_pose["rotation"],
             )
             current_grab = illegal_return_pose["current_grab"]
+            _draw_piece_ground_shadow(
+                screen,
+                (current_grab[0] - illegal_return_pose["drag_offset"][0] + SQUARE_SIZE / 2 + 2,
+                 current_grab[1] - illegal_return_pose["drag_offset"][1] + SQUARE_SIZE - 11),
+                illegal_return_pose["piece"],
+                lift=(illegal_return_pose["scale"] - 1.0) / (DRAG_GRAB_SCALE - 1.0),
+            )
             screen.blit(
                 returned_image,
                 (current_grab[0] - grab_x, current_grab[1] - grab_y),
@@ -32485,6 +32507,13 @@ def draw_gui(
                 )
                 held_image, grab_x, grab_y = _transform_dragged_piece_image(
                     images[pkey], drag_offset, grab_scale, grab_rotation
+                )
+                _draw_piece_ground_shadow(
+                    screen,
+                    (mx - drag_offset[0] + SQUARE_SIZE / 2 + 2,
+                     my - drag_offset[1] + SQUARE_SIZE - 11),
+                    piece,
+                    lift=(grab_scale - 1.0) / (DRAG_GRAB_SCALE - 1.0),
                 )
                 screen.blit(held_image, (mx - grab_x, my - grab_y))
     else:
