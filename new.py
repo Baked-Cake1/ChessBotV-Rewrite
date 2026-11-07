@@ -2,6 +2,7 @@ import array
 import base64
 import csv
 import ctypes
+import gc
 import importlib.util
 import io
 import json
@@ -137,6 +138,30 @@ GEAR_COLOR_HOVER = (255, 255, 255)
 
 pygame.init()
 pygame.display.set_caption("ChessBotV Rewrite")
+# --- Garbage collector policy ---
+# ChessBotV allocates a lot of short-lived objects per frame (arrow sample
+# vectors, cached-surface keys, poll result dicts). CPython's cyclic GC runs
+# a gen0 sweep every ~700 allocations and a gen2 sweep periodically after
+# that, which showed up as one-frame hitches during Advisor Mode. Reference
+# counting already frees everything that is not part of a reference cycle,
+# so cyclic collection is disabled here and performed explicitly from the
+# main loop on a slow, fixed cadence instead (see ``_maintenance_collect``).
+_GC_MAINTENANCE_SECONDS = 4.0
+
+
+def _maintenance_collect(force=False):
+    """Explicit, throttled cyclic collection for the pygame main loop."""
+    global _gc_last_collect_at
+    now = time.monotonic()
+    if not force and now - _gc_last_collect_at < _GC_MAINTENANCE_SECONDS:
+        return False
+    _gc_last_collect_at = now
+    gc.collect()
+    return True
+
+
+_gc_last_collect_at = time.monotonic()
+
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 font_large = pygame.font.SysFont("segoeui", 24, bold=True)
 font_small = pygame.font.SysFont("segoeui", 18)
@@ -408,10 +433,21 @@ def _win_error():
     return fn() if fn is not None else 0
 
 
+_USER32_CACHE = [None, False]
+
+
 def _user32():
-    """user32 with correctly-typed prototypes, or None off Windows."""
+    """user32 with correctly-typed prototypes, or None off Windows.
+
+    The prototyped handle is cached because this is called from the Advisor
+    mouse gate and other per-frame helpers; rebuilding a WinDLL and its
+    argtypes on every call is pure overhead.
+    """
     if os.name != "nt":
         return None
+    cached = _USER32_CACHE[0]
+    if cached is not None:
+        return cached
     from ctypes import wintypes
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -433,6 +469,7 @@ def _user32():
     set_long.restype = ctypes.c_ssize_t
     user32._get_window_long = get_long
     user32._set_window_long = set_long
+    _USER32_CACHE[0] = user32
     return user32
 
 
@@ -3353,6 +3390,39 @@ def _settings_main_item_slide(index, count, presentation):
     return int(round((1.0 - eased) * 20))
 
 
+_DIALOG_DIM_CACHE = {}
+_WINDOW_SCRATCH_SURFACES = {}
+
+def _dialog_dim_surface(alpha):
+    """Cached full-window black sheet for a dialog backdrop alpha.
+
+    Modals and the Settings shell used to allocate and clear a full-window
+    SRCALPHA surface every frame just to blit one flat colour. Backdrop alpha
+    animates in small integer steps, so the sheet is built once per value and
+    blitted again; the resulting pixels are identical.
+    """
+    alpha = max(0, min(255, int(alpha)))
+    surface = _DIALOG_DIM_CACHE.get(alpha)
+    if surface is None:
+        if len(_DIALOG_DIM_CACHE) > 64:
+            _DIALOG_DIM_CACHE.clear()
+        surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        surface.fill((0, 0, 0, alpha))
+        _DIALOG_DIM_CACHE[alpha] = surface
+    return surface
+
+
+def _window_scratch_surface(name="scratch"):
+    """A reused, cleared full-window SRCALPHA surface for offscreen frames."""
+    surface = _WINDOW_SCRATCH_SURFACES.get(name)
+    if surface is None:
+        surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        _WINDOW_SCRATCH_SURFACES[name] = surface
+    else:
+        surface.fill((0, 0, 0, 0))
+    return surface
+
+
 def _draw_settings_menu_reveal(surface, presentation):
     """Draw the shell's expanding/contracting rings and gear echo."""
     if not presentation.get("animating"):
@@ -3371,7 +3441,7 @@ def _draw_settings_menu_reveal(surface, presentation):
         origin_x, origin_y = settings_button_rect.center
     phase = float(presentation.get("phase", settings_menu_anim_phase))
 
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay = _window_scratch_surface("settings_reveal")
 
     # Two soft sonar-like rings expand from (or collect back toward) the
     # anchor while the content itself performs the scale/fade. Keeping
@@ -7776,9 +7846,7 @@ def get_promotion_rects():
 
 
 def draw_promotion_menu(screen, color):
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, 160))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(160), (0, 0))
     title = font_large.render("Choose promotion", True, TEXT_COLOR)
     screen.blit(title, (WIDTH // 2 - title.get_width() // 2, BOARD_OY + BOARD_WIDTH // 2 - 90))
     hint = font_tiny.render("Queen, Rook, Bishop, Knight (no pawn/king)", True, TEXT_MUTED)
@@ -8872,6 +8940,34 @@ def _eval_bar_white_fraction(current_eval, mate):
     return (clamped + 1000.0) / 2000.0
 
 
+_EVAL_BAR_GRADIENT_CACHE = {}
+
+
+def _eval_bar_gradient_surface(kind, w, h):
+    """Cached opaque gradient rows for one bar size and segment half.
+
+    ``kind`` 0 is the black half (top) and 1 the white half (bottom). Both
+    are anchored to the whole bar and evaluated with the same
+    ``t = row / (h - 1)`` and colour maths the per-frame loop used, so only
+    the drawing cost changes: eval updates now blit these instead of
+    drawing one line per pixel row on every frame.
+    """
+    key = (int(kind), int(w), int(h))
+    cached = _EVAL_BAR_GRADIENT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    first, second = (
+        EVAL_BLACK_GRADIENT if int(kind) == 0 else EVAL_WHITE_GRADIENT
+    )
+    surface = pygame.Surface((int(w), max(1, int(h))), pygame.SRCALPHA)
+    denom = max(1, int(h) - 1)
+    for i in range(int(h)):
+        colour = _lerp_color(first, second, i / denom)
+        pygame.draw.line(surface, (*colour, 255), (0, i), (int(w) - 1, i))
+    _EVAL_BAR_GRADIENT_CACHE[key] = surface
+    return surface
+
+
 def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
     """Draw a rounded, layered Lichess-style evaluation bar.
 
@@ -8933,18 +9029,24 @@ def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
     # Build the inner bar on its own surface so all shading can be clipped
     # to the same rounded silhouette. Gradients are anchored to the whole
     # bar (not each changing segment), so colours do not swim as eval moves.
+    # The two anchored gradients only depend on (w, h), so they are drawn
+    # once into a cached background and then split into their black/white
+    # parts with two clipped blits. Eval changes therefore cost two blits
+    # instead of one horizontal line per pixel row and ~600 _lerp_color
+    # calls on every frame.
     bar = pygame.Surface((w, h), pygame.SRCALPHA)
-    black_top, black_bottom = EVAL_BLACK_GRADIENT
-    white_top, white_bottom = EVAL_WHITE_GRADIENT
-    denom = max(1, h - 1)
-    for i in range(h):
-        t = i / denom
-        colour = (
-            _lerp_color(black_top, black_bottom, t)
-            if i < black_h
-            else _lerp_color(white_top, white_bottom, t)
+    if black_h > 0:
+        bar.blit(
+            _eval_bar_gradient_surface(0, w, h),
+            (0, 0),
+            (0, 0, w, black_h),
         )
-        pygame.draw.line(bar, (*colour, 255), (0, i), (w - 1, i))
+    if white_h > 0:
+        bar.blit(
+            _eval_bar_gradient_surface(1, w, h),
+            (0, black_h),
+            (0, black_h, w, white_h),
+        )
 
     # All translucent decoration goes on an overlay first. Drawing an
     # alpha colour directly onto the opaque gradient with pygame.draw can
@@ -13051,6 +13153,47 @@ def _autoplay_transition_matches(candidate_grid, after_grid, before_grid):
     return changed > 0
 
 
+def _autoplay_candidate_matches(candidate_grid, after_grid, before_grid):
+    """True if a partially-observed grid uniquely supports an end grid.
+
+    `?` cells are wildcards (useful while highlights/animations settle),
+    but at least one known cell that changed from before->after must
+    positively support the move. That prevents an all-unknown changed
+    region from being mistaken for a successful move.
+    """
+    support = 0
+    for row in range(8):
+        for col in range(8):
+            observed = candidate_grid[row][col]
+            if observed == "?":
+                continue
+            if observed != after_grid[row][col]:
+                return False
+            if after_grid[row][col] != before_grid[row][col]:
+                support += 1
+    return support > 0
+
+
+def _autoplay_transition_matches(candidate_grid, after_grid, before_grid):
+    """True when every square changed by a move is observed correctly.
+
+    This narrower check is used only for a known checkmating Auto-play
+    move. A site's game-over overlay can cover or recolour unrelated
+    squares immediately after mate, but the squares that actually
+    changed (origin, destination, captured/castling/en-passant squares)
+    must still positively match the move before it is accepted.
+    """
+    changed = 0
+    for row in range(8):
+        for col in range(8):
+            if after_grid[row][col] == before_grid[row][col]:
+                continue
+            changed += 1
+            if candidate_grid[row][col] != after_grid[row][col]:
+                return False
+    return changed > 0
+
+
 def _autoplay_matching_legal_moves(board, candidate_grid):
     """All legal moves whose resulting placement matches observations."""
     before_grid = _autoplay_board_grid_from_board(board)
@@ -13070,6 +13213,192 @@ def _autoplay_find_legal_move(board, candidate_grid):
     return matches[0] if len(matches) == 1 else None
 
 
+# --- Fast integer Advisor/Auto-play matchers -----------------------------
+#
+# The grid functions above are the readable reference implementation. A live
+# Advisor/Auto-play poll uses the helpers below instead, because Advisor has
+# to explain a screenshot that may already contain two plies: that means
+# matching every candidate reply of every candidate first move. Building a
+# fresh 8x8 string grid plus a python-chess board copy for each candidate
+# cost milliseconds of interpreter time on the poll worker, and the pygame
+# thread stuttered while it waited for the GIL.
+#
+# These helpers carry the same information as flat 64-int tuples (one cell
+# code per square, -1 for "unknown") and apply a legal move's placement
+# changes directly, so no board copy and no 64-square piece walk is needed
+# per candidate. Cell 0 is a8 and cell 63 is h1, matching
+# ``_autoplay_board_grid_from_board``.
+
+# Cell codes: 0 empty, 1-6 white P/N/B/R/Q/K, 7-12 the same black pieces,
+# -1 unknown. A promoted pawn therefore keeps the code of the piece that
+# actually stands on that square in the resulting grid.
+_GRID_CELL_CODES = {
+    ".": 0,
+    "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
+    "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
+    "?": -1,
+}
+_WHITE_CELL_CODES = frozenset(range(1, 7))
+_ALL_CELL_INDICES = tuple(range(64))
+_CELL_INDICES_64 = range(64)
+_CELL_INDICES_64 = range(64)
+_CELL_BIT = tuple(1 << index for index in range(64))
+
+
+def _grid_cells(grid):
+    """Flatten an 8x8 observation grid to 64 cell codes (-1 = unknown)."""
+    codes = _GRID_CELL_CODES
+    cells = []
+    append = cells.append
+    for row in grid:
+        for value in row:
+            if isinstance(value, str):
+                append(codes.get(value, -1))
+            else:
+                append(-1)
+    return tuple(cells)
+
+
+def _board_cells(board):
+    """The same 64 cell codes for a python-chess board."""
+    cells = []
+    append = cells.append
+    for rank_idx in range(7, -1, -1):
+        for file_idx in range(8):
+            piece = board.piece_at(chess.square(file_idx, rank_idx))
+            if piece is None:
+                append(0)
+            else:
+                append(
+                    int(piece.piece_type)
+                    if piece.color
+                    else int(piece.piece_type) + 6
+                )
+    return tuple(cells)
+
+
+def _changed_cell_indices(before_cells, after_cells):
+    """Indices whose symbols differ between two 64-cell tuples."""
+    return tuple(
+        index
+        for index in range(64)
+        if before_cells[index] != after_cells[index]
+    )
+
+
+def _cells_match(candidate_cells, after_cells, before_cells):
+    """Integer form of :func:`_autoplay_candidate_matches`."""
+    support = 0
+    for index in range(64):
+        observed = candidate_cells[index]
+        if observed < 0:
+            continue
+        if observed != after_cells[index]:
+            return False
+        if after_cells[index] != before_cells[index]:
+            support += 1
+    return support > 0
+
+
+def _transition_cells_match(candidate_cells, after_cells, before_cells,
+                            changed_cells=None):
+    """Integer form of :func:`_autoplay_transition_matches`."""
+    if changed_cells is None:
+        changed_cells = _changed_cell_indices(before_cells, after_cells)
+    if not changed_cells:
+        return False
+    for index in changed_cells:
+        if candidate_cells[index] != after_cells[index]:
+            return False
+    return True
+
+
+def _placement_layout(board):
+    """Piece-type/colour bitboards plus chess-square -> cell-index lookup."""
+    pairs = []
+    for is_white in (True, False):
+        for piece_type in range(1, 7):
+            mask = board.pieces_mask(piece_type, is_white)
+            if mask:
+                pairs.append((piece_type, is_white, mask))
+    squares = tuple(
+        (7 - (square >> 3)) * 8 + (square & 7) for square in range(64)
+    )
+    return pairs, squares
+
+
+def _cells_after_move(board, base_cells, move, layout):
+    """Cell tuple after ``move``, without copying or pushing a board.
+
+    A legal move can only alter its origin, its destination, the captured
+    piece there, the castling rook and (en passant) the passed pawn, so the
+    rest of ``base_cells`` is reused unchanged.
+    """
+    pairs, squares = layout
+    cells = list(base_cells)
+    from_square = int(move.from_square)
+    to_square = int(move.to_square)
+    moved = 0
+    is_white_mover = True
+    bit = 1 << from_square
+    for piece_type, is_white, mask in pairs:
+        if mask & bit:
+            is_white_mover = is_white
+            moved = piece_type if is_white else piece_type + 6
+            break
+    if not moved:
+        # Unknown origin (should not happen for a legal move): keep the
+        # observed symbol so the comparison stays conservative.
+        moved = base_cells[squares[from_square]]
+        if moved < 0:
+            moved = 0
+        is_white_mover = moved in _WHITE_CELL_CODES
+    from_index = squares[from_square]
+    to_index = squares[to_square]
+    cells[from_index] = 0
+    cells[to_index] = moved
+    if board.is_castling(move):
+        if to_square > from_square:
+            rook_from, rook_to = from_square + 3, to_square - 1
+        else:
+            rook_from, rook_to = from_square - 4, to_square + 1
+        rook_from_index = squares[rook_from]
+        rook_cell = base_cells[rook_from_index]
+        if rook_cell > 0:
+            cells[rook_from_index] = 0
+            cells[squares[rook_to]] = rook_cell
+    elif board.is_en_passant(move):
+        passed = to_square - 8 if board.turn == chess.WHITE else to_square + 8
+        cells[squares[passed]] = 0
+    promotion = getattr(move, "promotion", None)
+    if promotion:
+        cells[to_index] = (
+            int(promotion) if is_white_mover else int(promotion) + 6
+        )
+    return cells
+
+
+def _advisor_changed_cell_set(board, move, layout):
+    """Cell indices a legal reply can alter, mirroring the board mask test."""
+    _pairs, squares = layout
+    if board.is_castling(move):
+        return _ALL_CELL_INDICES
+    changed = {squares[int(move.from_square)], squares[int(move.to_square)]}
+    if board.is_en_passant(move):
+        to_square = int(move.to_square)
+        passed = to_square - 8 if board.turn == chess.WHITE else to_square + 8
+        changed.add(squares[passed])
+    return changed
+
+
+def _advisor_changed_cell_mask(board, move, layout):
+    """Bitmask (over cell indices) of the squares a reply can alter."""
+    mask = 0
+    for index in _advisor_changed_cell_set(board, move, layout):
+        mask |= _CELL_BIT[index]
+    return mask
+
+
 def _advisor_move_changed_mask(board, move):
     """Conservative set of squares a legal reply can alter, without pushing.
 
@@ -13085,57 +13414,70 @@ def _advisor_move_changed_mask(board, move):
     return mask
 
 
-def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
-    """Unique 0/1/2-ply legal sequence shown by an Advisor screenshot.
+def _advisor_find_move_sequence_cells(
+    board, candidate_cells, max_plies=2, layout=None, before_cells=None
+):
+    """Fast path of :func:`_advisor_find_move_sequence`.
 
-    Advisor polls only after the player releases the mouse. In a fast
-    game that screenshot can already contain both the player's move and
-    an instant/premoved reply, so fall back to a unique two-ply sequence
-    when no single move explains the observed changed squares.
+    Returns the same list/None result without building a string grid or
+    copying a board for the second-ply mismatch pruning.
     """
-    if board is None or candidate_grid is None:
+    if board is None or candidate_cells is None or len(candidate_cells) != 64:
         return None
-    before_grid = _autoplay_board_grid_from_board(board)
-    if candidate_grid == before_grid:
+    if layout is None:
+        layout = _placement_layout(board)
+    if before_cells is None:
+        before_cells = _board_cells(board)
+    if candidate_cells == before_cells:
         return []
 
-    # Build first-ply positions/grids once and reuse them for ordinary
-    # matching and the separate checkmate-banner recovery pass.
+    # Build first-ply cells once and reuse them for ordinary matching and
+    # the separate checkmate-banner recovery pass.
     first_nodes = []
     matches = []
     for move in board.legal_moves:
-        clone = board.copy(stack=False)
-        clone.push(move)
-        grid = _autoplay_board_grid_from_board(clone)
-        first_nodes.append((move, clone, grid))
-        if _autoplay_candidate_matches(candidate_grid, grid, before_grid):
+        cells = _cells_after_move(board, before_cells, move, layout)
+        first_nodes.append((move, cells))
+        if _cells_match(candidate_cells, cells, before_cells):
             matches.append(move)
     if len(matches) == 1:
         return matches
     if len(matches) > 1 or int(max_plies or 0) < 2:
         return None
+    if not first_nodes:
+        return None
 
+    probe = board.copy(stack=False)
     sequences = []
-    for first_move, clone, first_grid in first_nodes:
-        # Every known mismatch must be fixable by this one remaining
-        # reply. Unknown cells impose no restriction; final full matching
-        # still enforces positive evidence and uniqueness as before.
-        mismatches = 0
-        for row in range(8):
-            for col in range(8):
-                observed = candidate_grid[row][col]
-                if observed != "?" and observed != first_grid[row][col]:
-                    mismatches |= chess.BB_SQUARES[chess.square(col, 7 - row)]
-        for second_move in clone.legal_moves:
-            if mismatches & ~_advisor_move_changed_mask(clone, second_move):
-                continue
-            after = clone.copy(stack=False)
-            after.push(second_move)
-            after_grid = _autoplay_board_grid_from_board(after)
-            if _autoplay_candidate_matches(candidate_grid, after_grid, first_grid):
-                sequences.append([first_move, second_move])
-                if len(sequences) > 1:
-                    return None
+    for first_move, first_cells in first_nodes:
+        probe.push(first_move)
+        try:
+            # Every known mismatch must be fixable by this one remaining
+            # reply. Unknown cells impose no restriction; the full match
+            # below still enforces positive evidence and uniqueness. A
+            # reply only rewrites its own origin/destination (plus the
+            # capture, castling rook or en-passant pawn), so a cheap
+            # per-square probe can skip the grid rebuild entirely.
+            first_mismatches = 0
+            for index in _CELL_INDICES_64:
+                observed = candidate_cells[index]
+                if observed >= 0 and observed != first_cells[index]:
+                    first_mismatches |= _CELL_BIT[index]
+            for second_move in probe.legal_moves:
+                reply_mask = _advisor_changed_cell_mask(
+                    probe, second_move, layout
+                )
+                if first_mismatches & ~reply_mask:
+                    continue
+                second_cells = _cells_after_move(
+                    probe, first_cells, second_move, layout
+                )
+                if _cells_match(candidate_cells, second_cells, first_cells):
+                    sequences.append([first_move, second_move])
+                    if len(sequences) > 1:
+                        return None
+        finally:
+            probe.pop()
     if len(sequences) == 1:
         return sequences[0]
 
@@ -13146,43 +13488,146 @@ def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
     # preserves Advisor's required full stop on checkmate without using
     # the looser test for ordinary moves.
     terminal_sequences = []
-    for move, clone, after_grid in first_nodes:
-        if not clone.is_checkmate():
+    for move, cells in first_nodes:
+        probe.push(move)
+        try:
+            is_mate = probe.is_checkmate()
+        finally:
+            probe.pop()
+        if not is_mate:
             continue
-        if _autoplay_transition_matches(candidate_grid, after_grid, before_grid):
+        if _transition_cells_match(candidate_cells, cells, before_cells):
             terminal_sequences.append([move])
             if len(terminal_sequences) > 1:
                 return None
     if len(terminal_sequences) == 1:
         return terminal_sequences[0]
 
-    for first_move, first_clone, _first_grid in first_nodes:
-        if first_clone.is_game_over():
-            continue
-        for second_move in first_clone.legal_moves:
-            # Mate must give check. Avoid copying/pushing non-checks in
-            # this fallback; do not use full-grid mismatch pruning here
-            # because banners are allowed to obscure unrelated squares.
-            if not first_clone.gives_check(second_move):
+    for first_move, first_cells in first_nodes:
+        probe.push(first_move)
+        try:
+            if probe.is_game_over():
                 continue
-            second_clone = first_clone.copy(stack=False)
-            second_clone.push(second_move)
-            if not second_clone.is_checkmate():
-                continue
-            after_grid = _autoplay_board_grid_from_board(second_clone)
-            if _autoplay_transition_matches(
-                candidate_grid, after_grid, before_grid
-            ):
-                terminal_sequences.append([first_move, second_move])
-                if len(terminal_sequences) > 1:
-                    return None
+            for second_move in probe.legal_moves:
+                # Mate must give check. Avoid copying/pushing non-checks in
+                # this fallback; do not use full-grid mismatch pruning here
+                # because banners are allowed to obscure unrelated squares.
+                if not probe.gives_check(second_move):
+                    continue
+                second_cells = _cells_after_move(
+                    probe, first_cells, second_move, layout
+                )
+                probe.push(second_move)
+                try:
+                    is_mate = probe.is_checkmate()
+                finally:
+                    probe.pop()
+                if not is_mate:
+                    continue
+                if _transition_cells_match(
+                    candidate_cells, second_cells, first_cells
+                ):
+                    terminal_sequences.append([first_move, second_move])
+                    if len(terminal_sequences) > 1:
+                        return None
+        finally:
+            probe.pop()
     return terminal_sequences[0] if len(terminal_sequences) == 1 else None
+
+
+def _advisor_find_move_sequence(board, candidate_grid, max_plies=2):
+    """Unique 0/1/2-ply legal sequence shown by an Advisor screenshot.
+
+    Advisor polls only after the player releases the mouse. In a fast
+    game that screenshot can already contain both the player's move and
+    an instant/premoved reply, so fall back to a unique two-ply sequence
+    when no single move explains the observed changed squares.
+    """
+    if board is None or candidate_grid is None:
+        return None
+    try:
+        candidate_cells = _grid_cells(candidate_grid)
+    except Exception:
+        return None
+    if len(candidate_cells) != 64:
+        return None
+    return _advisor_find_move_sequence_cells(
+        board, candidate_cells, max_plies=max_plies
+    )
 
 
 def _autoplay_changed_visual_squares(previous, current,
                                      mean_threshold=6.0,
                                      changed_fraction=0.035):
-    """Screenshot cells whose pixels changed materially between polls."""
+    """Screenshot cells whose pixels changed materially between polls.
+
+    Every live Advisor/Auto-play poll calls this once. The exact same two
+    tests as before are applied per cell, but the 128 tiny ``np.mean``
+    reductions are replaced by two block reductions over the whole image:
+
+    * the per-pixel colour difference is summed per cell, then divided by
+      ``area * 3`` exactly like ``np.mean`` over the 3-channel cell, and
+    * the "changed pixel" mask is summed per cell and divided by ``area``.
+
+    Boards whose side is not a multiple of eight keep the original
+    rounded-boundary path (``_autoplay_changed_visual_squares_reference``),
+    which is also the readable reference for the optimised form.
+    """
+    if previous is None or current is None:
+        return [(row, col) for row in range(8) for col in range(8)]
+    if previous.shape != current.shape or previous.ndim != 3:
+        return [(row, col) for row in range(8) for col in range(8)]
+
+    import cv2
+    import numpy as np
+
+    difference = cv2.absdiff(previous[:, :, :3], current[:, :, :3])
+    height = int(difference.shape[0])
+    width = int(difference.shape[1])
+    if height <= 0 or width <= 0:
+        return []
+
+    # np.max(..., axis=2) is surprisingly slow for a strided 3-channel
+    # view; maximum() into a reusable buffer keeps the same values.
+    highest = np.empty((height, width), dtype=np.uint8)
+    np.maximum(difference[:, :, 0], difference[:, :, 1], out=highest)
+    np.maximum(highest, difference[:, :, 2], out=highest)
+    changed_pixels = highest > 32
+
+    if height % 8 or width % 8:
+        return _autoplay_changed_visual_squares_reference(
+            previous, current, mean_threshold, changed_fraction
+        )
+
+    cell_h = height // 8
+    cell_w = width // 8
+    shape = (8, cell_h, 8, cell_w)
+    cell_sums = difference.reshape(shape + (3,)).sum(
+        axis=(1, 3, 4), dtype=np.int64
+    )
+    cell_counts = changed_pixels.reshape(shape).sum(axis=(1, 3), dtype=np.int64)
+    area = float(cell_h * cell_w)
+    mean_diff = cell_sums / (area * 3.0)
+    fraction = cell_counts / area
+
+    return [
+        (row, col)
+        for row in range(8)
+        for col in range(8)
+        if mean_diff[row][col] >= mean_threshold
+        or fraction[row][col] >= changed_fraction
+    ]
+
+
+def _autoplay_changed_visual_squares_reference(
+    previous, current, mean_threshold=6.0, changed_fraction=0.035
+):
+    """Per-cell reference form of the poll diff (also used for odd sizes).
+
+    Kept alongside the optimised version so the two can be compared
+    directly, and so a board crop whose side is not a multiple of eight
+    still uses the original rounded cell boundaries.
+    """
     if previous is None or current is None:
         return [(row, col) for row in range(8) for col in range(8)]
     if previous.shape != current.shape or previous.ndim != 3:
@@ -17013,9 +17458,7 @@ def get_autoplay_side_dialog_rects():
 def draw_autoplay_side_dialog(screen):
     e = cubic_ease_in_out(max(0.0, min(1.0, autoplay_side_dialog_anim)))
     panel, choices, cancel = get_autoplay_side_dialog_rects()
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, int(170 * e)))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(int(170 * e)), (0, 0))
     pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
     pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
     pygame.draw.rect(screen, (130, 220, 150), panel, 2, border_radius=14)
@@ -17087,9 +17530,7 @@ def get_advisor_side_dialog_rects():
 def draw_advisor_side_dialog(screen):
     e = cubic_ease_in_out(max(0.0, min(1.0, advisor_side_dialog_anim)))
     panel, choices, cancel = get_advisor_side_dialog_rects()
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, int(170 * e)))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(int(170 * e)), (0, 0))
     pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
     pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
     pygame.draw.rect(screen, (130, 220, 150), panel, 2, border_radius=14)
@@ -17158,9 +17599,7 @@ def get_autoplay_gameover_dialog_rects():
 def draw_autoplay_gameover_dialog(screen):
     e = cubic_ease_in_out(max(0.0, min(1.0, autoplay_gameover_dialog_anim)))
     panel, scan_rect, stop_rect = get_autoplay_gameover_dialog_rects()
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, int(175 * e)))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(int(175 * e)), (0, 0))
     pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
     pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
     pygame.draw.rect(screen, (130, 220, 150), panel, 2, border_radius=14)
@@ -17302,9 +17741,7 @@ def draw_board_detection_dialog(screen):
     panel, cards, refresh_rect, cancel_rect, detect_rect, prev_rect, next_rect = (
         get_board_detection_dialog_rects()
     )
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, int(175 * e)))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(int(175 * e)), (0, 0))
 
     pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
     pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
@@ -23345,9 +23782,7 @@ def get_auto_color_dialog_rects():
 def draw_auto_color_dialog(screen):
     e = cubic_ease_in_out(max(0.0, min(1.0, auto_color_dialog_anim)))
     panel, choices, cancel = get_auto_color_dialog_rects()
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, int(165 * e)))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(int(165 * e)), (0, 0))
     pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
     pygame.draw.rect(screen, (52, 52, 64), panel, border_radius=14)
     pygame.draw.rect(screen, (130, 220, 150), panel, 2, border_radius=14)
@@ -31440,7 +31875,7 @@ def draw_settings_menu(screen):
     shell_animating = bool(presentation["animating"])
     content_surface = None
     if shell_animating:
-        content_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        content_surface = _window_scratch_surface("settings_shell")
         screen = content_surface
 
     update_menu_transition()
@@ -31455,9 +31890,7 @@ def draw_settings_menu(screen):
     # --- Choreographed shell open/close: backdrop, reveal, then pages ---
     eased = presentation["presence"]
     backdrop_alpha = presentation["backdrop_alpha"]
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, backdrop_alpha))
-    destination.blit(overlay, (0, 0))
+    destination.blit(_dialog_dim_surface(backdrop_alpha), (0, 0))
     _draw_settings_menu_reveal(destination, presentation)
     # The composite transform supplies the shared rise/sink. Individual
     # main-menu rows add only their staggered cascade below, avoiding the
@@ -31612,9 +32045,7 @@ def draw_settings_menu(screen):
         if page_state != outgoing_page:
             draw_page(page_state, page_off)
         elif outgoing_alpha > 0:
-            outgoing_surface = pygame.Surface(
-                (WIDTH, HEIGHT), pygame.SRCALPHA
-            )
+            outgoing_surface = _window_scratch_surface("settings_page")
             screen = outgoing_surface
             try:
                 draw_page(page_state, page_off)
@@ -31885,9 +32316,7 @@ def draw_confirm_dialog(screen):
         return None, None
     # backdrop
     e = cubic_ease_in_out(confirm_anim)
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0,0,0, int(160*e)))
-    screen.blit(overlay, (0,0))
+    screen.blit(_dialog_dim_surface(int(160 * e)), (0, 0))
     # dialog box
     w, h = 360, 160
     x = WIDTH//2 - w//2
@@ -31940,9 +32369,7 @@ def draw_game_over_dialog(screen, board):
     e = cubic_ease_in_out(max(0.0, min(1.0, game_over_anim)))
     panel, new_rect, keep_rect = get_game_over_rects()
 
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, int(165 * e)))
-    screen.blit(overlay, (0, 0))
+    screen.blit(_dialog_dim_surface(int(165 * e)), (0, 0))
 
     # soft shadow + panel
     pygame.draw.rect(screen, (18, 18, 22), panel.move(0, 5), border_radius=14)
@@ -31981,6 +32408,29 @@ def draw_game_over_dialog(screen, board):
     screen.blit(new_t, new_t.get_rect(center=new_rect.center))
     screen.blit(keep_t, keep_t.get_rect(center=keep_rect.center))
     return new_rect, keep_rect
+
+_TILE_OVERLAY_CACHE = {}
+
+
+def _tile_overlay(rgba):
+    """Cached one-square translucent overlay (selection / flash / last move).
+
+    The board loop used to allocate and fill a fresh SRCALPHA surface for
+    every highlighted square on every frame. The overlays depend only on
+    the square size and colour, so they are built once and blitted like
+    before: same pixels, no per-frame allocation or fill.
+    """
+    key = (SQUARE_SIZE, tuple(rgba))
+    surface = _TILE_OVERLAY_CACHE.get(key)
+    if surface is None:
+        if len(_TILE_OVERLAY_CACHE) > 96:
+            _TILE_OVERLAY_CACHE.clear()
+        surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+        surface.fill(tuple(rgba))
+        _TILE_OVERLAY_CACHE[key] = surface
+    return surface
+
+
 
 def draw_gui(
     screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos,
@@ -32132,21 +32582,19 @@ def draw_gui(
             sq = chess.square(vis_file, vis_rank)
             live_highlight_alpha = live_move_highlight.get(int(sq), 0)
             if live_highlight_alpha:
-                s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
-                s.fill((246, 199, 49, int(live_highlight_alpha)))
-                screen.blit(s, sq_rect.topleft)
+                screen.blit(
+                    _tile_overlay((246, 199, 49, int(live_highlight_alpha))),
+                    sq_rect.topleft,
+                )
             if sq == selected_sq:
-                s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
-                s.fill(HIGHLIGHT_COLOR)
-                screen.blit(s, sq_rect.topleft)
+                screen.blit(_tile_overlay(HIGHLIGHT_COLOR), sq_rect.topleft)
             if sq == anim_mgr.illegal_flash_square:
                 flash_alpha = anim_mgr.get_illegal_flash_alpha()
                 if flash_alpha > 0:
-                    s = pygame.Surface(
-                        (SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA
+                    screen.blit(
+                        _tile_overlay((255, 45, 45, flash_alpha)),
+                        sq_rect.topleft,
                     )
-                    s.fill((255, 45, 45, flash_alpha))
-                    screen.blit(s, sq_rect.topleft)
 
     # Board border with AA
     pygame.draw.rect(
@@ -32302,9 +32750,7 @@ def draw_gui(
             if tmp_move in board.legal_moves:
                 x, y = square_to_screen(drop_sq)
                 hl_rect = pygame.Rect(x, y, SQUARE_SIZE, SQUARE_SIZE)
-                s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
-                s.fill((255, 255, 100, 80))
-                screen.blit(s, hl_rect.topleft)
+                screen.blit(_tile_overlay((255, 255, 100, 80)), hl_rect.topleft)
 
     # 4. Capture animations
     for anim in anim_mgr.capture_anims:
@@ -32735,6 +33181,9 @@ def main():
     global show_autoplay_side_dialog, show_autoplay_gameover_dialog, show_advisor_side_dialog
 
     clock = pygame.time.Clock()
+    # Cyclic GC is disabled module-wide for smooth frames; this loop
+    # performs the throttled explicit collection instead.
+    gc.disable()
     board = chess.Board()
     anim_mgr = AnimationManager()
     check_effect = CheckEffect()
@@ -34507,6 +34956,7 @@ def main():
             if config.get("always_on_top", 1):
                 apply_always_on_top(True, persist=False)
         clock.tick(FPS)
+        _maintenance_collect()
 
     if training_session.mode:
         training_session.stop(board, engine_thread)

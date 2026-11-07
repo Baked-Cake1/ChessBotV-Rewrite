@@ -9,12 +9,19 @@ source = ast.parse((Path(__file__).resolve().parents[1] / 'new.py').read_text())
 namespace = {'chess': chess}
 functions = {'_autoplay_board_grid_from_board', '_autoplay_candidate_matches',
              '_autoplay_transition_matches', '_autoplay_matching_legal_moves',
-             '_advisor_move_changed_mask', '_advisor_find_move_sequence'}
+             '_advisor_move_changed_mask', '_advisor_find_move_sequence',
+             # Fast integer path used by the live Advisor poll.
+             '_grid_cells', '_board_cells', '_changed_cell_indices',
+             '_cells_match', '_transition_cells_match', '_placement_layout',
+             '_cells_after_move', '_advisor_changed_cell_set',
+             '_advisor_changed_cell_mask', '_advisor_find_move_sequence_cells'}
+constants = {'ADVISOR_POLL_SECONDS', '_GRID_CELL_CODES', '_WHITE_CELL_CODES',
+             '_ALL_CELL_INDICES', '_CELL_BIT', '_CELL_INDICES_64'}
 for node in source.body:
     if isinstance(node, ast.FunctionDef) and node.name in functions:
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'new.py', 'exec'), namespace)
     if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and
-            t.id == 'ADVISOR_POLL_SECONDS' for t in node.targets):
+            t.id in constants for t in node.targets):
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'new.py', 'exec'), namespace)
 exec(compile(Path(__file__).with_name('advisor_reference.py').read_text(),
              'advisor_reference.py', 'exec'), namespace)
@@ -143,3 +150,71 @@ class AdvisorRecoveryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AdvisorLivePathRegressionTests(unittest.TestCase):
+    """Guards the live poll's own optimised helpers.
+
+    ``AdvisorRecoveryTests`` above already compares the matcher against the
+    frozen exhaustive reference. These tests additionally pin the pieces the
+    live Advisor poll now uses directly, so a future change cannot silently
+    reintroduce the per-candidate board copies/string grids that made the
+    pygame thread stutter.
+    """
+
+    def test_board_and_grid_cells_agree(self):
+        import random as _random
+        rng = _random.Random(4242)
+        for _ in range(40):
+            board = chess.Board()
+            for _ in range(rng.randrange(0, 70)):
+                if board.is_game_over():
+                    break
+                board.push(rng.choice(list(board.legal_moves)))
+            grid = namespace['_autoplay_board_grid_from_board'](board)
+            self.assertEqual(
+                namespace['_grid_cells'](grid), namespace['_board_cells'](board)
+            )
+
+    def test_cells_after_move_matches_pushed_board(self):
+        """Speed path must reproduce a pushed board, including special moves."""
+        cases = [
+            (chess.Board(), ['e2e4']),
+            (chess.Board('rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1'), ['e7e5']),
+            (chess.Board('r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1'), ['e1g1']),
+            (chess.Board('r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1'), ['e8c8']),
+            (chess.Board('4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1'), ['e5d6']),
+            (chess.Board('4k3/P7/8/8/8/8/7p/4K3 w - - 0 1'), ['a7a8n']),
+        ]
+        for board, ucvs in cases:
+            for uci in ucvs:
+                with self.subTest(fen=board.fen(), uci=uci):
+                    move = chess.Move.from_uci(uci)
+                    self.assertIn(move, board.legal_moves)
+                    fen_before = board.fen()
+                    layout = namespace['_placement_layout'](board)
+                    before = namespace['_board_cells'](board)
+                    after = namespace['_cells_after_move'](
+                        board, before, move, layout
+                    )
+                    clone = board.copy(stack=False)
+                    clone.push(move)
+                    self.assertEqual(tuple(after), namespace['_board_cells'](clone))
+                    self.assertEqual(fen_before, board.fen())
+
+    def test_fast_matcher_leaves_board_untouched(self):
+        board = chess.Board()
+        for uci in ('e2e4', 'e7e5'):
+            board.push_uci(uci)
+        fen = board.fen()
+        stack = list(board.move_stack)
+        grid = namespace['_autoplay_board_grid_from_board'](board)
+        grid[4][4] = '?'
+        namespace['_advisor_find_move_sequence'](board, grid)
+        self.assertEqual(board.fen(), fen)
+        self.assertEqual(board.move_stack, stack)
+
+    def test_poll_interval_unchanged(self):
+        # Advisor still polls on the documented cadence; the optimisations
+        # made each poll cheaper rather than polling less often.
+        self.assertEqual(namespace['ADVISOR_POLL_SECONDS'], 0.18)
