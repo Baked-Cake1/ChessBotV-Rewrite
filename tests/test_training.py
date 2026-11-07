@@ -12,7 +12,12 @@ import chess
 
 source = ast.parse((Path(__file__).resolve().parents[1] / 'new.py').read_text())
 namespace = dict(chess=chess, Path=Path, json=json, os=os, sqlite3=sqlite3,
-                 tempfile=tempfile, time=time, TRAINING_DEPTH=40)
+                 tempfile=tempfile, time=time)
+for node in source.body:
+    if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "TRAINING_DEPTH"
+            for target in node.targets):
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "new.py", "exec"), namespace)
 for node in source.body:
     if isinstance(node, ast.ClassDef) and node.name in ('TrainingStore', 'TrainingSession', 'EngineThread'):
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'new.py', 'exec'), namespace)
@@ -71,13 +76,30 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(self.session.db.execute('SELECT count(*) FROM frontier').fetchone()[0], 20)
         self.session.tick(self.board, self.engine)
         self.assertEqual(self.board.turn, chess.BLACK)
-        self.engine.info = self.info(40)
+        self.engine.info = self.info(35)
         self.session.tick(self.board, self.engine)
         self.assertEqual(self.session.db.execute('SELECT count(*) FROM frontier WHERE done=1').fetchone()[0], 1)
         self.assertEqual(self.session.db.execute('SELECT count(*) FROM frontier').fetchone()[0], 40)
         self.session.stop(self.board, self.engine)
         self.session.start('auto', self.board, self.engine)
         self.assertEqual(self.session.db.execute('SELECT count(*) FROM frontier WHERE done=1').fetchone()[0], 1)
+    def test_training_target_and_completion_boundary(self):
+        self.assertEqual(namespace['TRAINING_DEPTH'], 35)
+        self.session.start('manual', self.board, self.engine)
+        self.assertEqual(self.engine.training_depth, 35)
+        self.engine.info = self.info(34)
+        self.session.tick(self.board, self.engine)
+        self.assertTrue(self.session.blocked())
+        self.assertIn('34/35', self.session.status)
+        self.engine.info = self.info(35)
+        self.session.tick(self.board, self.engine)
+        self.assertFalse(self.session.blocked())
+        self.assertEqual(self.store.lookup(self.board)['depth'], 35)
+        self.assertIn('Saved depth 35', self.session.status)
+        self.session.fen = None
+        self.session.tick(self.board, self.engine)
+        self.assertIn('already done', self.session.status)
+
     def test_stale_info_and_corrupt_file(self):
         info = self.info(40)
         info['fen'] = 'wrong'
@@ -150,26 +172,26 @@ class EngineDepthTests(unittest.TestCase):
         self.parse('info depth 1 score cp 0 pv e7e5', token=2)
         self.assertEqual(self.engine.info['depth'], 1)
 
-    def test_manual_does_not_finish_on_secondary_or_progress_depth_40(self):
+    def test_manual_does_not_finish_on_secondary_or_progress_depth_35(self):
         with tempfile.TemporaryDirectory() as directory:
             store = namespace['TrainingStore'](directory)
             namespace['training_store'] = store
             session = namespace['TrainingSession']()
             session.mode = 'manual'
             session.tick(self.engine.board, self.engine)
-            self.parse('info depth 38 multipv 1 score cp 25 pv e2e4')
-            self.parse('info depth 40 multipv 2 score cp 10 pv d2d4')
-            self.parse('info depth 40 currmove e2e4')
+            self.parse('info depth 34 multipv 1 score cp 25 pv e2e4')
+            self.parse('info depth 35 multipv 2 score cp 10 pv d2d4')
+            self.parse('info depth 35 currmove e2e4')
             session.tick(self.engine.board, self.engine)
             self.assertTrue(session.blocked())
             self.assertFalse(store.records)
             session.skip(self.engine.board, self.engine)
-            self.assertEqual(store.lookup(self.engine.board)['depth'], 38)
+            self.assertEqual(store.lookup(self.engine.board)['depth'], 34)
             session.ready = False
-            self.parse('info depth 40 multipv 1 score cp 28 pv e2e4')
+            self.parse('info depth 35 multipv 1 score cp 28 pv e2e4')
             session.tick(self.engine.board, self.engine)
             self.assertFalse(session.blocked())
-            self.assertEqual(store.lookup(self.engine.board)['depth'], 40)
+            self.assertEqual(store.lookup(self.engine.board)['depth'], 35)
 
 
 if __name__ == '__main__':
