@@ -7874,9 +7874,9 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
 
     is_castling, rook_start_sq, rook_target_sq, rook_piece = get_castling_info(board, from_sq, to_sq)
 
-    captured_piece = board.piece_at(to_sq)
+    captured_piece = None if is_castling else board.piece_at(to_sq)
     # Handle en-passant capture (destination empty but diagonal pawn move)
-    if not captured_piece:
+    if not is_castling and not captured_piece:
         piece = board.piece_at(from_sq)
         if piece and piece.piece_type == chess.PAWN:
             if chess.square_file(from_sq) != chess.square_file(to_sq):
