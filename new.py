@@ -7800,6 +7800,44 @@ def _opening_marquee_offset(name, text_width, viewport_width, time_ms=None):
     return round(viewport_width - travelled)
 
 
+def _gui_custom_legal_moves(board):
+    king_cap = bool(config.get("gui_rule_king_capturing", 0))
+    double_pawn = bool(config.get("gui_rule_double_pawn", 1))
+    en_passant = bool(config.get("gui_rule_en_passant", 1))
+    promotion = bool(config.get("gui_rule_promotion", 1))
+    castling = bool(config.get("gui_rule_castling", 1))
+    friendly_fire = bool(config.get("gui_rule_friendly_fire", 0))
+
+    base_moves = list(board.pseudo_legal_moves if king_cap else board.legal_moves)
+    out = []
+    for mv in base_moves:
+        p = board.piece_at(mv.from_square)
+        if not double_pawn and p and p.piece_type == chess.PAWN:
+            if abs(chess.square_rank(mv.to_square) - chess.square_rank(mv.from_square)) == 2:
+                continue
+        if not en_passant and board.is_en_passant(mv):
+            continue
+        if not castling and board.is_castling(mv):
+            continue
+        if not promotion and mv.promotion is not None:
+            if mv.promotion == chess.QUEEN:
+                out.append(chess.Move(mv.from_square, mv.to_square))
+            continue
+        out.append(mv)
+
+    if friendly_fire:
+        for sq, piece in board.piece_map().items():
+            if piece.color != board.turn:
+                continue
+            for atk_sq in board.attacks(sq):
+                target = board.piece_at(atk_sq)
+                if target is not None and target.color == board.turn:
+                    if not king_cap and target.piece_type == chess.KING:
+                        continue
+                    out.append(chess.Move(sq, atk_sq))
+    return out
+
+
 def get_legal_squares(board, selected_sq):
     if selected_sq is None:
         return set(), set()
@@ -7807,7 +7845,7 @@ def get_legal_squares(board, selected_sq):
     regular_moves = set()
     capture_moves = set()
 
-    for move in board.legal_moves:
+    for move in _gui_custom_legal_moves(board):
         if move.from_square == selected_sq:
             if board.piece_at(move.to_square):
                 capture_moves.add(move.to_square)
