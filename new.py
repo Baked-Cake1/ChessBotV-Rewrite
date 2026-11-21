@@ -4206,10 +4206,31 @@ class EngineThread:
                 print(f"Analysis error: {e}")
                 if "closed its output stream" in str(e) and self.running:
                     print("Restarting engine after unexpected stream closure...")
-                    self._stop_process()
-                    if self.start_engine():
+                    try:
+                        if self.proc is not None:
+                            self.proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        _si = None
+                        if sys.platform == "win32":
+                            _si = subprocess.STARTUPINFO()
+                            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        self.proc = subprocess.Popen(
+                            self.path,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            bufsize=1,
+                            startupinfo=_si,
+                        )
+                        self._handshake(self.cfg)
+                        self.engine_active = True
                         last_searched_fen = None
                         continue
+                    except Exception as restart_err:
+                        print(f"Engine restart failed: {restart_err}")
                 self.engine_active = False
                 break
 
