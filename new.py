@@ -34259,6 +34259,8 @@ def draw_gui(
 def main():
     global training_action
     global menu_anim_progress, menu_anim_opening, menu_anim_closing
+    global _history_hold_dir, _history_hold_start_ms, _history_hold_last_step_ms
+    global show_edit_board_dialog, _edit_board_state, _edit_board_drag_piece, _edit_board_drag_from_sq, _edit_board_status
     global menu_transition_direction, engine_thread, promotion_pending, restart_requested, engine_slider_dragging
     global show_newgame_confirm, confirm_anim, board_flipped, board_ox_current, eval_bar_x_current, board_ox_target, eval_bar_x_target, board_anim_t, eval_bar_side
     global engine_draft, engine_slider_display, engine_has_changes
