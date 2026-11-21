@@ -33384,7 +33384,7 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None):
 
 def draw_gui(
     screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos,
-    drag_sq=None, drag_offset=None, dragging=False, view_ply=None, total_ply=None
+    drag_sq=None, drag_offset=None, dragging=False, view_ply=None, total_ply=None, history_redo=None
 ):
     global depth_bar_fraction
     screen.fill(BG_COLOR)
@@ -36185,6 +36185,7 @@ def main():
             dragging=dragging,
             view_ply=len(board.move_stack),
             total_ply=len(board.move_stack) + len(history_redo),
+            history_redo=history_redo,
         )
         if training_session.mode or training_session.status != "Training idle":
             text = font_tiny.render(training_session.status + " | F6 Skip  F7 Stop", True, TEXT_COLOR)
