@@ -623,7 +623,7 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1}
 _STRING_CONFIG_KEYS = (
     "theme",
     "board_theme",
@@ -635,6 +635,8 @@ _STRING_CONFIG_KEYS = (
     "autoplay_broadcast_process",
     "autoplay_broadcast_screen_device",
     "vision_model",
+    "gui_arrow_anim_style",
+    "gui_piece_anim_style",
 )
 
 
@@ -858,6 +860,19 @@ def save_config():
             f.write(f"theme={config.get('theme', current_theme)}\n")
             f.write(f"board_theme={config.get('board_theme', current_board_theme)}\n")
             f.write(f"always_on_top={1 if config.get('always_on_top', 1) else 0}\n")
+            for _gk in (
+                "gui_basic_arrows",
+                "gui_legacy_buttons",
+                "gui_coordinates",
+                "gui_rounded_corners",
+                "gui_fancy_knight",
+                "gui_show_legal_moves",
+                "gui_disable_legal_moves_anim",
+                "gui_rotate_piece_on_move",
+            ):
+                f.write(f"{_gk}={1 if config.get(_gk, ENGINE_DEFAULTS[_gk]) else 0}\n")
+            f.write(f"gui_arrow_anim_style={config.get('gui_arrow_anim_style', 'Cubic')}\n")
+            f.write(f"gui_piece_anim_style={config.get('gui_piece_anim_style', 'Cubic')}\n")
             f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
             f.write(f"autoplay_depth={int(config.get('autoplay_depth', 20))}\n")
@@ -2106,9 +2121,10 @@ menu_transition_speed = 0.07
 menu_transition_direction = "none"  # "none" | "forward" | "back"
 SETTINGS_PAGE_TITLES = {
     "main": "Settings",
-    "board": "Board",
+    "board": "Display",
     "pieces_style": "Pieces Styles",
     "board_themes": "Board Themes",
+    "gui": "GUI",
     "engine_settings": "Engine Settings",
     "analysis": "Analysis Settings",
     "autoplay_settings": "Auto-Play Settings",
@@ -2121,10 +2137,11 @@ SETTINGS_PAGE_PARENT = {
     "board": "main",
     "pieces_style": "board",
     "board_themes": "board",
+    "gui": "board",
 }
 SETTINGS_MAIN_ITEMS = [
     "Engine Settings",
-    "Board",
+    "Display",
     "Game Controls",
     "Analysis Settings",
     "Auto-Play Settings",
@@ -2721,9 +2738,12 @@ class AnimationManager:
         self.get_illegal_flash_alpha(_now_ms)
 
         if self.move_anim:
-            self.move_anim["progress"] += self.move_anim["speed"]
-            if self.move_anim["progress"] >= 1.0:
+            if str(config.get("gui_piece_anim_style", "Cubic")) == "None":
                 self.move_anim = None
+            else:
+                self.move_anim["progress"] += self.move_anim["speed"]
+                if self.move_anim["progress"] >= 1.0:
+                    self.move_anim = None
 
         if self.rook_anim:
             self.rook_anim["progress"] += self.rook_anim["speed"]
@@ -2754,41 +2774,42 @@ class AnimationManager:
         else:
             self.arrow_alpha = self.arrow_target_alpha
 
+        _arrow_style = str(config.get("gui_arrow_anim_style", "Cubic"))
+        def _step_arrow_vec(cur, target, speed):
+            if _arrow_style == "None":
+                return target.copy()
+            d = target - cur
+            lsq = d.length_squared()
+            if lsq <= 1.0:
+                return target.copy()
+            if _arrow_style == "Linear":
+                dist = math.sqrt(lsq)
+                step = min(dist, 18.0)
+                return cur + d * (step / dist)
+            if _arrow_style == "Quad":
+                return cur + d * min(1.0, speed * 1.35)
+            return cur + d * speed
+
         if (
             self.arrow_start is not None
             and self.arrow_end is not None
             and self.arrow_target_start is not None
             and self.arrow_target_end is not None
         ):
-            ds = self.arrow_target_start - self.arrow_start
-            if ds.length_squared() > 1.0:
-                self.arrow_start += ds * self.arrow_morph_speed
-            else:
-                self.arrow_start = self.arrow_target_start.copy()
-
-            de = self.arrow_target_end - self.arrow_end
-            if de.length_squared() > 1.0:
-                self.arrow_end += de * self.arrow_morph_speed
-            else:
-                self.arrow_end = self.arrow_target_end.copy()
+            self.arrow_start = _step_arrow_vec(self.arrow_start, self.arrow_target_start, self.arrow_morph_speed)
+            self.arrow_end = _step_arrow_vec(self.arrow_end, self.arrow_target_end, self.arrow_morph_speed)
 
         # MultiPV arrows update
         for aid, adata in list(self.multi_arrows.items()):
-            if abs(adata["alpha"] - adata["target_alpha"]) > 0.5:
+            if _arrow_style == "None":
+                adata["alpha"] = adata["target_alpha"]
+            elif abs(adata["alpha"] - adata["target_alpha"]) > 0.5:
                 adata["alpha"] += (adata["target_alpha"] - adata["alpha"]) * self.multi_arrow_fade_speed
             else:
                 adata["alpha"] = adata["target_alpha"]
             if adata["start"] is not None and adata["end"] is not None and adata["target_start"] is not None and adata["target_end"] is not None:
-                ds = adata["target_start"] - adata["start"]
-                if ds.length_squared() > 1.0:
-                    adata["start"] += ds * self.multi_arrow_morph_speed
-                else:
-                    adata["start"] = adata["target_start"].copy()
-                de = adata["target_end"] - adata["end"]
-                if de.length_squared() > 1.0:
-                    adata["end"] += de * self.multi_arrow_morph_speed
-                else:
-                    adata["end"] = adata["target_end"].copy()
+                adata["start"] = _step_arrow_vec(adata["start"], adata["target_start"], self.multi_arrow_morph_speed)
+                adata["end"] = _step_arrow_vec(adata["end"], adata["target_end"], self.multi_arrow_morph_speed)
             # prune faded out arrows that are no longer wanted
             if adata["target_alpha"] == 0 and adata["alpha"] < 1:
                 # keep for a moment, will be removed by set_multipv_arrows if not in targets
@@ -7777,6 +7798,8 @@ def _transform_dragged_piece_image(image, drag_offset, scale, angle_degrees):
     grab slide in the player's hand.
     """
     grab_x, grab_y = float(drag_offset[0]), float(drag_offset[1])
+    if not config.get("gui_rotate_piece_on_move", 1):
+        angle_degrees = 0.0
     if abs(scale - 1.0) < 0.0005 and abs(angle_degrees) < 0.005:
         return image, grab_x, grab_y
 
@@ -8257,6 +8280,53 @@ def _draw_suggestion_arrow_path(
             )
     style = _suggestion_arrow_style(rank, is_mate, gradient_colors)
     rank = style["rank"]
+
+    if config.get("gui_basic_arrows", 0):
+        try:
+            nominal_width = max(1.0, float(width))
+        except Exception:
+            nominal_width = 7.0
+        try:
+            raw_alpha = float(alpha)
+        except Exception:
+            raw_alpha = 255.0
+        effective_alpha = int(max(0, min(255, raw_alpha * style["alpha_scale"])))
+        if effective_alpha <= 1:
+            return
+        basic_color = (50, 135, 255) if (rank == 1 and not is_mate) else style["end"]
+        end = points[-1].copy()
+        _ep, end_dir = _suggestion_arrow_point_at(points, cumulative, total_length)
+        end_perp = pygame.Vector2(-end_dir.y, end_dir.x)
+        head_len = total_length * 0.45 if total_length < 18.0 else max(10.0, min(nominal_width * 2.5, total_length * 0.38))
+        head_half = max(nominal_width * 1.25, 6.0)
+        shaft_end_dist = max(1.0, total_length - head_len * 0.65)
+        shaft_pts = _trim_suggestion_arrow_path(points, cumulative, shaft_end_dist)
+        xs = [p.x for p in points] + [end.x + head_half, end.x - head_half]
+        ys = [p.y for p in points] + [end.y + head_half, end.y - head_half]
+        pad = int(math.ceil(nominal_width)) + 4
+        min_x = int(math.floor(min(xs))) - pad
+        min_y = int(math.floor(min(ys))) - pad
+        sw = max(1, int(math.ceil(max(xs))) + pad - min_x)
+        sh = max(1, int(math.ceil(max(ys))) + pad - min_y)
+        scratch = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        if len(shaft_pts) >= 2:
+            pygame.draw.lines(
+                scratch,
+                (*basic_color, 255),
+                False,
+                [(int(round(p.x - min_x)), int(round(p.y - min_y))) for p in shaft_pts],
+                max(2, int(round(nominal_width))),
+            )
+        head_base = end - end_dir * head_len
+        head_poly = [
+            (int(round(end.x - min_x)), int(round(end.y - min_y))),
+            (int(round(head_base.x + end_perp.x * head_half - min_x)), int(round(head_base.y + end_perp.y * head_half - min_y))),
+            (int(round(head_base.x - end_perp.x * head_half - min_x)), int(round(head_base.y - end_perp.y * head_half - min_y))),
+        ]
+        pygame.draw.polygon(scratch, (*basic_color, 255), head_poly)
+        scratch.set_alpha(effective_alpha)
+        screen.blit(scratch, (min_x, min_y))
+        return
 
     try:
         nominal_width = float(width)
@@ -9045,6 +9115,18 @@ def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
     """
     x, y, w, h = int(x), int(y), int(w), int(h)
     if w <= 0 or h <= 0:
+        return
+    if config.get("gui_basic_arrows", 0):
+        white_frac = _eval_bar_white_fraction(current_eval, mate)
+        top_is_white = bool(globals().get("board_flipped", False))
+        black_col = (38, 38, 42)
+        white_col = (238, 238, 242)
+        pygame.draw.rect(screen, black_col, (x, y, w, h))
+        white_h = int(round(h * white_frac))
+        if white_h > 0:
+            wy = y if top_is_white else (y + h - white_h)
+            pygame.draw.rect(screen, white_col, (x, wy, w, white_h))
+        pygame.draw.rect(screen, (90, 90, 100), (x, y, w, h), 1)
         return
 
     bar_rect = pygame.Rect(x, y, w, h)
@@ -10496,7 +10578,25 @@ def _draw_board_button_chevron(surface, cx, cy, colour):
         pass
 
 
+def _draw_legacy_button(screen, rect, label, hovered, bg=None, border=None, text_color=None, font_obj=None):
+    if bg is None:
+        bg = (78, 82, 108) if hovered else (56, 58, 70)
+    if border is None:
+        border = (150, 170, 255) if hovered else MENU_BORDER_COLOR
+    if text_color is None:
+        text_color = TEXT_COLOR
+    if font_obj is None:
+        font_obj = font_small
+    pygame.draw.rect(screen, bg, rect, border_radius=8)
+    pygame.draw.rect(screen, border, rect, 1, border_radius=8)
+    txt = font_obj.render(label, True, text_color)
+    screen.blit(txt, txt.get_rect(center=rect.center))
+
+
 def draw_polished_board_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Display", hovered, font_obj=font_large)
+        return
     """Draw the Settings-main Board navigation row.
 
     The caller supplies the original 400x50 row, including entrance slide,
@@ -10679,7 +10779,7 @@ def draw_polished_board_button(screen, rect, hovered):
     # long style name the old row-centred subtitle ended only a couple of
     # pixels before those previews and could collide under wider fonts.
     text_center_x = visual_rect.x + 176
-    label = "Board"
+    label = "Display"
     title_colour = _lerp_color(
         (244, 238, 226), (255, 255, 255), hover_amount
     )
@@ -10801,6 +10901,7 @@ def get_board_hub_rects(offset_x=0, offset_y=0):
     return {
         "pieces_style": pygame.Rect(x, 190 + offset_y, w, h),
         "board_themes": pygame.Rect(x, 318 + offset_y, w, h),
+        "gui": pygame.Rect(x, 446 + offset_y, w, h),
     }
 
 
@@ -10847,6 +10948,16 @@ def draw_board_hub_content(screen, offset_x=0, offset_y=0):
         for f in range(4):
             col = LIGHT_SQ if (r + f) % 2 == 0 else DARK_SQ
             pygame.draw.rect(screen, col, (themes_rect.x + 14 + f * sq, themes_rect.centery - sq + r * sq, sq, sq), border_radius=2)
+
+    gui_rect = rects["gui"]
+    _draw_board_hub_card(screen, gui_rect, "GUI", "Arrows, buttons, board & pieces", idle and gui_rect.collidepoint(mx, my))
+    gx, gy = gui_rect.x + 22, gui_rect.centery - 22
+    pygame.draw.rect(screen, (70, 82, 115), (gx, gy, 104, 44), border_radius=8)
+    pygame.draw.rect(screen, (140, 175, 255), (gx, gy, 104, 44), 1, border_radius=8)
+    pygame.draw.line(screen, (80, 170, 255), (gx + 16, gy + 22), (gx + 48, gy + 22), 4)
+    pygame.draw.polygon(screen, (80, 170, 255), [(gx + 54, gy + 22), (gx + 44, gy + 15), (gx + 44, gy + 29)])
+    pygame.draw.rect(screen, (95, 195, 130), (gx + 64, gy + 14, 28, 16), border_radius=8)
+    pygame.draw.circle(screen, (240, 245, 255), (gx + 84, gy + 22), 6)
 
 
 # --- Board Themes page ---
@@ -10914,6 +11025,183 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
 
 # --- Board Detection ---
 # The Analysis page can capture another Windows application window, find a
+# --- GUI Settings page ---
+gui_settings_scroll = 0.0
+gui_settings_dropdown_open = None
+_GUI_ANIM_STYLES = ("Cubic", "Quad", "Linear", "None")
+_GUI_SECTIONS = [
+    (
+        "Arrows",
+        [
+            ("gui_basic_arrows", "Use Basic Arrows", "toggle", "Solid blue/rank arrows & simple eval bar"),
+            ("gui_arrow_anim_style", "Change Animation Style for Arrow", "dropdown", "Tweening curve when suggested move changes"),
+        ],
+    ),
+    (
+        "Buttons",
+        [
+            ("gui_legacy_buttons", "Use Legacy Buttons", "toggle", "Fast, flat basic buttons across the UI"),
+        ],
+    ),
+    (
+        "Board",
+        [
+            ("gui_coordinates", "Coordinates", "toggle", "Show rank (1-8) and file (a-h) labels"),
+            ("gui_rounded_corners", "Rounded Corners", "toggle", "Round the outer corners of the board"),
+        ],
+    ),
+    (
+        "Pieces",
+        [
+            ("gui_piece_anim_style", "Change Piece Animation Style", "dropdown", "Easing curve for piece move animations"),
+            ("gui_fancy_knight", "Fancy Knight", "toggle", "Animate knights along an L-shaped path"),
+            ("gui_show_legal_moves", "Show Legal Moves", "toggle", "Highlight legal destinations when selecting a piece"),
+            ("gui_disable_legal_moves_anim", "Disable Legal Moves Animation", "toggle", "Show legal move dots immediately without fade/pop"),
+            ("gui_rotate_piece_on_move", "Rotate Piece on move", "toggle", "Tilt the held piece slightly while dragging"),
+        ],
+    ),
+]
+
+
+def _gui_settings_layout(offset_x=0, offset_y=0):
+    viewport = pygame.Rect(WIDTH // 2 - 310 + offset_x, 128 + offset_y, 620, HEIGHT - 156)
+    row_w = 592
+    row_x = viewport.x + 10
+    y = viewport.y + 8 - int(round(gui_settings_scroll))
+    items = []
+    for section_title, section_items in _GUI_SECTIONS:
+        items.append(("header", section_title, pygame.Rect(row_x, y, row_w, 26), None, None))
+        y += 32
+        for key, label, kind, desc in section_items:
+            items.append((kind, label, pygame.Rect(row_x, y, row_w, 54), key, desc))
+            y += 62
+        y += 8
+    content_h = (y + int(round(gui_settings_scroll))) - (viewport.y + 8)
+    max_scroll = max(0.0, float(content_h - viewport.height + 16))
+    return viewport, items, max_scroll
+
+
+def scroll_gui_settings(delta):
+    global gui_settings_scroll
+    _vp, _items, max_scroll = _gui_settings_layout()
+    gui_settings_scroll = max(0.0, min(max_scroll, gui_settings_scroll + delta * 36.0))
+
+
+def draw_gui_settings_content(screen, offset_x=0, offset_y=0):
+    global gui_settings_scroll
+    mx, my = pygame.mouse.get_pos()
+    idle = menu_transition_direction == "none"
+    intro = font_small.render("Customise arrows, buttons, board & pieces", True, TEXT_MUTED)
+    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 96 + offset_y))
+
+    viewport, items, max_scroll = _gui_settings_layout(offset_x, offset_y)
+    gui_settings_scroll = max(0.0, min(max_scroll, gui_settings_scroll))
+
+    prev_clip = screen.get_clip()
+    screen.set_clip(viewport)
+    dropdown_overlay = None
+
+    for kind, label, rect, key, desc in items:
+        if rect.bottom < viewport.top - 10 or rect.top > viewport.bottom + 10:
+            if kind == "dropdown" and gui_settings_dropdown_open == key:
+                dropdown_overlay = (key, rect)
+            continue
+        if kind == "header":
+            hdr = font_small.render(f"-- {label} --", True, TEXT_ACCENT)
+            screen.blit(hdr, (rect.x + 4, rect.y + 4))
+            continue
+
+        hovered = idle and viewport.collidepoint(mx, my) and rect.collidepoint(mx, my)
+        bg = (74, 78, 102) if hovered else (54, 56, 68)
+        border = (145, 165, 255) if hovered else MENU_BORDER_COLOR
+        pygame.draw.rect(screen, bg, rect, border_radius=10)
+        pygame.draw.rect(screen, border, rect, 1, border_radius=10)
+
+        lbl_s = font_small.render(label, True, TEXT_COLOR)
+        screen.blit(lbl_s, (rect.x + 14, rect.y + 8))
+        desc_s = font_tiny.render(_elide_text(desc, font_tiny, rect.width - 150), True, TEXT_MUTED)
+        screen.blit(desc_s, (rect.x + 14, rect.y + 31))
+
+        if kind == "toggle":
+            on = bool(config.get(key, ENGINE_DEFAULTS.get(key, 0)))
+            pill = pygame.Rect(rect.right - 66, rect.centery - 13, 50, 26)
+            pygame.draw.rect(screen, (72, 185, 118) if on else (88, 90, 104), pill, border_radius=13)
+            knob_x = pill.right - 13 if on else pill.left + 13
+            pygame.draw.circle(screen, (245, 248, 255), (knob_x, pill.centery), 10)
+        elif kind == "dropdown":
+            val = str(config.get(key, ENGINE_DEFAULTS.get(key, "Cubic")))
+            box = pygame.Rect(rect.right - 122, rect.centery - 15, 108, 30)
+            is_open = gui_settings_dropdown_open == key
+            pygame.draw.rect(screen, (68, 74, 98) if is_open else (44, 46, 58), box, border_radius=7)
+            pygame.draw.rect(screen, (150, 170, 255) if is_open else MENU_BORDER_COLOR, box, 1, border_radius=7)
+            val_s = font_tiny.render(val, True, TEXT_COLOR)
+            screen.blit(val_s, (box.x + 10, box.centery - val_s.get_height() // 2))
+            chev = font_tiny.render("▲" if is_open else "▼", True, TEXT_MUTED)
+            screen.blit(chev, (box.right - 18, box.centery - chev.get_height() // 2))
+            if is_open:
+                dropdown_overlay = (key, box)
+
+    if dropdown_overlay is not None:
+        key, box = dropdown_overlay
+        current_val = str(config.get(key, ENGINE_DEFAULTS.get(key, "Cubic")))
+        menu_h = len(_GUI_ANIM_STYLES) * 28 + 6
+        menu_y = box.bottom + 4
+        if menu_y + menu_h > viewport.bottom:
+            menu_y = box.top - menu_h - 4
+        menu_rect = pygame.Rect(box.x, menu_y, box.width, menu_h)
+        pygame.draw.rect(screen, (38, 40, 52), menu_rect, border_radius=8)
+        pygame.draw.rect(screen, (150, 170, 255), menu_rect, 1, border_radius=8)
+        for idx, opt in enumerate(_GUI_ANIM_STYLES):
+            opt_rect = pygame.Rect(menu_rect.x + 3, menu_rect.y + 3 + idx * 28, menu_rect.width - 6, 26)
+            opt_hov = idle and opt_rect.collidepoint(mx, my)
+            if opt == current_val or opt_hov:
+                pygame.draw.rect(screen, (82, 92, 138) if opt_hov else (64, 72, 108), opt_rect, border_radius=5)
+            opt_s = font_tiny.render(opt, True, TEXT_COLOR)
+            screen.blit(opt_s, (opt_rect.x + 8, opt_rect.centery - opt_s.get_height() // 2))
+
+    screen.set_clip(prev_clip)
+
+
+def handle_gui_settings_click(mx, my):
+    global gui_settings_dropdown_open
+    viewport, items, _max_scroll = _gui_settings_layout()
+    if not viewport.collidepoint(mx, my):
+        gui_settings_dropdown_open = None
+        return False
+
+    if gui_settings_dropdown_open is not None:
+        for kind, _label, rect, key, _desc in items:
+            if kind == "dropdown" and key == gui_settings_dropdown_open:
+                box = pygame.Rect(rect.right - 122, rect.centery - 15, 108, 30)
+                menu_h = len(_GUI_ANIM_STYLES) * 28 + 6
+                menu_y = box.bottom + 4
+                if menu_y + menu_h > viewport.bottom:
+                    menu_y = box.top - menu_h - 4
+                menu_rect = pygame.Rect(box.x, menu_y, box.width, menu_h)
+                if menu_rect.collidepoint(mx, my):
+                    for idx, opt in enumerate(_GUI_ANIM_STYLES):
+                        opt_rect = pygame.Rect(menu_rect.x + 3, menu_rect.y + 3 + idx * 28, menu_rect.width - 6, 26)
+                        if opt_rect.collidepoint(mx, my):
+                            config[key] = opt
+                            save_config()
+                            gui_settings_dropdown_open = None
+                            return True
+                break
+        gui_settings_dropdown_open = None
+        return True
+
+    for kind, _label, rect, key, _desc in items:
+        if kind in ("toggle", "dropdown") and rect.collidepoint(mx, my):
+            if kind == "toggle":
+                config[key] = 0 if config.get(key, ENGINE_DEFAULTS.get(key, 0)) else 1
+                save_config()
+                return True
+            elif kind == "dropdown":
+                gui_settings_dropdown_open = None if gui_settings_dropdown_open == key else key
+                return True
+    return True
+
+
 # chessboard in that screenshot, and display the result with a blue 8x8
 # overlay. Board location first asks OpenCV's corner detectors for the 7x7
 # internal corners of an 8x8 board. The SB detector is tried on the plain,
@@ -21813,6 +22101,9 @@ def _draw_always_on_top_icon(
 
 
 def draw_polished_always_on_top_toggle(screen, rect, on, anim, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, f"Always on Top: {'ON' if on else 'OFF'}", hovered)
+        return
     """Draw the Settings-main Always on Top row and return its pill rect.
 
     ``rect``, the 54x28 pill geometry and the caller's on/off animation
@@ -22991,6 +23282,9 @@ def _draw_autoplay_settings_chevron(surface, centre, colour, scale=1.0):
 
 
 def draw_polished_analysis_settings_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Analysis Settings", hovered, font_obj=font_large)
+        return
     """Draw the Settings-main Analysis Settings navigation row.
 
     The caller owns the original 400x50 row, hover gating and navigation.
@@ -23299,6 +23593,9 @@ def draw_polished_analysis_settings_button(screen, rect, hovered):
 
 
 def draw_polished_autoplay_settings_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Auto-Play Settings", hovered, font_obj=font_large)
+        return
     """Draw the Settings-main Auto-Play Settings navigation row.
 
     The caller supplies the original 400x50 row, including entrance and
@@ -29518,6 +29815,9 @@ def _draw_engine_save_icon(
 
 
 def draw_polished_engine_reset_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Reset", hovered)
+        return
     """Draw Engine Settings Reset with a rotating restore medallion.
 
     The original ``rect`` remains the click target. This renderer only
@@ -29648,6 +29948,10 @@ def draw_polished_engine_reset_button(screen, rect, hovered):
 
 
 def draw_polished_engine_save_button(screen, rect, hovered, has_changes):
+    if config.get("gui_legacy_buttons", 0):
+        bg = (68, 128, 88) if (has_changes and hovered) else (54, 104, 72) if has_changes else (52, 54, 64)
+        _draw_legacy_button(screen, rect, "Save", hovered, bg=bg)
+        return
     """Draw Engine Settings Save with its enabled/disabled polish.
 
     The original ``rect`` remains the click target and the caller still
@@ -30054,6 +30358,9 @@ def _draw_engine_settings_chevron(surface, cx, cy, colour):
 
 
 def draw_polished_engine_settings_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Engine Settings", hovered, font_obj=font_large)
+        return
     """Draw the Settings-main Engine Settings navigation row.
 
     The caller supplies the original 400x50 row (including menu entrance
@@ -30716,6 +31023,9 @@ def _draw_external_link_icon(surface, cx, cy, colour, shift=0):
 
 
 def draw_polished_github_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "GitHub", hovered)
+        return
     """Draw Settings > About > Github as a polished sapphire link button.
 
     The click rectangle and web-browser behaviour are unchanged. This
@@ -31033,6 +31343,9 @@ def _draw_restart_icon(surface, cx, cy, radius, rotation):
 
 
 def draw_polished_restart_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Restart", hovered)
+        return
     """Draw Settings > About > Restart as a polished ruby action button.
 
     The click rectangle and restart/exit-code behaviour are unchanged.
@@ -31472,6 +31785,9 @@ def _draw_close_x_icon(
 
 
 def draw_polished_close_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "X", hovered)
+        return
     """Draw the Settings header Close/X button.
 
     The caller retains the original 44x32 rect and click handling. This
@@ -31723,6 +32039,9 @@ def draw_polished_close_button(screen, rect, hovered):
         screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 def draw_polished_back_button(screen, rect, hovered):
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "< Back", hovered)
+        return
     bg = (75, 75, 85) if hovered else (60, 60, 70)
     if hovered:
         glow = pygame.Surface((rect.width+10, rect.height+10), pygame.SRCALPHA)
@@ -32145,7 +32464,7 @@ def draw_settings_menu(screen):
                 )
 
                 is_interactive = item in (
-                    "Board",
+                    "Display",
                     "Engine Settings",
                     "Analysis Settings",
                     "Auto-Play Settings",
@@ -32159,7 +32478,7 @@ def draw_settings_menu(screen):
                     draw_polished_engine_settings_button(
                         screen, item_rect, is_hovered
                     )
-                elif item == "Board":
+                elif item == "Display":
                     draw_polished_board_button(
                         screen, item_rect, is_hovered
                     )
@@ -32218,6 +32537,8 @@ def draw_settings_menu(screen):
             draw_pieces_style_content(screen, offset_x, open_slide)
         elif page_state == "board_themes":
             draw_board_themes_content(screen, offset_x, open_slide)
+        elif page_state == "gui":
+            draw_gui_settings_content(screen, offset_x, open_slide)
         elif page_state == "engine_settings":
             draw_engine_settings_content(screen, offset_x, open_slide)
         elif page_state == "analysis":
@@ -32450,6 +32771,9 @@ def handle_menu_click(mx, my):
                     apply_board_theme(theme_id, persist=True)
                 return True
 
+    elif settings_menu_state == "gui":
+        return handle_gui_settings_click(mx, my)
+
     elif settings_menu_state == "pieces_style":
         viewport, style_rects, _total_h, _max_scroll, _scroll = (
             _pieces_style_layout(get_available_themes())
@@ -32493,7 +32817,7 @@ def handle_menu_click(mx, my):
                 item_height,
             )
             if item_rect.collidepoint(mx, my):
-                if item == "Board":
+                if item == "Display":
                     navigate_to("board", forward=True)
                 elif item == "Engine Settings":
                     navigate_to("engine_settings", forward=True)
@@ -32769,6 +33093,8 @@ def draw_gui(
             int(live_last_move.from_square): 105,
             int(live_last_move.to_square): 150,
         }
+    _rounded_board = bool(config.get("gui_rounded_corners", 0))
+    _show_coords = bool(config.get("gui_coordinates", 0))
     for r in range(8):
         for f in range(8):
             color = LIGHT_SQ if (r + f) % 2 == 0 else DARK_SQ
@@ -32778,12 +33104,33 @@ def draw_gui(
                 SQUARE_SIZE,
                 SQUARE_SIZE,
             )
-            pygame.draw.rect(screen, color, sq_rect)
-            # AA border for squares (subtle)
-            try:
-                pygame.gfxdraw.rectangle(screen, sq_rect, color)
-            except Exception:
-                pass
+            if _rounded_board and (r in (0, 7) and f in (0, 7)):
+                pygame.draw.rect(
+                    screen,
+                    color,
+                    sq_rect,
+                    border_top_left_radius=10 if (r == 0 and f == 0) else 0,
+                    border_top_right_radius=10 if (r == 0 and f == 7) else 0,
+                    border_bottom_left_radius=10 if (r == 7 and f == 0) else 0,
+                    border_bottom_right_radius=10 if (r == 7 and f == 7) else 0,
+                )
+            else:
+                pygame.draw.rect(screen, color, sq_rect)
+                # AA border for squares (subtle)
+                try:
+                    pygame.gfxdraw.rectangle(screen, sq_rect, color)
+                except Exception:
+                    pass
+            if _show_coords:
+                coord_col = DARK_SQ if (r + f) % 2 == 0 else LIGHT_SQ
+                if f == 0:
+                    rank_lbl = str(r + 1) if board_flipped else str(8 - r)
+                    rs = font_tiny.render(rank_lbl, True, coord_col)
+                    screen.blit(rs, (sq_rect.x + 3, sq_rect.y + 2))
+                if r == 7:
+                    file_lbl = ("hgfedcba" if board_flipped else "abcdefgh")[f]
+                    fs = font_tiny.render(file_lbl, True, coord_col)
+                    screen.blit(fs, (sq_rect.right - fs.get_width() - 3, sq_rect.bottom - fs.get_height() - 1))
             # map visual to logical square considering flip
             if board_flipped:
                 vis_file = 7 - f
@@ -32820,11 +33167,18 @@ def draw_gui(
     except Exception:
         pass
 
-    regular_moves, capture_moves = get_legal_squares(board, selected_sq)
+    if config.get("gui_show_legal_moves", 1):
+        regular_moves, capture_moves = get_legal_squares(board, selected_sq)
+    else:
+        regular_moves, capture_moves = [], []
 
     # Animated legal move green circles — pulsating scale + alpha
-    pulse_scale = 1.0 + 0.12 * math.sin(legal_pulse_t)
-    pulse_alpha = 90 + int(18 * math.sin(legal_pulse_t))
+    if config.get("gui_disable_legal_moves_anim", 0):
+        pulse_scale = 1.0
+        pulse_alpha = 90
+    else:
+        pulse_scale = 1.0 + 0.12 * math.sin(legal_pulse_t)
+        pulse_alpha = 90 + int(18 * math.sin(legal_pulse_t))
 
     for sq in regular_moves:
         cx, cy = square_center(sq)
@@ -32980,14 +33334,41 @@ def draw_gui(
             )
 
     # 5. Move animations
+    _piece_anim_style = str(config.get("gui_piece_anim_style", "Cubic"))
+    def _ease_piece_anim(p):
+        p = max(0.0, min(1.0, float(p)))
+        if _piece_anim_style == "None":
+            return 1.0
+        if _piece_anim_style == "Linear":
+            return p
+        if _piece_anim_style == "Quad":
+            return 2.0 * p * p if p < 0.5 else 1.0 - ((-2.0 * p + 2.0) ** 2) / 2.0
+        return cubic_ease_in_out(p)
+
     if anim_mgr.move_anim:
         pkey = get_piece_key(anim_mgr.move_anim["piece"])
         if pkey in images:
-            t = cubic_ease_in_out(anim_mgr.move_anim["progress"])
+            t = _ease_piece_anim(anim_mgr.move_anim["progress"])
             sx, sy = anim_mgr.move_anim["start"]
             ex, ey = anim_mgr.move_anim["end"]
-            curr_x = sx + (ex - sx) * t
-            curr_y = sy + (ey - sy) * t
+            if config.get("gui_fancy_knight", 0) and anim_mgr.move_anim["piece"].piece_type == chess.KNIGHT:
+                dx = ex - sx
+                dy = ey - sy
+                if t < 0.5:
+                    sub = t * 2.0
+                    if abs(dx) >= abs(dy):
+                        curr_x, curr_y = sx + dx * sub, sy
+                    else:
+                        curr_x, curr_y = sx, sy + dy * sub
+                else:
+                    sub = (t - 0.5) * 2.0
+                    if abs(dx) >= abs(dy):
+                        curr_x, curr_y = ex, sy + dy * sub
+                    else:
+                        curr_x, curr_y = sx + dx * sub, ey
+            else:
+                curr_x = sx + (ex - sx) * t
+                curr_y = sy + (ey - sy) * t
             _draw_piece_ground_shadow(
                 screen,
                 (curr_x + SQUARE_SIZE // 2 + 2, curr_y + SQUARE_SIZE - 11),
@@ -32998,7 +33379,7 @@ def draw_gui(
     if anim_mgr.rook_anim:
         pkey = get_piece_key(anim_mgr.rook_anim["piece"])
         if pkey in images:
-            t = cubic_ease_in_out(anim_mgr.rook_anim["progress"])
+            t = _ease_piece_anim(anim_mgr.rook_anim["progress"])
             sx, sy = anim_mgr.rook_anim["start"]
             ex, ey = anim_mgr.rook_anim["end"]
             curr_x = sx + (ex - sx) * t
@@ -35041,6 +35422,12 @@ def main():
                     # pygame reports wheel-up as +y; negating makes scrolling
                     # down move the list down (and up move it up).
                     scroll_theme_list(-event.y * theme_scroll_speed)
+                elif (
+                    settings_menu_open
+                    and settings_menu_state == "gui"
+                    and menu_transition_direction == "none"
+                ):
+                    scroll_gui_settings(-event.y)
 
             elif event.type == pygame.KEYDOWN:
                 if training_session.mode and event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE):
