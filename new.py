@@ -40,9 +40,12 @@ EVAL_BAR_GAP = 22
 PADDING = 24
 TOP_BAR_HEIGHT = 44
 INFO_HEIGHT = 152
+SIDE_PANEL_GAP = 16
+SIDE_PANEL_WIDTH = 300
+SIDE_PANEL_X = PADDING + EVAL_BAR_WIDTH + EVAL_BAR_GAP + BOARD_WIDTH + SIDE_PANEL_GAP
 
 # Window Dimensions
-WIDTH = PADDING + EVAL_BAR_WIDTH + EVAL_BAR_GAP + BOARD_WIDTH + PADDING
+WIDTH = SIDE_PANEL_X + SIDE_PANEL_WIDTH + PADDING
 HEIGHT = TOP_BAR_HEIGHT + PADDING + BOARD_WIDTH + INFO_HEIGHT
 
 FPS = 60
@@ -32971,6 +32974,170 @@ def _tile_overlay(rgba):
 
 
 
+def draw_side_panel(screen, board, engine_thread, view_ply=None):
+    """Draw the right-hand Chess.com-style panel: Engine Top Lines & Move History."""
+    panel_x = SIDE_PANEL_X
+    panel_y = BOARD_OY
+    panel_w = SIDE_PANEL_WIDTH
+    panel_h = BOARD_WIDTH
+
+    panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+    pygame.draw.rect(screen, (36, 38, 46), panel_rect, border_radius=12)
+    pygame.draw.rect(screen, (62, 66, 80), panel_rect, 1, border_radius=12)
+
+    # --- Top section: Engine Top Lines (up to 3) ---
+    top_h = 166
+    hdr_s = font_small.render("Top Lines", True, TEXT_COLOR)
+    screen.blit(hdr_s, (panel_x + 14, panel_y + 10))
+    pygame.draw.line(
+        screen,
+        (56, 60, 74),
+        (panel_x + 12, panel_y + 36),
+        (panel_x + panel_w - 12, panel_y + 36),
+        1,
+    )
+
+    with engine_thread.lock:
+        lines_copy = dict(engine_thread.info.get("lines") or {})
+        fallback_pv = list(engine_thread.info.get("pv") or [])
+        fallback_score = engine_thread.info.get("score")
+        fallback_mate = engine_thread.info.get("mate")
+
+    if not lines_copy and fallback_pv:
+        lines_copy = {1: {"pv": fallback_pv, "score": fallback_score, "mate": fallback_mate}}
+
+    sorted_keys = sorted(lines_copy.keys())[:3]
+    line_y = panel_y + 44
+    if not sorted_keys:
+        empty_s = font_tiny.render("Analyzing position...", True, TEXT_MUTED)
+        screen.blit(empty_s, (panel_x + 14, line_y + 6))
+    else:
+        for idx, k in enumerate(sorted_keys):
+            ldata = lines_copy[k]
+            pv = ldata.get("pv") or []
+            l_score = ldata.get("score")
+            l_mate = ldata.get("mate")
+
+            row_rect = pygame.Rect(panel_x + 10, line_y + idx * 38, panel_w - 20, 32)
+            pygame.draw.rect(screen, (46, 49, 60), row_rect, border_radius=6)
+
+            # Eval badge
+            if l_mate is not None:
+                eval_str = f"M{l_mate}" if l_mate > 0 else f"-M{abs(l_mate)}"
+                badge_bg = (180, 62, 62) if l_mate < 0 else (210, 145, 50)
+                badge_fg = (255, 255, 255)
+            elif l_score is not None:
+                pawns = l_score / 100.0
+                eval_str = f"{pawns:+.2f}"
+                if pawns >= 0.2:
+                    badge_bg = (228, 232, 240)
+                    badge_fg = (24, 26, 32)
+                elif pawns <= -0.2:
+                    badge_bg = (28, 30, 36)
+                    badge_fg = (232, 236, 244)
+                else:
+                    badge_bg = (90, 95, 110)
+                    badge_fg = (240, 242, 248)
+            else:
+                eval_str = "0.00"
+                badge_bg = (90, 95, 110)
+                badge_fg = (240, 242, 248)
+
+            badge_rect = pygame.Rect(row_rect.x + 4, row_rect.y + 4, 54, 24)
+            pygame.draw.rect(screen, badge_bg, badge_rect, border_radius=5)
+            ev_s = font_tiny.render(eval_str, True, badge_fg)
+            screen.blit(ev_s, ev_s.get_rect(center=badge_rect.center))
+
+            # Standard notation PV moves
+            san_parts = []
+            try:
+                tmp_b = board.copy()
+                for mv in pv[:6]:
+                    if mv in tmp_b.legal_moves:
+                        san_parts.append(tmp_b.san(mv))
+                        tmp_b.push(mv)
+                    else:
+                        break
+            except Exception:
+                pass
+            pv_text = " ".join(san_parts) if san_parts else "..."
+            pv_text = _elide_text(pv_text, font_tiny, row_rect.width - 68)
+            pv_s = font_tiny.render(pv_text, True, TEXT_COLOR)
+            screen.blit(pv_s, (badge_rect.right + 8, row_rect.centery - pv_s.get_height() // 2))
+
+    # --- Bottom section: Move History ---
+    hist_top = panel_y + top_h + 4
+    pygame.draw.line(
+        screen,
+        (56, 60, 74),
+        (panel_x + 12, hist_top),
+        (panel_x + panel_w - 12, hist_top),
+        1,
+    )
+    mh_hdr = font_small.render("Move History", True, TEXT_COLOR)
+    screen.blit(mh_hdr, (panel_x + 14, hist_top + 8))
+
+    list_rect = pygame.Rect(panel_x + 10, hist_top + 36, panel_w - 20, panel_rect.bottom - (hist_top + 46))
+    pygame.draw.rect(screen, (28, 30, 38), list_rect, border_radius=8)
+
+    moves = list(board.move_stack)
+    active_ply = len(moves) if view_ply is None else int(view_ply)
+
+    if not moves:
+        no_mv = font_tiny.render("No moves played yet", True, TEXT_MUTED)
+        screen.blit(no_mv, (list_rect.x + 12, list_rect.y + 12))
+        return
+
+    # Build SAN pairs from the starting position
+    san_list = []
+    try:
+        replay = chess.Board()
+        for mv in moves:
+            san_list.append(replay.san(mv))
+            replay.push(mv)
+    except Exception:
+        san_list = [mv.uci() for mv in moves]
+
+    rows = []
+    for i in range(0, len(san_list), 2):
+        move_no = i // 2 + 1
+        w_san = san_list[i]
+        b_san = san_list[i + 1] if i + 1 < len(san_list) else ""
+        rows.append((move_no, w_san, i + 1, b_san, i + 2 if b_san else None))
+
+    row_h = 26
+    visible_rows = max(1, (list_rect.height - 8) // row_h)
+    active_row = max(0, (active_ply - 1) // 2) if active_ply > 0 else 0
+    start_row = max(0, min(len(rows) - visible_rows, active_row - visible_rows + 2))
+    if len(rows) <= visible_rows:
+        start_row = 0
+
+    prev_clip = screen.get_clip()
+    screen.set_clip(list_rect)
+    for r_idx, (move_no, w_san, w_ply, b_san, b_ply) in enumerate(rows[start_row:start_row + visible_rows]):
+        ry = list_rect.y + 4 + r_idx * row_h
+        if (start_row + r_idx) % 2 == 1:
+            pygame.draw.rect(screen, (34, 36, 45), (list_rect.x + 2, ry, list_rect.width - 4, row_h))
+
+        num_s = font_tiny.render(f"{move_no}.", True, TEXT_MUTED)
+        screen.blit(num_s, (list_rect.x + 8, ry + 4))
+
+        w_rect = pygame.Rect(list_rect.x + 42, ry + 2, 104, row_h - 4)
+        if w_ply == active_ply:
+            pygame.draw.rect(screen, (68, 98, 158), w_rect, border_radius=4)
+        ws = font_tiny.render(w_san, True, (255, 255, 255) if w_ply == active_ply else TEXT_COLOR)
+        screen.blit(ws, (w_rect.x + 6, ry + 4))
+
+        if b_san:
+            b_rect = pygame.Rect(list_rect.x + 152, ry + 2, 104, row_h - 4)
+            if b_ply == active_ply:
+                pygame.draw.rect(screen, (68, 98, 158), b_rect, border_radius=4)
+            bs = font_tiny.render(b_san, True, (255, 255, 255) if b_ply == active_ply else TEXT_COLOR)
+            screen.blit(bs, (b_rect.x + 6, ry + 4))
+
+    screen.set_clip(prev_clip)
+
+
 def draw_gui(
     screen, board, engine_thread, anim_mgr, check_effect, selected_sq, mouse_pos,
     drag_sq=None, drag_offset=None, dragging=False, view_ply=None, total_ply=None
@@ -33729,6 +33896,8 @@ def draw_gui(
 
     # Buttons (top bar) + flip + confirmation + menu overlay
     draw_new_game_button(screen, mouse_pos)
+    draw_side_panel(screen, board, engine_thread, view_ply)
+
     draw_settings_button(screen, mouse_pos)
     draw_flip_button(screen, mouse_pos)
 
