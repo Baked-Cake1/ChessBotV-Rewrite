@@ -8565,12 +8565,12 @@ def _draw_suggestion_arrow_path(
         (*_lerp_color(start_colour, end_colour, 0.86), 255),
     )
 
-    # Narrow off-centre gloss, drawn as a handful of gradient chunks.
+    # Narrow centred gloss, drawn as a handful of gradient chunks.
     # Colours are pre-blended opaque: pygame.draw with an alpha colour
     # would replace, rather than blend, the scratch surface's alpha.
     gloss_width = max(1.1, effective_width * 0.17)
     gloss_points = [
-        sample["point"] - sample["perp"] * sample["half"] * 0.34
+        sample["point"].copy()
         for sample in samples
     ]
     if len(gloss_points) >= 2:
@@ -8612,11 +8612,7 @@ def _draw_suggestion_arrow_path(
                 final_gloss_colour,
                 gloss_width,
             )
-        gloss_tip = (
-            end
-            - end_direction * head_length * 0.18
-            - end_perp * samples[-1]["half"] * 0.22
-        )
+        gloss_tip = end - end_direction * head_length * 0.18
         draw_line(
             gloss_points[-1],
             gloss_tip,
