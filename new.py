@@ -20752,6 +20752,9 @@ def _draw_game_review_coach_character(
 
 def _draw_game_review_button(screen, rect, hovered):
     """Polished Analysis-page launch button for Game Review."""
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Game Review", hovered)
+        return
     global game_review_button_hover_amount, game_review_button_pulse_phase
     try:
         pressed = bool(hovered and pygame.mouse.get_pressed()[0])
