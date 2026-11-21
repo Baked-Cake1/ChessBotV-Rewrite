@@ -9130,6 +9130,21 @@ def draw_eval_bar(screen, x, y, w, h, current_eval, mate):
             wy = y if top_is_white else (y + h - white_h)
             pygame.draw.rect(screen, white_col, (x, wy, w, white_h))
         pygame.draw.rect(screen, (90, 90, 100), (x, y, w, h), 1)
+        if mate is not None:
+            eval_txt = f"M{abs(int(mate))}"
+            white_winning = int(mate) > 0
+        else:
+            val = float(current_eval or 0.0) / 100.0
+            eval_txt = f"{abs(val):.1f}"
+            white_winning = val >= 0.0
+        if white_winning:
+            txt_col = (24, 24, 28)
+            txt_y = (y + 8) if top_is_white else (y + h - 16)
+        else:
+            txt_col = (238, 238, 242)
+            txt_y = (y + h - 16) if top_is_white else (y + 8)
+        ev_surf = font_tiny.render(eval_txt, True, txt_col)
+        screen.blit(ev_surf, ev_surf.get_rect(center=(x + w // 2, txt_y)))
         return
 
     bar_rect = pygame.Rect(x, y, w, h)
@@ -32974,8 +32989,15 @@ def _tile_overlay(rgba):
 
 
 
+_side_panel_topline_hits = []
+_side_panel_history_hits = []
+
+
 def draw_side_panel(screen, board, engine_thread, view_ply=None):
     """Draw the right-hand Chess.com-style panel: Engine Top Lines & Move History."""
+    global _side_panel_topline_hits, _side_panel_history_hits
+    _side_panel_topline_hits = []
+    _side_panel_history_hits = []
     panel_x = SIDE_PANEL_X
     panel_y = BOARD_OY
     panel_w = SIDE_PANEL_WIDTH
@@ -33064,6 +33086,8 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None):
             pv_text = _elide_text(pv_text, font_tiny, row_rect.width - 68)
             pv_s = font_tiny.render(pv_text, True, TEXT_COLOR)
             screen.blit(pv_s, (badge_rect.right + 8, row_rect.centery - pv_s.get_height() // 2))
+            if pv:
+                _side_panel_topline_hits.append((row_rect, pv[0]))
 
     # --- Bottom section: Move History ---
     hist_top = panel_y + top_h + 4
@@ -33127,6 +33151,7 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None):
             pygame.draw.rect(screen, (68, 98, 158), w_rect, border_radius=4)
         ws = font_tiny.render(w_san, True, (255, 255, 255) if w_ply == active_ply else TEXT_COLOR)
         screen.blit(ws, (w_rect.x + 6, ry + 4))
+        _side_panel_history_hits.append((w_rect, w_ply))
 
         if b_san:
             b_rect = pygame.Rect(list_rect.x + 152, ry + 2, 104, row_h - 4)
@@ -33134,6 +33159,7 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None):
                 pygame.draw.rect(screen, (68, 98, 158), b_rect, border_radius=4)
             bs = font_tiny.render(b_san, True, (255, 255, 255) if b_ply == active_ply else TEXT_COLOR)
             screen.blit(bs, (b_rect.x + 6, ry + 4))
+            _side_panel_history_hits.append((b_rect, b_ply))
 
     screen.set_clip(prev_clip)
 
@@ -35358,6 +35384,29 @@ def main():
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
+
+                if not settings_menu_open and not game_review_is_active() and mx >= SIDE_PANEL_X:
+                    _handled_side = False
+                    for _hrect, _hply in _side_panel_history_hits:
+                        if _hrect.collidepoint(mx, my):
+                            view_ply = _hply if _hply < len(board.move_stack) else None
+                            selected_sq = None
+                            dragging = False
+                            _handled_side = True
+                            break
+                    if _handled_side:
+                        continue
+                    for _trect, _tmv in _side_panel_topline_hits:
+                        if _trect.collidepoint(mx, my):
+                            if _tmv in board.legal_moves:
+                                view_ply = None
+                                selected_sq = None
+                                dragging = False
+                                try_execute_move(board, anim_mgr, engine_thread, _tmv.from_square, _tmv.to_square, animate=True)
+                            _handled_side = True
+                            break
+                    if _handled_side:
+                        continue
 
                 # Board Detection window picker is modal over Settings.
                 if show_board_detection_dialog:
