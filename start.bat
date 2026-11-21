@@ -13,6 +13,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Check for updates before launching
+python updater.py
+
 REM Run main Python script with any command line arguments passed through
 :launch
 echo Initalizing launcher...
