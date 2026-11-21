@@ -3914,6 +3914,8 @@ class EngineThread:
 
     def __init__(self, path, cfg):
         global ANALYSIS_DEPTH
+        self.path = path
+        self.cfg = dict(cfg) if isinstance(cfg, dict) else cfg
         # A thread constructed from a saved config must search to that
         # config's depth even if some other module-level default changed.
         if isinstance(cfg, dict):
