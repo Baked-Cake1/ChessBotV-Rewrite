@@ -4204,6 +4204,12 @@ class EngineThread:
                 )
             except Exception as e:
                 print(f"Analysis error: {e}")
+                if "closed its output stream" in str(e) and self.running:
+                    print("Restarting engine after unexpected stream closure...")
+                    self._stop_process()
+                    if self.start_engine():
+                        last_searched_fen = None
+                        continue
                 self.engine_active = False
                 break
 
