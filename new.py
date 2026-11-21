@@ -33210,7 +33210,7 @@ _swing_last_x = None
 _mate_anim_start_ms = None
 
 
-def draw_side_panel(screen, board, engine_thread, view_ply=None):
+def draw_side_panel(screen, board, engine_thread, view_ply=None, history_redo=None):
     """Draw the right-hand Chess.com-style panel: Engine Top Lines & Move History."""
     global _side_panel_topline_hits, _side_panel_history_hits
     global _side_panel_history_scroll, _side_panel_history_max_scroll, _side_panel_history_rect
