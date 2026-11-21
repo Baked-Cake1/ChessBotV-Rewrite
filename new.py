@@ -626,7 +626,7 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_instant_checking": 0, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1}
 _STRING_CONFIG_KEYS = (
     "theme",
     "board_theme",
@@ -640,6 +640,7 @@ _STRING_CONFIG_KEYS = (
     "vision_model",
     "gui_arrow_anim_style",
     "gui_piece_anim_style",
+    "gui_rule_repetition",
 )
 
 
@@ -872,13 +873,25 @@ def save_config():
                 "gui_show_legal_moves",
                 "gui_disable_legal_moves_anim",
                 "gui_rotate_piece_on_move",
+                "gui_swing",
+                "gui_mate_animation",
+                "gui_rule_insufficient_material",
+                "gui_rule_king_capturing",
+                "gui_rule_double_pawn",
+                "gui_rule_en_passant",
+                "gui_rule_promotion",
+                "gui_rule_castling",
+                "gui_rule_friendly_fire",
+                "gui_rule_always_queen",
             ):
                 f.write(f"{_gk}={1 if config.get(_gk, ENGINE_DEFAULTS[_gk]) else 0}\n")
             f.write(f"gui_arrow_anim_style={config.get('gui_arrow_anim_style', 'Cubic')}\n")
             f.write(f"gui_piece_anim_style={config.get('gui_piece_anim_style', 'Cubic')}\n")
+            f.write(f"gui_rule_repetition={config.get('gui_rule_repetition', 'Three-Fold')}\n")
             f.write(f"auto_move_color={config.get('auto_move_color', 'both')}\n")
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
             f.write(f"autoplay_depth={int(config.get('autoplay_depth', 20))}\n")
+            f.write(f"autoplay_instant_checking={1 if config.get('autoplay_instant_checking', 0) else 0}\n")
             f.write(
                 "autoplay_side="
                 f"{_normalise_autoplay_side_preference(config.get('autoplay_side', 'ask'))}\n"
@@ -1138,6 +1151,10 @@ autoplay_broadcast_target = None
 # Screenshot polls are one-at-a-time background jobs; 50 ms keeps very
 # fast opponent replies responsive without launching overlapping captures.
 AUTOPLAY_POLL_SECONDS = 0.05
+
+
+def _autoplay_poll_seconds():
+    return 0.0 if config.get("autoplay_instant_checking", 0) else AUTOPLAY_POLL_SECONDS
 # Nominal one-square drag time. The physical drag varies this by travel
 # distance and a small per-move random factor rather than always taking
 # exactly the same time between two square centres.
@@ -1833,6 +1850,14 @@ def normalise_board_theme(value):
     return v if v in BOARD_THEMES else "classic"
 
 
+_board_theme_anim_start_ms = None
+_piece_theme_anim_start_ms = None
+_board_theme_from_light = LIGHT_SQ
+_board_theme_from_dark = DARK_SQ
+_board_theme_to_light = LIGHT_SQ
+_board_theme_to_dark = DARK_SQ
+
+
 def apply_board_theme(theme_id, persist=False):
     """Switch the light/dark square colours (not the piece style)."""
     global LIGHT_SQ, DARK_SQ, current_board_theme
@@ -2253,6 +2278,9 @@ new_game_button_rect = pygame.Rect(
 )
 flip_button_rect = pygame.Rect(
     new_game_button_rect.x - 10 - 50, _button_y, 50, 30
+)
+edit_board_button_rect = pygame.Rect(
+    flip_button_rect.x - 10 - 50, _button_y, 50, 30
 )
 # Small interactive polish for the settings cog: it eases up in brightness /
 # size and turns slowly while hovered. These are visual-only and never
@@ -7871,7 +7899,7 @@ def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=Tru
     if training_session.blocked():
         return False
     move = build_move_with_promotion(board, from_sq, to_sq)
-    if move not in board.legal_moves:
+    if move not in _gui_custom_legal_moves(board):
         return False
     board_before = board.copy()
 
@@ -7924,6 +7952,8 @@ promotion_pending = None  # {"from_sq":..., "to_sq":..., "color":...}
 
 
 def is_promotion_move(board, from_sq, to_sq):
+    if not config.get("gui_rule_promotion", 1) or config.get("gui_rule_always_queen", 0):
+        return False
     piece = board.piece_at(from_sq)
     if not piece or piece.piece_type != chess.PAWN:
         return False
@@ -9706,6 +9736,9 @@ def draw_new_game_button(screen, mouse_pos):
 
     rect = new_game_button_rect
     hovered = rect.collidepoint(mouse_pos)
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "New Game", hovered, font_obj=font_tiny)
+        return
     try:
         pressed = bool(hovered and pygame.mouse.get_pressed()[0])
     except Exception:
@@ -9936,6 +9969,9 @@ def draw_settings_button(screen, mouse_pos):
 
     rect = settings_button_rect
     hovered = rect.collidepoint(mouse_pos)
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Settings", hovered, font_obj=font_tiny)
+        return
     try:
         pressed = bool(hovered and pygame.mouse.get_pressed()[0])
     except Exception:
@@ -11047,12 +11083,20 @@ def draw_board_themes_content(screen, offset_x=0, offset_y=0):
 gui_settings_scroll = 0.0
 gui_settings_dropdown_open = None
 _GUI_ANIM_STYLES = ("Cubic", "Quad", "Linear", "None")
+_GUI_REPETITION_OPTIONS = ("Three-Fold", "Five-Fold", "Ten-Fold", "None")
+
+
+def _gui_dropdown_options(key):
+    if key == "gui_rule_repetition":
+        return _GUI_REPETITION_OPTIONS
+    return _GUI_ANIM_STYLES
 _GUI_SECTIONS = [
     (
         "Arrows",
         [
             ("gui_basic_arrows", "Use Basic Arrows", "toggle", "Solid blue/rank arrows & simple eval bar"),
             ("gui_arrow_anim_style", "Change Animation Style for Arrow", "dropdown", "Tweening curve when suggested move changes"),
+            ("gui_arrow_follow_drag", "Arrow Follows Dragged Piece", "toggle", "Start of suggestion arrow follows the dragged piece"),
         ],
     ),
     (
@@ -11162,14 +11206,15 @@ def draw_gui_settings_content(screen, offset_x=0, offset_y=0):
     if dropdown_overlay is not None:
         key, box = dropdown_overlay
         current_val = str(config.get(key, ENGINE_DEFAULTS.get(key, "Cubic")))
-        menu_h = len(_GUI_ANIM_STYLES) * 28 + 6
+        opts = _gui_dropdown_options(key)
+        menu_h = len(opts) * 28 + 6
         menu_y = box.bottom + 4
         if menu_y + menu_h > viewport.bottom:
             menu_y = box.top - menu_h - 4
         menu_rect = pygame.Rect(box.x, menu_y, box.width, menu_h)
         pygame.draw.rect(screen, (38, 40, 52), menu_rect, border_radius=8)
         pygame.draw.rect(screen, (150, 170, 255), menu_rect, 1, border_radius=8)
-        for idx, opt in enumerate(_GUI_ANIM_STYLES):
+        for idx, opt in enumerate(opts):
             opt_rect = pygame.Rect(menu_rect.x + 3, menu_rect.y + 3 + idx * 28, menu_rect.width - 6, 26)
             opt_hov = idle and opt_rect.collidepoint(mx, my)
             if opt == current_val or opt_hov:
@@ -11191,13 +11236,14 @@ def handle_gui_settings_click(mx, my):
         for kind, _label, rect, key, _desc in items:
             if kind == "dropdown" and key == gui_settings_dropdown_open:
                 box = pygame.Rect(rect.right - 122, rect.centery - 15, 108, 30)
-                menu_h = len(_GUI_ANIM_STYLES) * 28 + 6
+                opts = _gui_dropdown_options(key)
+                menu_h = len(opts) * 28 + 6
                 menu_y = box.bottom + 4
                 if menu_y + menu_h > viewport.bottom:
                     menu_y = box.top - menu_h - 4
                 menu_rect = pygame.Rect(box.x, menu_y, box.width, menu_h)
                 if menu_rect.collidepoint(mx, my):
-                    for idx, opt in enumerate(_GUI_ANIM_STYLES):
+                    for idx, opt in enumerate(opts):
                         opt_rect = pygame.Rect(menu_rect.x + 3, menu_rect.y + 3 + idx * 28, menu_rect.width - 6, 26)
                         if opt_rect.collidepoint(mx, my):
                             config[key] = opt
@@ -19860,7 +19906,18 @@ def _draw_game_review_coach_character(
             pygame.draw.ellipse(blush, (238, 130, 116, 62), blush.get_rect())
             canvas.blit(blush, p(head_cx + side * 20 - 8, 66 + head_y))
 
-    mouth_y = 76 + head_y
+    mouth_y = 76 + head_y + mouth_open * 1.4
+    if mouth_open > 0.02:
+        for _wi in range(5):
+            _wx = head_cx + 26 + _wi * 3.2
+            _wh = max(2.0, (4.0 + 12.0 * mouth_open) * (0.65 + 0.35 * abs(math.sin(time_ms / 75.0 + _wi * 1.1))))
+            pygame.draw.line(
+                canvas,
+                (125, 210, 255, int(120 + 120 * mouth_open)),
+                (int(round(_wx * scale)), int(round((mouth_y - _wh * 0.5) * scale))),
+                (int(round(_wx * scale)), int(round((mouth_y + _wh * 0.5) * scale))),
+                max(1, int(round(1.6 * scale))),
+            )
     if reaction == "best":
         # One continuous smile silhouette, rather than overlapping arcs,
         # skin masks and an always-open oval. Keep the corners anchored
@@ -20616,12 +20673,12 @@ def _draw_game_review_coach_character(
         # A shadow copy gives it an outline without introducing a dark
         # cartoon stroke that would clash with the rest of Nolan.
         thumb_points = [
-            (93.0, 89.5 + head_y),
-            (91.2, 79.0 + head_y),
-            (91.7, 74.0 + head_y),
-            (94.0, 71.8 + head_y),
-            (97.2, 73.0 + head_y),
-            (98.2, 78.5 + head_y),
+            (92.5, 89.5 + head_y),
+            (89.8, 82.0 + head_y),
+            (89.5, 78.0 + head_y),
+            (92.0, 76.2 + head_y),
+            (95.8, 77.2 + head_y),
+            (97.2, 81.8 + head_y),
             (97.4, 89.0 + head_y),
         ]
         poly(
@@ -20629,10 +20686,10 @@ def _draw_game_review_coach_character(
             [(point_x + 1.0, point_y + 0.8) for point_x, point_y in thumb_points],
         )
         poly(skin, thumb_points)
-        ellipse((250, 222, 199), (92.3, 72.5 + head_y, 4.1, 5.1))
+        ellipse((250, 222, 199), (90.4, 76.8 + head_y, 4.2, 4.4))
         line(
             skin_shadow,
-            [(92.0, 81.8 + head_y), (97.3, 80.9 + head_y)],
+            [(90.6, 83.2 + head_y), (96.5, 82.6 + head_y)],
             0.65,
         )
         pygame.draw.rect(
@@ -24739,6 +24796,23 @@ def _draw_threads_slider_thumb(
         pass
 
 
+def _draw_legacy_engine_slider(screen, row_rect, track_rect, value_rect, label, value_text, frac, hovered):
+    bg = (70, 74, 96) if hovered else (52, 54, 66)
+    border = (145, 165, 255) if hovered else MENU_BORDER_COLOR
+    pygame.draw.rect(screen, bg, row_rect, border_radius=8)
+    pygame.draw.rect(screen, border, row_rect, 1, border_radius=8)
+    lbl_s = font_small.render(label, True, TEXT_COLOR)
+    screen.blit(lbl_s, (row_rect.x + 14, row_rect.centery - lbl_s.get_height() // 2))
+    pygame.draw.rect(screen, (36, 38, 48), track_rect, border_radius=3)
+    fill_w = max(0, int(round(track_rect.width * max(0.0, min(1.0, frac)))))
+    if fill_w > 0:
+        pygame.draw.rect(screen, (95, 145, 245), (track_rect.x, track_rect.y, fill_w, track_rect.height), border_radius=3)
+    knob_x = track_rect.x + fill_w
+    pygame.draw.circle(screen, (235, 240, 255), (knob_x, track_rect.centery), 8)
+    val_s = font_small.render(str(value_text), True, TEXT_COLOR)
+    screen.blit(val_s, val_s.get_rect(center=value_rect.center))
+
+
 def _draw_polished_threads_slider(
     screen, row_rect, track_rect, value_rect, mx, my
 ):
@@ -24753,6 +24827,10 @@ def _draw_polished_threads_slider(
     global threads_slider_hover_amount, threads_slider_pulse_phase
 
     values = _threads_slider_values()
+    if config.get("gui_legacy_buttons", 0):
+        frac = (values["display"] - values["low"]) / max(1.0, float(values["high"] - values["low"]))
+        _draw_legacy_engine_slider(screen, row_rect, track_rect, value_rect, "Threads", values["draft"], frac, row_rect.collidepoint(mx, my))
+        return
     low = values["low"]
     high = values["high"]
     draft = values["draft"]
@@ -25514,10 +25592,10 @@ def _draw_skill_crown_icon(
     crown_width = max(14, int(round(size * 0.62)))
     crown_left = cx - crown_width // 2
     crown_right = crown_left + crown_width
-    crown_base_y = cy + max(3, int(round(size * 0.10)))
-    crown_peak_y = cy - max(7, int(round(size * 0.24)))
-    crown_side_y = cy - max(4, int(round(size * 0.13)))
-    crown_valley_y = cy - max(1, int(round(size * 0.03)))
+    crown_base_y = cy + max(5, int(round(size * 0.17)))
+    crown_peak_y = cy - max(5, int(round(size * 0.17)))
+    crown_side_y = cy - max(3, int(round(size * 0.08)))
+    crown_valley_y = cy + max(1, int(round(size * 0.02)))
     crown_colour = _lerp_color(accent, (255, 214, 105), 0.58)
     crown_colour = _lerp_color(
         crown_colour, (255, 255, 255), 0.14 * hover_amount
@@ -25693,6 +25771,10 @@ def _draw_polished_skill_slider(
     global skill_slider_hover_amount, skill_slider_pulse_phase
 
     values = _skill_slider_values()
+    if config.get("gui_legacy_buttons", 0):
+        frac = (values["display"] - values["low"]) / max(1.0, float(values["high"] - values["low"]))
+        _draw_legacy_engine_slider(screen, row_rect, track_rect, value_rect, "Skill Level", values["draft"], frac, row_rect.collidepoint(mx, my))
+        return
     low = values["low"]
     high = values["high"]
     draft = values["draft"]
@@ -26692,6 +26774,10 @@ def _draw_polished_hash_slider(
     global hash_slider_hover_amount, hash_slider_pulse_phase
 
     values = _hash_slider_values()
+    if config.get("gui_legacy_buttons", 0):
+        frac = (values["display"] - values["low"]) / max(1.0, float(values["high"] - values["low"]))
+        _draw_legacy_engine_slider(screen, row_rect, track_rect, value_rect, "Hash (MB)", values["draft"], frac, row_rect.collidepoint(mx, my))
+        return
     steps = values["steps"]
     high = values["high"]
     draft = values["draft"]
@@ -27697,6 +27783,10 @@ def _draw_polished_depth_slider(
     global depth_slider_hover_amount, depth_slider_pulse_phase
 
     values = _depth_slider_values()
+    if config.get("gui_legacy_buttons", 0):
+        frac = (values["display"] - values["low"]) / max(1.0, float(values["high"] - values["low"]))
+        _draw_legacy_engine_slider(screen, row_rect, track_rect, value_rect, "Depth", values["draft"], frac, row_rect.collidepoint(mx, my))
+        return
     low = values["low"]
     high = values["high"]
     draft = values["draft"]
@@ -28776,6 +28866,10 @@ def _draw_polished_multipv_slider(
     global multipv_slider_hover_amount, multipv_slider_pulse_phase
 
     values = _multipv_slider_values()
+    if config.get("gui_legacy_buttons", 0):
+        frac = (values["display"] - values["low"]) / max(1.0, float(values["high"] - values["low"]))
+        _draw_legacy_engine_slider(screen, row_rect, track_rect, value_rect, "MultiPV", values["draft"], frac, row_rect.collidepoint(mx, my))
+        return
     low = values["low"]
     high = values["high"]
     draft = values["draft"]
@@ -32061,7 +32155,7 @@ def draw_polished_close_button(screen, rect, hovered):
 
 def draw_polished_back_button(screen, rect, hovered):
     if config.get("gui_legacy_buttons", 0):
-        _draw_legacy_button(screen, rect, "< Back", hovered)
+        _draw_legacy_button(screen, rect, "< Back", hovered, font_obj=font_tiny)
         return
     bg = (75, 75, 85) if hovered else (60, 60, 70)
     if hovered:
@@ -32195,6 +32289,9 @@ def draw_flip_button(screen, mouse_pos):
 
     rect = flip_button_rect
     hovered = rect.collidepoint(mouse_pos)
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Flip", hovered, font_obj=font_tiny)
+        return
     try:
         pressed = bool(hovered and pygame.mouse.get_pressed()[0])
     except Exception:
@@ -32868,6 +32965,114 @@ def handle_menu_click(mx, my):
     return True
 
 
+show_edit_board_dialog = False
+_edit_board_state = None
+_edit_board_drag_piece = None
+_edit_board_drag_from_sq = None
+_edit_board_status = ""
+
+
+def _read_clipboard_text():
+    try:
+        import tkinter as _tk
+        _r = _tk.Tk()
+        _r.withdraw()
+        _txt = _r.clipboard_get()
+        _r.destroy()
+        return str(_txt)
+    except Exception:
+        return ""
+
+
+def draw_edit_board_button(screen, mouse_pos):
+    if menu_anim_progress != 0:
+        return
+    rect = edit_board_button_rect
+    hovered = rect.collidepoint(mouse_pos)
+    if config.get("gui_legacy_buttons", 0):
+        _draw_legacy_button(screen, rect, "Edit", hovered, font_obj=font_tiny)
+        return
+    bg = (74, 80, 108) if hovered else (52, 56, 72)
+    border = (145, 170, 255) if hovered else (82, 88, 112)
+    pygame.draw.rect(screen, bg, rect, border_radius=8)
+    pygame.draw.rect(screen, border, rect, 1, border_radius=8)
+    lbl = font_tiny.render("Edit", True, TEXT_COLOR)
+    screen.blit(lbl, lbl.get_rect(center=rect.center))
+
+
+def _edit_board_layout():
+    w, h = 540, 580
+    x = WIDTH // 2 - w // 2
+    y = HEIGHT // 2 - h // 2
+    sq = 48
+    bx = WIDTH // 2 - (sq * 8) // 2
+    by = y + 96
+    board_rect = pygame.Rect(bx, by, sq * 8, sq * 8)
+    top_palette = [(bx + i * (sq + 8), by - sq - 10, k) for i, k in enumerate(("bk", "bq", "br", "bb", "bn", "bp"))]
+    bot_palette = [(bx + i * (sq + 8), by + sq * 8 + 10, k) for i, k in enumerate(("wk", "wq", "wr", "wb", "wn", "wp"))]
+    btn_y = by + sq * 8 + sq + 24
+    btns = {
+        "clear": pygame.Rect(x + 20, btn_y, 76, 30),
+        "start": pygame.Rect(x + 104, btn_y, 90, 30),
+        "fen": pygame.Rect(x + 202, btn_y, 92, 30),
+        "pgn": pygame.Rect(x + 302, btn_y, 92, 30),
+        "apply": pygame.Rect(x + 402, btn_y, 60, 30),
+        "cancel": pygame.Rect(x + 468, btn_y, 56, 30),
+    }
+    return pygame.Rect(x, y, w, h), sq, board_rect, top_palette, bot_palette, btns
+
+
+def _pkey_to_piece(pkey):
+    color = chess.WHITE if pkey[0] == "w" else chess.BLACK
+    ptype = {"k": chess.KING, "q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT, "p": chess.PAWN}[pkey[1]]
+    return chess.Piece(ptype, color)
+
+
+def draw_edit_board_dialog(screen):
+    if not show_edit_board_dialog or _edit_board_state is None:
+        return
+    screen.blit(_dialog_dim_surface(165), (0, 0))
+    panel, sq, board_rect, top_palette, bot_palette, btns = _edit_board_layout()
+    pygame.draw.rect(screen, (42, 44, 54), panel, border_radius=12)
+    pygame.draw.rect(screen, (110, 125, 165), panel, 2, border_radius=12)
+
+    title = font_small.render("Edit Board (drag pieces on/off)", True, TEXT_COLOR)
+    screen.blit(title, (panel.x + 18, panel.y + 12))
+    if _edit_board_status:
+        st = font_tiny.render(_edit_board_status, True, (255, 200, 110))
+        screen.blit(st, (panel.right - st.get_width() - 18, panel.y + 15))
+
+    for px, py, pkey in top_palette + bot_palette:
+        pr = pygame.Rect(px, py, sq, sq)
+        pygame.draw.rect(screen, (56, 58, 72), pr, border_radius=6)
+        if pkey in images:
+            img = pygame.transform.smoothscale(images[pkey], (sq - 6, sq - 6))
+            screen.blit(img, (px + 3, py + 3))
+
+    for r in range(8):
+        for f in range(8):
+            col = LIGHT_SQ if (r + f) % 2 == 0 else DARK_SQ
+            sr = pygame.Rect(board_rect.x + f * sq, board_rect.y + r * sq, sq, sq)
+            pygame.draw.rect(screen, col, sr)
+            csq = chess.square(f, 7 - r)
+            if csq != _edit_board_drag_from_sq:
+                pc = _edit_board_state.piece_at(csq)
+                if pc is not None:
+                    pk = get_piece_key(pc)
+                    if pk in images:
+                        img = pygame.transform.smoothscale(images[pk], (sq - 4, sq - 4))
+                        screen.blit(img, (sr.x + 2, sr.y + 2))
+
+    mx, my = pygame.mouse.get_pos()
+    labels = {"clear": "Clear", "start": "Start", "fen": "Paste FEN", "pgn": "Paste PGN", "apply": "Apply", "cancel": "Cancel"}
+    for bk, brect in btns.items():
+        _draw_legacy_button(screen, brect, labels[bk], brect.collidepoint(mx, my), font_obj=font_tiny)
+
+    if _edit_board_drag_piece is not None and _edit_board_drag_piece in images:
+        img = pygame.transform.smoothscale(images[_edit_board_drag_piece], (sq, sq))
+        screen.blit(img, (mx - sq // 2, my - sq // 2))
+
+
 def draw_confirm_dialog(screen):
     if not show_newgame_confirm:
         return None, None
@@ -32879,8 +33084,8 @@ def draw_confirm_dialog(screen):
     x = WIDTH//2 - w//2
     y = HEIGHT//2 - h//2 - int((1-e)*20)
     bg = pygame.Surface((w, h), pygame.SRCALPHA)
-    bg.fill((55,55,65, int(255*e)))
-    pygame.draw.rect(bg, (80,80,90), bg.get_rect(), 2, border_radius=12)
+    pygame.draw.rect(bg, (55, 55, 65, int(255*e)), bg.get_rect(), border_radius=12)
+    pygame.draw.rect(bg, (80,80,90, int(255*e)), bg.get_rect(), 2, border_radius=12)
     # we need to blit bg with proper alpha
     screen.blit(bg, (x, y))
     # title
@@ -32991,11 +33196,24 @@ def _tile_overlay(rgba):
 
 _side_panel_topline_hits = []
 _side_panel_history_hits = []
+_side_panel_history_scroll = 0
+_side_panel_history_max_scroll = 0
+_side_panel_history_rect = None
+_history_hold_dir = 0
+_history_hold_start_ms = 0
+_history_hold_last_step_ms = 0
+
+
+_swing_angle = 0.0
+_swing_vel = 0.0
+_swing_last_x = None
+_mate_anim_start_ms = None
 
 
 def draw_side_panel(screen, board, engine_thread, view_ply=None):
     """Draw the right-hand Chess.com-style panel: Engine Top Lines & Move History."""
     global _side_panel_topline_hits, _side_panel_history_hits
+    global _side_panel_history_scroll, _side_panel_history_max_scroll, _side_panel_history_rect
     _side_panel_topline_hits = []
     _side_panel_history_hits = []
     panel_x = SIDE_PANEL_X
@@ -33102,6 +33320,7 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None):
     screen.blit(mh_hdr, (panel_x + 14, hist_top + 8))
 
     list_rect = pygame.Rect(panel_x + 10, hist_top + 36, panel_w - 20, panel_rect.bottom - (hist_top + 46))
+    _side_panel_history_rect = list_rect
     pygame.draw.rect(screen, (28, 30, 38), list_rect, border_radius=8)
 
     moves = list(board.move_stack)
@@ -33131,10 +33350,9 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None):
 
     row_h = 26
     visible_rows = max(1, (list_rect.height - 8) // row_h)
-    active_row = max(0, (active_ply - 1) // 2) if active_ply > 0 else 0
-    start_row = max(0, min(len(rows) - visible_rows, active_row - visible_rows + 2))
-    if len(rows) <= visible_rows:
-        start_row = 0
+    _side_panel_history_max_scroll = max(0, len(rows) - visible_rows)
+    _side_panel_history_scroll = max(0, min(_side_panel_history_max_scroll, _side_panel_history_scroll))
+    start_row = 0 if len(rows) <= visible_rows else _side_panel_history_scroll
 
     prev_clip = screen.get_clip()
     screen.set_clip(list_rect)
@@ -33289,6 +33507,28 @@ def draw_gui(
             int(live_last_move.from_square): 105,
             int(live_last_move.to_square): 150,
         }
+    global _board_theme_anim_start_ms, LIGHT_SQ, DARK_SQ
+    if _board_theme_anim_start_ms is not None:
+        _bt_elapsed = pygame.time.get_ticks() - _board_theme_anim_start_ms
+        if _bt_elapsed >= 280:
+            LIGHT_SQ = _board_theme_to_light
+            DARK_SQ = _board_theme_to_dark
+            _board_theme_anim_start_ms = None
+        else:
+            _bt_t = cubic_ease_in_out(_bt_elapsed / 280.0)
+            LIGHT_SQ = _lerp_color(_board_theme_from_light, _board_theme_to_light, _bt_t)
+            DARK_SQ = _lerp_color(_board_theme_from_dark, _board_theme_to_dark, _bt_t)
+    global _piece_theme_anim_start_ms
+    if _piece_theme_anim_start_ms is not None:
+        _pt_elapsed = pygame.time.get_ticks() - _piece_theme_anim_start_ms
+        if _pt_elapsed >= 240:
+            for _img in images.values():
+                _img.set_alpha(255)
+            _piece_theme_anim_start_ms = None
+        else:
+            _pt_a = int(80 + 175 * cubic_ease_in_out(_pt_elapsed / 240.0))
+            for _img in images.values():
+                _img.set_alpha(_pt_a)
     _rounded_board = bool(config.get("gui_rounded_corners", 0))
     _show_coords = bool(config.get("gui_coordinates", 0))
     for r in range(8):
@@ -33356,12 +33596,41 @@ def draw_gui(
         screen,
         BOARD_BORDER_COLOR,
         (board_ox - 2, BOARD_OY - 2, BOARD_WIDTH + 4, BOARD_WIDTH + 4),
-        2, border_radius=2
+        2, border_radius=12 if _rounded_board else 2
     )
-    try:
-        pygame.gfxdraw.rectangle(screen, pygame.Rect(board_ox-2, BOARD_OY-2, BOARD_WIDTH+4, BOARD_WIDTH+4), BOARD_BORDER_COLOR)
-    except Exception:
-        pass
+    if not _rounded_board:
+        try:
+            pygame.gfxdraw.rectangle(screen, pygame.Rect(board_ox-2, BOARD_OY-2, BOARD_WIDTH+4, BOARD_WIDTH+4), BOARD_BORDER_COLOR)
+        except Exception:
+            pass
+
+    if config.get("gui_mate_animation", 0) and board.is_checkmate():
+        global _mate_anim_start_ms
+        _now_ms = pygame.time.get_ticks()
+        if _mate_anim_start_ms is None:
+            _mate_anim_start_ms = _now_ms
+        _mate_elapsed = _now_ms - _mate_anim_start_ms
+        if _mate_elapsed >= 1200:
+            _fade_t = min(1.0, (_mate_elapsed - 1200) / 1400.0)
+            _hl_alpha = int(115 * _fade_t)
+            _k_sq = board.king(board.turn)
+            if _k_sq is not None:
+                _kf, _kr = chess.square_file(_k_sq), chess.square_rank(_k_sq)
+                for _df in (-1, 0, 1):
+                    for _dr in (-1, 0, 1):
+                        if _df == 0 and _dr == 0:
+                            continue
+                        _nf, _nr = _kf + _df, _kr + _dr
+                        if 0 <= _nf < 8 and 0 <= _nr < 8:
+                            _nsq = chess.square(_nf, _nr)
+                            if board.piece_at(_nsq) is None and board.is_attacked_by(not board.turn, _nsq):
+                                _vf = 7 - _nf if board_flipped else _nf
+                                _vr = _nr if board_flipped else 7 - _nr
+                                _hl = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+                                _hl.fill((225, 55, 55, _hl_alpha))
+                                screen.blit(_hl, (board_ox + _vf * SQUARE_SIZE, BOARD_OY + _vr * SQUARE_SIZE))
+    else:
+        _mate_anim_start_ms = None
 
     if config.get("gui_show_legal_moves", 1):
         regular_moves, capture_moves = get_legal_squares(board, selected_sq)
@@ -33425,7 +33694,16 @@ def draw_gui(
             # Only display if move is legal in current position (engine may have stale line)
             if mv not in board.legal_moves:
                 continue
-            start_x, start_y = square_center(mv.from_square)
+            if (
+                config.get("gui_arrow_follow_drag", 0)
+                and dragging
+                and drag_sq is not None
+                and mv.from_square == drag_sq
+                and mouse_pos is not None
+            ):
+                start_x, start_y = float(mouse_pos[0]), float(mouse_pos[1])
+            else:
+                start_x, start_y = square_center(mv.from_square)
             end_x, end_y = square_center(mv.to_square)
             is_knight = False
             piece = board.piece_at(mv.from_square)
@@ -33740,6 +34018,20 @@ def draw_gui(
                 grab_scale, grab_rotation = anim_mgr.get_drag_grab_pose(
                     drag_sq, mouse_pos
                 )
+                global _swing_angle, _swing_vel, _swing_last_x
+                if config.get("gui_swing", 0):
+                    if _swing_last_x is None:
+                        _swing_last_x = float(mx)
+                    _dx = float(mx) - _swing_last_x
+                    _swing_last_x = float(mx)
+                    _swing_vel += (-_dx * 0.22 - _swing_angle * 0.24)
+                    _swing_vel *= 0.80
+                    _swing_angle = max(-24.0, min(24.0, _swing_angle + _swing_vel))
+                    grab_rotation += _swing_angle
+                else:
+                    _swing_last_x = None
+                    _swing_angle = 0.0
+                    _swing_vel = 0.0
                 held_image, grab_x, grab_y = _transform_dragged_piece_image(
                     images[pkey], drag_offset, grab_scale, grab_rotation
                 )
@@ -33922,10 +34214,11 @@ def draw_gui(
 
     # Buttons (top bar) + flip + confirmation + menu overlay
     draw_new_game_button(screen, mouse_pos)
-    draw_side_panel(screen, board, engine_thread, view_ply)
+    draw_side_panel(screen, board, engine_thread, view_ply, history_redo=history_redo)
 
     draw_settings_button(screen, mouse_pos)
     draw_flip_button(screen, mouse_pos)
+    draw_edit_board_button(screen, mouse_pos)
 
     # New game confirmation dialog (over buttons, under menu)
     if show_newgame_confirm:
@@ -33942,6 +34235,8 @@ def draw_gui(
     # must render above the settings menu).
     if show_auto_color_dialog:
         draw_auto_color_dialog(screen)
+    if show_edit_board_dialog:
+        draw_edit_board_dialog(screen)
 
     # Board Detection window picker (also from the Analysis page).
     if show_board_detection_dialog:
@@ -34338,7 +34633,7 @@ def main():
             "last_image": board_crop,
             "last_grid": _autoplay_board_grid_from_board(board),
             "expected_fen": board.fen(),
-            "next_poll_at": time.monotonic() + AUTOPLAY_POLL_SECONDS,
+            "next_poll_at": time.monotonic() + _autoplay_poll_seconds(),
             "pending_move": None,
             "pending_before_image": None,
             "pending_before_grid": None,
@@ -34425,7 +34720,7 @@ def main():
         now = time.monotonic()
         if not force and now < float(_autoplay.get("next_poll_at", 0.0)):
             return None
-        _autoplay["next_poll_at"] = now + AUTOPLAY_POLL_SECONDS
+        _autoplay["next_poll_at"] = now + _autoplay_poll_seconds()
         launch_base_grid = base_grid() if callable(base_grid) else base_grid
         launch_board_snapshot = (
             board_snapshot() if callable(board_snapshot) else board_snapshot
@@ -34484,7 +34779,7 @@ def main():
         _autoplay.update({
             "state": "verify_our_move",
             "pending_started_at": now,
-            "next_poll_at": now + AUTOPLAY_POLL_SECONDS,
+            "next_poll_at": now + _autoplay_poll_seconds(),
         })
         if result.get("kind") == "retry":
             _autoplay_set_status(
@@ -34542,7 +34837,7 @@ def main():
         if state == "our_turn":
             if board.turn != player:
                 _autoplay["state"] = "wait_opponent"
-                _autoplay["next_poll_at"] = now + AUTOPLAY_POLL_SECONDS
+                _autoplay["next_poll_at"] = now + _autoplay_poll_seconds()
                 _autoplay_set_status("Auto-play waiting for the opponent...")
                 return
             pre_drag_poll = autoplay_poll_candidate_async(
@@ -35385,6 +35680,70 @@ def main():
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
 
+                if show_edit_board_dialog and _edit_board_state is not None:
+                    _panel, _sq, _brect, _top_p, _bot_p, _btns = _edit_board_layout()
+                    if _btns["clear"].collidepoint(mx, my):
+                        _edit_board_state.clear_board()
+                        _edit_board_status = "Cleared"
+                    elif _btns["start"].collidepoint(mx, my):
+                        _edit_board_state = chess.Board()
+                        _edit_board_status = "Starting pos"
+                    elif _btns["fen"].collidepoint(mx, my):
+                        _clip = _read_clipboard_text().strip()
+                        try:
+                            _edit_board_state = chess.Board(_clip)
+                            _edit_board_status = "FEN loaded"
+                        except Exception:
+                            _edit_board_status = "Invalid FEN"
+                    elif _btns["pgn"].collidepoint(mx, my):
+                        _clip = _read_clipboard_text().strip()
+                        try:
+                            import io as _io
+                            import chess.pgn as _cpgn
+                            _g = _cpgn.read_game(_io.StringIO(_clip))
+                            if _g is not None:
+                                _nb = _g.board()
+                                for _gm in _g.mainline_moves():
+                                    _nb.push(_gm)
+                                _edit_board_state = _nb
+                                _edit_board_status = "PGN loaded"
+                            else:
+                                _edit_board_status = "Invalid PGN"
+                        except Exception:
+                            _edit_board_status = "Invalid PGN"
+                    elif _btns["apply"].collidepoint(mx, my):
+                        board = _edit_board_state.copy()
+                        history_redo.clear()
+                        selected_sq = None
+                        dragging = False
+                        engine_thread.update_position(board)
+                        show_edit_board_dialog = False
+                    elif _btns["cancel"].collidepoint(mx, my):
+                        show_edit_board_dialog = False
+                    elif _brect.collidepoint(mx, my):
+                        _f = (mx - _brect.x) // _sq
+                        _r = (my - _brect.y) // _sq
+                        _csq = chess.square(_f, 7 - _r)
+                        _pc = _edit_board_state.piece_at(_csq)
+                        if _pc is not None:
+                            _edit_board_drag_piece = get_piece_key(_pc)
+                            _edit_board_drag_from_sq = _csq
+                    else:
+                        for _px, _py, _pk in _top_p + _bot_p:
+                            if pygame.Rect(_px, _py, _sq, _sq).collidepoint(mx, my):
+                                _edit_board_drag_piece = _pk
+                                _edit_board_drag_from_sq = None
+                                break
+                    continue
+
+                if not settings_menu_open and not game_review_is_active() and menu_anim_progress == 0 and edit_board_button_rect.collidepoint(mx, my):
+                    _edit_board_state = board.copy()
+                    _edit_board_drag_piece = None
+                    _edit_board_drag_from_sq = None
+                    _edit_board_status = ""
+                    show_edit_board_dialog = True
+                    continue
+
                 if not settings_menu_open and not game_review_is_active() and mx >= SIDE_PANEL_X:
                     _handled_side = False
                     for _hrect, _hply in _side_panel_history_hits:
@@ -35563,6 +35922,19 @@ def main():
                     handle_menu_click(mx, my)
 
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if show_edit_board_dialog and _edit_board_drag_piece is not None and _edit_board_state is not None:
+                    mx, my = event.pos
+                    _panel, _sq, _brect, _top_p, _bot_p, _btns = _edit_board_layout()
+                    if _edit_board_drag_from_sq is not None:
+                        _edit_board_state.remove_piece_at(_edit_board_drag_from_sq)
+                    if _brect.collidepoint(mx, my):
+                        _f = (mx - _brect.x) // _sq
+                        _r = (my - _brect.y) // _sq
+                        _csq = chess.square(_f, 7 - _r)
+                        _edit_board_state.set_piece_at(_csq, _pkey_to_piece(_edit_board_drag_piece))
+                    _edit_board_drag_piece = None
+                    _edit_board_drag_from_sq = None
+                    continue
                 if engine_slider_dragging is not None:
                     engine_slider_dragging = None
                 mx, my = event.pos
@@ -35649,6 +36021,16 @@ def main():
                     and menu_transition_direction == "none"
                 ):
                     scroll_gui_settings(-event.y)
+                elif (
+                    not settings_menu_open
+                    and not game_review_is_active()
+                    and _side_panel_history_rect is not None
+                    and _side_panel_history_rect.collidepoint(pygame.mouse.get_pos())
+                ):
+                    _side_panel_history_scroll = max(
+                        0,
+                        min(_side_panel_history_max_scroll, _side_panel_history_scroll - event.y),
+                    )
 
             elif event.type == pygame.KEYDOWN:
                 if training_session.mode and event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE):
@@ -35720,6 +36102,9 @@ def main():
                     else:
                         selected_sq = None
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT) and menu_anim_progress == 0 and not show_newgame_confirm and not show_auto_color_dialog and promotion_pending is None and not dragging and not anim_mgr.board_reset_anims and not anim_mgr.illegal_return_anim:
+                    _history_hold_dir = -1 if event.key == pygame.K_LEFT else 1
+                    _history_hold_start_ms = pygame.time.get_ticks()
+                    _history_hold_last_step_ms = _history_hold_start_ms
                     if event.key == pygame.K_LEFT:
                         # Previous move (kept in history_redo for →), played backwards
                         if board.move_stack:
@@ -35748,6 +36133,41 @@ def main():
                 elif event.key == pygame.K_SPACE and menu_anim_progress == 0 and not show_auto_color_dialog and not game_review_is_active():
                     if not (anim_mgr.move_anim or anim_mgr.rook_anim or anim_mgr.illegal_return_anim):
                         execute_engine_best_move()
+
+            elif event.type == pygame.KEYUP:
+                if event.key == pygame.K_LEFT and _history_hold_dir == -1:
+                    _history_hold_dir = 0
+                elif event.key == pygame.K_RIGHT and _history_hold_dir == 1:
+                    _history_hold_dir = 0
+
+        if _history_hold_dir != 0:
+            _keys = pygame.key.get_pressed()
+            _held_key = pygame.K_LEFT if _history_hold_dir == -1 else pygame.K_RIGHT
+            if not _keys[_held_key] or menu_anim_progress != 0 or show_newgame_confirm or show_auto_color_dialog or promotion_pending is not None or dragging:
+                _history_hold_dir = 0
+            else:
+                _now_ms = pygame.time.get_ticks()
+                if _now_ms - _history_hold_start_ms >= 320 and _now_ms - _history_hold_last_step_ms >= 55:
+                    _history_hold_last_step_ms = _now_ms
+                    if _history_hold_dir == -1 and board.move_stack:
+                        add_move_animation_for_move(anim_mgr, board, board.move_stack[-1], reverse=True)
+                        history_redo.append(board.pop())
+                        play_sound("move")
+                        sync_after_history_step()
+                        if game_review_is_active():
+                            set_game_review_playing(False)
+                    elif _history_hold_dir == 1 and history_redo:
+                        next_move = history_redo[-1]
+                        if next_move in board.legal_moves:
+                            board_before = board.copy()
+                            add_move_animation_for_move(anim_mgr, board, next_move, reverse=False)
+                            board.push(history_redo.pop())
+                            play_move_sound(board_before, next_move)
+                            sync_after_history_step()
+                            if game_review_is_active():
+                                set_game_review_playing(False)
+                        else:
+                            history_redo.clear()
 
 
         draw_gui(
