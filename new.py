@@ -33416,13 +33416,18 @@ def draw_side_panel(screen, board, engine_thread, view_ply=None, history_redo=No
 
     # Build SAN pairs from the starting position
     san_list = []
-    try:
-        replay = chess.Board()
-        for mv in moves:
+    replay = chess.Board()
+    for mv in moves:
+        try:
             san_list.append(replay.san(mv))
             replay.push(mv)
-    except Exception:
-        san_list = [mv.uci() for mv in moves]
+        except Exception:
+            san_list.append(f"{chess.square_name(mv.from_square)}x{chess.square_name(mv.to_square)}")
+            try:
+                replay.remove_piece_at(mv.to_square)
+                replay.push(mv)
+            except Exception:
+                pass
 
     rows = []
     for i in range(0, len(san_list), 2):
@@ -33863,7 +33868,20 @@ def draw_gui(
                 (x + SQUARE_SIZE // 2 + 2, y + SQUARE_SIZE - 11),
                 piece,
             )
-            screen.blit(images[pkey], (x, y))
+            if config.get("gui_mate_animation", 0) and board.is_checkmate() and sq == board.king(board.turn) and _mate_anim_start_ms is not None:
+                _me = pygame.time.get_ticks() - _mate_anim_start_ms
+                if _me >= 1200:
+                    _fall_t = min(1.0, (_me - 1200) / 1400.0)
+                    _fall_angle = -90.0 * _fall_t
+                    _sx = math.sin(_me * 0.11) * 4.5
+                    _sy = math.cos(_me * 0.15) * 3.0
+                    _rot_img = pygame.transform.rotozoom(images[pkey], _fall_angle, 1.0)
+                    _rr = _rot_img.get_rect(center=(x + SQUARE_SIZE // 2 + _sx, y + SQUARE_SIZE // 2 + _sy))
+                    screen.blit(_rot_img, _rr.topleft)
+                else:
+                    screen.blit(images[pkey], (x, y))
+            else:
+                screen.blit(images[pkey], (x, y))
 
     # 3b. Drag highlight for drop square
     if dragging and drag_sq is not None:
@@ -33894,6 +33912,8 @@ def draw_gui(
     _piece_anim_style = str(config.get("gui_piece_anim_style", "Cubic"))
     def _ease_piece_anim(p):
         p = max(0.0, min(1.0, float(p)))
+        if config.get("gui_mate_animation", 0) and board.is_checkmate():
+            return cubic_ease_out_back(p, overshoot=1.8)
         if _piece_anim_style == "None":
             return 1.0
         if _piece_anim_style == "Linear":
