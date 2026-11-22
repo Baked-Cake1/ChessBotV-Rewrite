@@ -11188,6 +11188,21 @@ _GUI_SECTIONS = [
             ("gui_disable_legal_moves_anim", "Disable Legal Moves Animation", "toggle", "Show legal move dots immediately without fade/pop"),
             ("gui_rotate_piece_on_move", "Rotate Piece on move", "toggle", "Tilt the held piece slightly while dragging"),
             ("gui_swing", "Swing", "toggle", "Add springy swing/jiggle physics when dragging a piece"),
+            ("gui_mate_animation", "Mate Animation", "toggle", "Slow-motion overshoot, king fall/shake & blocked escape highlights on checkmate"),
+        ],
+    ),
+    (
+        "Rules",
+        [
+            ("gui_rule_repetition", "Repetition", "dropdown", "Draw by repetition threshold"),
+            ("gui_rule_insufficient_material", "Insufficient Material Draw", "toggle", "Draw automatically when neither side can checkmate"),
+            ("gui_rule_king_capturing", "King-Capturing", "toggle", "Win by capturing the king; kings can move next to each other"),
+            ("gui_rule_double_pawn", "Double-move pawns", "toggle", "Allow pawns to move 2 squares on their first move"),
+            ("gui_rule_en_passant", "En-passant", "toggle", "Allow en-passant pawn captures"),
+            ("gui_rule_promotion", "Promotion", "toggle", "Allow pawns to promote on the back rank"),
+            ("gui_rule_castling", "Castling", "toggle", "Allow kingside and queenside castling"),
+            ("gui_rule_friendly_fire", "Friendly-Fire", "toggle", "Allow pieces to capture their own team"),
+            ("gui_rule_always_queen", "Always Queen on Promotion", "toggle", "Automatically promote to a Queen without a dialog"),
         ],
     ),
 ]
