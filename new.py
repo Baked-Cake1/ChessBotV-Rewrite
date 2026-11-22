@@ -3275,20 +3275,28 @@ def get_game_status(board):
     (threefold repetition, fifty-move rule) — the game ends automatically
     for any of these so play cannot continue in a finished position.
     """
-    if board.is_checkmate():
+    if config.get("gui_rule_king_capturing", 0):
+        if board.king(chess.WHITE) is None:
+            return ("Black Wins (King Captured)!", TEXT_STATUS, True)
+        if board.king(chess.BLACK) is None:
+            return ("White Wins (King Captured)!", TEXT_STATUS, True)
+    elif board.is_checkmate():
         return ("Checkmate!", TEXT_STATUS, True)
     if board.is_stalemate():
         return ("Draw — Stalemate", DRAW_COLOR, True)
-    if board.is_insufficient_material():
+    if config.get("gui_rule_insufficient_material", 1) and board.is_insufficient_material():
         return ("Draw — Insufficient Material", DRAW_COLOR, True)
     if board.is_seventyfive_moves():
         return ("Draw — 75-Move Rule", DRAW_COLOR, True)
-    if board.is_fivefold_repetition():
-        return ("Draw — Fivefold Repetition", DRAW_COLOR, True)
     if board.is_fifty_moves():
         return ("Draw — 50-Move Rule", DRAW_COLOR, True)
-    if board.is_repetition(3):
+    _rep_rule = str(config.get("gui_rule_repetition", "Three-Fold"))
+    if _rep_rule == "Three-Fold" and board.is_repetition(3):
         return ("Draw — Threefold Repetition", DRAW_COLOR, True)
+    if _rep_rule == "Five-Fold" and board.is_repetition(5):
+        return ("Draw — Fivefold Repetition", DRAW_COLOR, True)
+    if _rep_rule == "Ten-Fold" and board.is_repetition(10):
+        return ("Draw — Tenfold Repetition", DRAW_COLOR, True)
     if board.is_check():
         return ("Check!", TEXT_STATUS, False)
     return (None, None, False)
