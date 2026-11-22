@@ -11187,6 +11187,7 @@ _GUI_SECTIONS = [
             ("gui_show_legal_moves", "Show Legal Moves", "toggle", "Highlight legal destinations when selecting a piece"),
             ("gui_disable_legal_moves_anim", "Disable Legal Moves Animation", "toggle", "Show legal move dots immediately without fade/pop"),
             ("gui_rotate_piece_on_move", "Rotate Piece on move", "toggle", "Tilt the held piece slightly while dragging"),
+            ("gui_swing", "Swing", "toggle", "Add springy swing/jiggle physics when dragging a piece"),
         ],
     ),
 ]
