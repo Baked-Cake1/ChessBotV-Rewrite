@@ -884,7 +884,7 @@ def save_config():
                 "gui_rule_friendly_fire",
                 "gui_rule_always_queen",
             ):
-                f.write(f"{_gk}={1 if config.get(_gk, ENGINE_DEFAULTS[_gk]) else 0}\n")
+                f.write(f"{_gk}={1 if config.get(_gk, ENGINE_DEFAULTS.get(_gk, 0)) else 0}\n")
             f.write(f"gui_arrow_anim_style={config.get('gui_arrow_anim_style', 'Cubic')}\n")
             f.write(f"gui_piece_anim_style={config.get('gui_piece_anim_style', 'Cubic')}\n")
             f.write(f"gui_rule_repetition={config.get('gui_rule_repetition', 'Three-Fold')}\n")
