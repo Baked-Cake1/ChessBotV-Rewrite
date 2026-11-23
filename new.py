@@ -22686,17 +22686,16 @@ def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
 
 
 def get_auto_move_depth_rects(offset_x=0, offset_y=0):
-    """Row and − / value / + controls for Auto-Move's target depth."""
+    """Row, slider track, and value chip for Auto-Move's target depth."""
     row = pygame.Rect(
         (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
         304 + offset_y,
         AUTOPLAY_SETTINGS_ROW_WIDTH,
         58,
     )
-    minus = pygame.Rect(row.right - 178, row.centery - 18, 42, 36)
-    value = pygame.Rect(minus.right + 8, row.centery - 18, 72, 36)
-    plus = pygame.Rect(value.right + 8, row.centery - 18, 42, 36)
-    return row, minus, value, plus
+    track = pygame.Rect(row.right - 260, row.centery - 3, 170, 6)
+    value = pygame.Rect(row.right - 78, row.centery - 16, 62, 32)
+    return row, track, value, pygame.Rect(0, 0, 0, 0)
 
 
 def _draw_auto_move_depth_row(screen, offset_x=0, offset_y=0, idle=True):
@@ -32878,14 +32877,12 @@ def handle_menu_click(mx, my):
                 show_auto_color_dialog = True
                 auto_color_dialog_anim = 0.0
             return True
-        _depth_row, depth_minus, _depth_value, depth_plus = (
+        _depth_row, depth_track, _depth_value, _depth_unused = (
             get_auto_move_depth_rects()
         )
-        if depth_minus.collidepoint(mx, my):
-            set_auto_move_depth(auto_move_depth - 1)
-            return True
-        if depth_plus.collidepoint(mx, my):
-            set_auto_move_depth(auto_move_depth + 1)
+        if depth_track.inflate(8, 20).collidepoint(mx, my):
+            _frac = max(0.0, min(1.0, (mx - depth_track.x) / max(1.0, float(depth_track.width))))
+            set_auto_move_depth(int(round(_frac * 40)))
             return True
         if auto_move_enabled:
             for color, rect in get_auto_move_color_rects().items():
