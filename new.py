@@ -17201,6 +17201,11 @@ def restart_autoplay_scan():
     if not _autoplay.get("window"):
         return request_autoplay_start()
     _autoplay["enabled"] = True
+    if config.get("gui_combined_mode", 0) and not advisor_is_active() and window is not None:
+        try:
+            start_advisor_on_window(window)
+        except Exception:
+            pass
     return start_autoplay_scan(_autoplay.get("side", "white"))
 
 
