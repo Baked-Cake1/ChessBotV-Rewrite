@@ -1152,6 +1152,9 @@ autoplay_broadcast_target = None
 # Screenshot polls are one-at-a-time background jobs; 50 ms keeps very
 # fast opponent replies responsive without launching overlapping captures.
 AUTOPLAY_POLL_SECONDS = 0.05
+AUTOPLAY_SYNC_RESCAN_SECONDS = 2.5
+ADVISOR_SYNC_RESCAN_SECONDS = 2.5
+LIVE_SYNC_RESCAN_LIMIT = 2
 
 
 def _autoplay_poll_seconds():
@@ -1204,6 +1207,8 @@ _autoplay = {
     "pending_before_grid": None,
     "pending_started_at": 0.0,
     "pending_causes_checkmate": False,
+    "sync_started_at": 0.0,
+    "sync_rescans": 0,
     "drag_attempts": 0,
     "drag_id": 0,
     "drag_running": False,
@@ -1271,6 +1276,8 @@ _advisor = {
     "mouse_down": False,
     "mouse_released_at": 0.0,
     "sync_pending": False,
+    "sync_started_at": 0.0,
+    "sync_rescans": 0,
     "capture_failures": 0,
     "best_move_uci": "",
     "best_move_san": "",
@@ -7859,7 +7866,7 @@ def _gui_custom_legal_moves(board):
             continue
         if not promotion and mv.promotion is not None:
             if mv.promotion == chess.QUEEN:
-                out.append(chess.Move(mv.from_square, mv.to_square))
+                out.append(mv)
             continue
         out.append(mv)
 
@@ -7954,19 +7961,24 @@ def build_move_with_promotion(board, from_sq, to_sq):
 
 
 def get_castling_info(board, from_sq, to_sq):
-    """Return (is_castling, rook_start, rook_target, rook_piece) for a king move."""
-    piece = board.piece_at(from_sq)
-    if not piece or piece.piece_type != chess.KING:
+    """Return castling animation data only for a valid orthodox castle."""
+    try:
+        piece = board.piece_at(from_sq)
+        if piece is None or piece.piece_type != chess.KING:
+            return False, None, None, None
+        move = chess.Move(from_sq, to_sq)
+        if not board.is_castling(move):
+            return False, None, None, None
+        rook_pair = _CASTLING_ROOK_PAIRS.get((from_sq, to_sq))
+        if rook_pair is None:
+            return False, None, None, None
+        rook_start, rook_target = rook_pair
+        rook_piece = board.piece_at(rook_start)
+        if rook_piece is None or rook_piece.piece_type != chess.ROOK or rook_piece.color != piece.color:
+            return False, None, None, None
+        return True, rook_start, rook_target, rook_piece
+    except (AttributeError, TypeError, ValueError):
         return False, None, None, None
-    if (from_sq == chess.E1 and to_sq == chess.G1) or (from_sq == chess.E8 and to_sq == chess.G8):
-        rook_start = chess.H1 if from_sq == chess.E1 else chess.H8
-        rook_target = chess.F1 if from_sq == chess.E1 else chess.F8
-        return True, rook_start, rook_target, board.piece_at(rook_start)
-    if (from_sq == chess.E1 and to_sq == chess.C1) or (from_sq == chess.E8 and to_sq == chess.C8):
-        rook_start = chess.A1 if from_sq == chess.E1 else chess.A8
-        rook_target = chess.D1 if from_sq == chess.E1 else chess.D8
-        return True, rook_start, rook_target, board.piece_at(rook_start)
-    return False, None, None, None
 
 
 def try_execute_move(board, anim_mgr, engine_thread, from_sq, to_sq, animate=True):
@@ -8030,11 +8042,21 @@ promotion_pending = None  # {"from_sq":..., "to_sq":..., "color":...}
 def is_promotion_move(board, from_sq, to_sq):
     if not config.get("gui_rule_promotion", 1) or config.get("gui_rule_always_queen", 0):
         return False
-    piece = board.piece_at(from_sq)
-    if not piece or piece.piece_type != chess.PAWN:
+    if not isinstance(from_sq, int) or not isinstance(to_sq, int):
         return False
-    rank = chess.square_rank(to_sq)
-    return rank == 0 or rank == 7
+    if not (0 <= from_sq < 64 and 0 <= to_sq < 64):
+        return False
+    try:
+        piece = board.piece_at(from_sq)
+        if piece is None or piece.piece_type != chess.PAWN:
+            return False
+        promotion_rank = 7 if piece.color == chess.WHITE else 0
+        if chess.square_rank(to_sq) != promotion_rank:
+            return False
+        queen_move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
+        return queen_move in board.legal_moves and queen_move in _gui_custom_legal_moves(board)
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def get_promotion_rects():
@@ -8077,16 +8099,32 @@ def draw_promotion_menu(screen, color):
 def try_execute_promotion(board, anim_mgr, engine_thread, from_sq, to_sq, promo_piece, animate=True):
     if training_session.blocked():
         return False
-    move = chess.Move(from_sq, to_sq, promotion=promo_piece)
-    if move not in board.legal_moves:
+    if promo_piece not in PROMOTION_CHOICES:
         return False
+    if not (0 <= from_sq < 64 and 0 <= to_sq < 64):
+        return False
+    pawn = board.piece_at(from_sq)
+    if pawn is None or pawn.piece_type != chess.PAWN:
+        return False
+    promotion_rank = 7 if pawn.color == chess.WHITE else 0
+    if chess.square_rank(to_sq) != promotion_rank:
+        return False
+    move = chess.Move(from_sq, to_sq, promotion=promo_piece)
+    if move not in board.legal_moves or move not in _gui_custom_legal_moves(board):
+        return False
+
     board_before = board.copy()
-    is_castling, rook_start_sq, rook_target_sq, rook_piece = get_castling_info(board, from_sq, to_sq)
     captured_piece = board.piece_at(to_sq)
-    if captured_piece:
+    if captured_piece is None and board.is_en_passant(move):
+        capture_sq = chess.square(chess.square_file(to_sq), chess.square_rank(from_sq))
+        captured_piece = board.piece_at(capture_sq)
+        if captured_piece is not None:
+            anim_mgr.add_capture(captured_piece, capture_sq)
+    if captured_piece is not None and not board.is_en_passant(move):
         anim_mgr.add_capture(captured_piece, to_sq)
     if animate:
-        anim_mgr.add_move(board.piece_at(from_sq), from_sq, to_sq, is_castling, rook_start_sq, rook_target_sq, rook_piece)
+        anim_mgr.add_move(board.piece_at(from_sq), from_sq, to_sq)
+
     board.push(move)
     if training_session.mode == "manual":
         training_session.ready = False
@@ -16881,6 +16919,12 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
         "awaiting_f8_restart": False,
     })
     _autoplay_set_status(reason, error=reason if error else "")
+    if config.get("gui_combined_mode", 0) and (
+        _advisor.get("enabled") or _advisor.get("running")
+        or _advisor.get("scan_running")
+        or _advisor.get("overlay_generation")
+    ):
+        stop_advisor(reason, error=error)
     show_autoplay_side_dialog = False
     show_autoplay_gameover_dialog = False
     if board_detection_picker_purpose == "autoplay":
@@ -17126,6 +17170,45 @@ def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
             _autoplay["scan_running"] = False
 
 
+def _start_combined_advisor_scan(window_info, side):
+    """Start Advisor on Auto-play's selected window and side."""
+    if not config.get("gui_combined_mode", 0):
+        return True
+
+    window_info = dict(window_info)
+    if not window_info.get("process_name"):
+        window_info["process_name"] = _window_process_name(
+            window_info.get("hwnd")
+        )
+    if not _advisor.get("overlay_generation"):
+        try:
+            _ensure_cliv_gui_available()
+        except Exception as exc:
+            stop_autoplay(f"Combined Mode could not start Advisor Mode: {exc}", error=True)
+            return False
+        generation = _advisor_overlay_service.start_session(
+            window_info.get("hwnd"),
+            window_info.get("process_name") or "unknown.exe",
+        )
+        if not generation:
+            stop_autoplay(
+                "Combined Mode could not start the cliv-gui overlay.",
+                error=True,
+            )
+            return False
+        _advisor["overlay_generation"] = int(generation)
+
+    _advisor.update({
+        "enabled": True,
+        "running": False,
+        "state": "choosing_side",
+        "pending_window": dict(window_info),
+        "window": dict(window_info),
+        "side": side,
+    })
+    return start_advisor_scan(side)
+
+
 def start_autoplay_scan(side=None):
     """Start (or restart for a new game) the initial full-board scan."""
     global menu_anim_closing
@@ -17180,6 +17263,15 @@ def start_autoplay_scan(side=None):
         f"Scanning {_autoplay_broadcast_target_label(window_info)} as "
         f"{side.capitalize()} with {_vision_backend_label(use_package_snapshot)}..."
     )
+    if config.get("gui_combined_mode", 0):
+        try:
+            if not _start_combined_advisor_scan(window_info, side):
+                return False
+        except Exception as exc:
+            stop_autoplay(
+                f"Combined Mode advisor scan failed: {exc}", error=True
+            )
+            return False
     try:
         begin_settings_menu_close()
     except Exception:
@@ -17201,11 +17293,6 @@ def restart_autoplay_scan():
     if not _autoplay.get("window"):
         return request_autoplay_start()
     _autoplay["enabled"] = True
-    if config.get("gui_combined_mode", 0) and not advisor_is_active():
-        try:
-            start_advisor_scan(side=_autoplay.get("side"))
-        except Exception as _adv_err:
-            print(f"Combined Mode advisor start failed: {_adv_err}")
     return start_autoplay_scan(_autoplay.get("side", "white"))
 
 
@@ -17363,7 +17450,7 @@ def request_advisor_start():
             show_board_detection_dialog
             and board_detection_picker_purpose == "autoplay"
         )
-    ) and not config.get("gui_combined_mode", 0):
+    ):
         message = "Stop Auto-play before starting Advisor Mode."
         _advisor_set_status(message, error=message)
         return False
@@ -18146,6 +18233,14 @@ def handle_advisor_side_click(mx, my):
     for side, rect in choices.items():
         if rect.collidepoint(mx, my):
             show_advisor_side_dialog = False
+            if config.get("gui_combined_mode", 0):
+                autoplay_side = _autoplay_side_name(
+                    _autoplay.get("side", side)
+                )
+                _advisor["side"] = autoplay_side
+                if not _autoplay.get("enabled"):
+                    start_autoplay_scan(autoplay_side)
+                return True
             start_advisor_scan(side)
             return True
     if cancel.collidepoint(mx, my) or not panel.collidepoint(mx, my):
@@ -18204,15 +18299,21 @@ def handle_autoplay_gameover_click(mx, my):
     return True
 
 
+# Extra height the Auto-Move colour picker, status and hint add when Auto-Move
+# is on; everything below Auto-Move moves down by this amount.
+AUTOPLAY_PAGE_AUTO_MOVE_SHIFT = 62
+
+
+def _autoplay_page_auto_move_shift():
+    return AUTOPLAY_PAGE_AUTO_MOVE_SHIFT if auto_move_enabled else 0
+
+
 def get_board_detection_button_rect(offset_x=0, offset_y=0):
-    # Sit below the always-visible Auto-Move depth row, and below the
-    # colour/status controls too when Auto-Move is enabled.
-    y = 494 if auto_move_enabled else 374
     return pygame.Rect(
         (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        y + offset_y,
+        330 + _autoplay_page_auto_move_shift() + offset_y,
         AUTOPLAY_SETTINGS_ROW_WIDTH,
-        88,
+        72,
     )
 
 
@@ -19550,7 +19651,7 @@ def _game_review_eval_text(cp, mate=None):
         return "+0.00"
 
 
-def _draw_game_review_coach_character(
+def _draw_game_review_coach_character_legacy(
     surface, rect, reaction, time_ms=None, mouth_open=0.0
 ):
     """Draw Coach Nolan as a polished supersampled vector bust.
@@ -20020,9 +20121,9 @@ def _draw_game_review_coach_character(
             pygame.draw.line(
                 canvas,
                 (125, 210, 255, int(120 + 120 * mouth_open)),
-                (int(round(_wx * scale)), int(round((mouth_y - _wh * 0.5) * scale))),
-                (int(round(_wx * scale)), int(round((mouth_y + _wh * 0.5) * scale))),
-                max(1, int(round(1.6 * scale))),
+                p(_wx, mouth_y - _wh * 0.5),
+                p(_wx, mouth_y + _wh * 0.5),
+                max(1, int(round(1.6 * sx))),
             )
     if reaction == "best":
         # One continuous smile silhouette, rather than overlapping arcs,
@@ -20929,6 +21030,115 @@ def _draw_game_review_coach_character(
 
     rendered = pygame.transform.smoothscale(canvas, rect.size)
     surface.blit(rendered, rect.topleft)
+
+
+def _draw_game_review_coach_character(
+    surface, rect, reaction, time_ms=None, mouth_open=0.0
+):
+    if rect.width < 16 or rect.height < 16:
+        return
+    if time_ms is None:
+        time_ms = pygame.time.get_ticks()
+    reaction = reaction if reaction in GAME_REVIEW_RATINGS else "thinking"
+    try:
+        mouth_open = max(0.0, min(1.0, float(mouth_open)))
+    except (TypeError, ValueError):
+        mouth_open = 0.0
+
+    scale = min(rect.width / 120.0, rect.height / 132.0)
+    width, height = max(1, int(120 * scale)), max(1, int(132 * scale))
+    sprite = pygame.Surface((width, height), pygame.SRCALPHA)
+    ox = (width - int(120 * scale)) // 2
+    bob = math.sin(time_ms / 650.0) * 0.8
+    cx, cy = 60.0, 54.0 + bob
+    colours = {
+        "skin": (225, 179, 143), "skin_shadow": (190, 135, 105),
+        "hair": (69, 46, 36), "hair_light": (105, 72, 53),
+        "jacket": (40, 89, 105), "jacket_light": (59, 116, 126),
+        "shirt": (235, 227, 205), "ink": (48, 40, 37),
+        "eye": (60, 53, 48), "accent": (223, 179, 91),
+    }
+
+    def pt(x, y):
+        return (int(ox + x * scale), int(y * scale))
+
+    def ellipse(colour, box, border=0):
+        x, y, w, h = box
+        pygame.draw.ellipse(
+            sprite, colour,
+            pygame.Rect(int(ox + x * scale), int(y * scale),
+                        max(1, int(w * scale)), max(1, int(h * scale))),
+            max(0, int(border * scale)),
+        )
+
+    def line(colour, points, thickness=1):
+        pygame.draw.lines(sprite, colour, False, [pt(x, y) for x, y in points],
+                          max(1, int(thickness * scale)))
+
+    def polygon(colour, points):
+        pygame.draw.polygon(sprite, colour, [pt(x, y) for x, y in points])
+
+    # Jacket, shirt and a small rook pin keep the silhouette readable at icon size.
+    polygon(colours["jacket"], [(19, 132), (26, 103), (43, 91), (77, 91), (94, 103), (101, 132)])
+    polygon(colours["jacket_light"], [(19, 132), (26, 103), (38, 97), (34, 132)])
+    polygon(colours["shirt"], [(48, 94), (72, 94), (60, 118)])
+    polygon(colours["accent"], [(60, 98), (57, 103), (60, 108), (63, 103)])
+    ellipse(colours["skin_shadow"], (52, 80 + bob, 16, 19))
+
+    # Ears and a compact, consistent head/neck silhouette.
+    ellipse(colours["skin"], (28, 45 + bob, 10, 17))
+    ellipse(colours["skin"], (82, 45 + bob, 10, 17))
+    ellipse(colours["skin"], (32, 20 + bob, 56, 72))
+    polygon(colours["skin"], [(36, 62 + bob), (84, 62 + bob), (77, 83 + bob), (60, 91 + bob), (43, 83 + bob)])
+
+    # Swept hair cap with clean temple edges; no heavy outlines or shine layers.
+    ellipse(colours["hair"], (29, 10 + bob, 62, 47))
+    polygon(colours["skin"], [(32, 35 + bob), (88, 32 + bob), (84, 72 + bob), (76, 81 + bob), (44, 81 + bob), (36, 70 + bob)])
+    polygon(colours["hair"], [(31, 43 + bob), (32, 25 + bob), (42, 13 + bob), (66, 10 + bob), (86, 19 + bob), (91, 33 + bob), (77, 27 + bob), (65, 23 + bob), (49, 30 + bob)])
+    line(colours["hair_light"], [(43, 18 + bob), (57, 14 + bob), (73, 16 + bob)], 2)
+    polygon(colours["hair"], [(33, 34 + bob), (41, 30 + bob), (42, 59 + bob), (36, 56 + bob)])
+    polygon(colours["hair"], [(87, 32 + bob), (80, 30 + bob), (79, 57 + bob), (85, 55 + bob)])
+
+    # Brows and eyes change subtly with the evaluation, without detached parts.
+    expression = {
+        "best": 3, "brilliant": 4, "excellent": 2, "great": 2,
+        "good": 1, "book": 1, "thinking": 0, "forced": 0,
+        "inaccuracy": -1, "miss": -2, "mistake": -2, "blunder": -3,
+    }.get(reaction, 0)
+    eye_y = 49 + bob
+    eye_gap = 12
+    brow_lift = expression * 0.7
+    for side in (-1, 1):
+        ex = cx + side * eye_gap
+        line(colours["hair"], [(ex - 5, eye_y - 7 - brow_lift), (ex + 4, eye_y - 8 + brow_lift)], 1.7)
+        ellipse((248, 239, 221), (ex - 4, eye_y - 2, 8, 5))
+        ellipse(colours["eye"], (ex - 1.2, eye_y - 1.3, 2.8, 3.4))
+        ellipse((255, 255, 255), (ex - 0.6, eye_y - 0.7, 0.9, 1.0))
+
+    # Nose and one mouth per pose; speaking animation only opens that same mouth.
+    line(colours["skin_shadow"], [(60, 51 + bob), (57, 63 + bob), (61, 65 + bob)], 1)
+    mouth_y = 73 + bob
+    mouth_colour = (117, 62, 52)
+    if mouth_open > 0.04:
+        mouth_h = 2.0 + mouth_open * 7.0
+        ellipse(mouth_colour, (52, mouth_y - mouth_h / 2, 16, mouth_h))
+        if mouth_open > 0.45:
+            ellipse((231, 213, 190), (55, mouth_y - mouth_h * 0.36, 10, max(1, mouth_h * 0.18)))
+    elif reaction in ("best", "brilliant", "excellent", "great", "good", "book"):
+        line(mouth_colour, [(52, mouth_y), (56, mouth_y + 2), (61, mouth_y + 2.5), (66, mouth_y + 2), (69, mouth_y)], 1.4)
+    elif reaction in ("mistake", "miss", "blunder", "inaccuracy"):
+        line(mouth_colour, [(52, mouth_y + 2), (57, mouth_y), (62, mouth_y - 0.5), (68, mouth_y + 2)], 1.4)
+    else:
+        line(mouth_colour, [(54, mouth_y + 1), (67, mouth_y + 1)], 1.2)
+
+    # A single quiet prop distinguishes opening/book reactions.
+    if reaction == "book":
+        polygon((107, 75, 53), [(27, 101), (57, 105), (57, 122), (29, 118)])
+        polygon((128, 91, 62), [(58, 105), (89, 101), (87, 118), (58, 122)])
+        line((231, 215, 176), [(58, 106), (58, 121)], 1)
+
+    sprite_rect = sprite.get_rect(midbottom=rect.midbottom)
+    surface.blit(sprite, sprite_rect)
 
 
 def _draw_game_review_button(screen, rect, hovered):
@@ -22696,9 +22906,9 @@ def draw_polished_always_on_top_toggle(screen, rect, on, anim, hovered):
 def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
     return pygame.Rect(
         (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        150 + offset_y,
+        140 + offset_y,
         AUTOPLAY_SETTINGS_ROW_WIDTH,
-        94,
+        78,
     )
 
 
@@ -22773,13 +22983,13 @@ def get_auto_move_color_rects(offset_x=0, offset_y=0):
     w, h, gap = 190, 46, 15
     total = 3 * w + 2 * gap
     x0 = WIDTH // 2 - total // 2 + offset_x
-    return {c: pygame.Rect(x0 + i * (w + gap), 402 + offset_y, w, h) for i, c in enumerate(colors)}
+    return {c: pygame.Rect(x0 + i * (w + gap), 262 + offset_y, w, h) for i, c in enumerate(colors)}
 
 
 def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
     """Expanded Auto-play card below Board Detection (dynamic Y)."""
     bd_rect = get_board_detection_button_rect(offset_x, offset_y)
-    return pygame.Rect(bd_rect.x, bd_rect.bottom + 42, bd_rect.width, 128)
+    return pygame.Rect(bd_rect.x, bd_rect.bottom + 38, bd_rect.width, 124)
 
 
 def get_autoplay_depth_rects(offset_x=0, offset_y=0):
@@ -22891,18 +23101,18 @@ def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
 def get_autoplay_setup_rects(offset_x=0, offset_y=0):
     """Side/source setup controls in the expanded Auto-play card."""
     row = get_autoplay_toggle_rect(offset_x, offset_y)
-    strip_y = row.bottom - 39
-    side_label = pygame.Rect(row.x + 18, strip_y, 40, 29)
+    strip_y = row.bottom - 32
+    side_label = pygame.Rect(row.x + 16, strip_y, 34, 24)
     side = {}
-    side_x = row.x + 62
-    for name, width in (("ask", 56), ("white", 62), ("black", 62)):
-        side[name] = pygame.Rect(side_x, strip_y, width, 29)
-        side_x += width + 6
+    side_x = row.x + 52
+    for name, width in (("ask", 48), ("white", 54), ("black", 54)):
+        side[name] = pygame.Rect(side_x, strip_y, width, 24)
+        side_x += width + 4
 
-    source_label = pygame.Rect(row.x + 272, strip_y, 54, 29)
-    source_ask = pygame.Rect(row.x + 332, strip_y, 56, 29)
-    source_saved = pygame.Rect(source_ask.right + 6, strip_y, 64, 29)
-    source_choose = pygame.Rect(source_saved.right + 6, strip_y, 76, 29)
+    source_label = pygame.Rect(row.x + 240, strip_y, 48, 24)
+    source_ask = pygame.Rect(row.x + 290, strip_y, 48, 24)
+    source_saved = pygame.Rect(source_ask.right + 4, strip_y, 56, 24)
+    source_choose = pygame.Rect(source_saved.right + 4, strip_y, 70, 24)
     return {
         "row": row,
         "strip": pygame.Rect(row.x + 18, strip_y, row.width - 36, 29),
@@ -22925,8 +23135,8 @@ def _draw_autoplay_setup_controls(screen, mouse_pos, offset_x=0, offset_y=0):
     pygame.draw.line(
         screen,
         (92, 96, 112),
-        (row.x + 18, row.bottom - 48),
-        (row.right - 18, row.bottom - 48),
+        (row.x + 16, row.bottom - 39),
+        (row.right - 16, row.bottom - 39),
         1,
     )
     for label, rect in (
@@ -23062,9 +23272,9 @@ def get_advisor_toggle_rect(offset_x=0, offset_y=0):
     """
     return pygame.Rect(
         (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        106 + offset_y,
+        88 + offset_y,
         AUTOPLAY_SETTINGS_ROW_WIDTH,
-        40,
+        32,
     )
 
 
@@ -24233,7 +24443,7 @@ def _draw_vision_model_selector(screen, mouse_pos, offset_x=0, offset_y=0):
 def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
-    intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
+    intro = font_small.render("Live board tools and detection", True, TEXT_MUTED)
     screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 84 + offset_y))
 
     advisor_shown_on = bool(
@@ -24245,6 +24455,8 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         )
     )
     advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
+    advisor_status = "Idle"
+    advisor_colour = TEXT_ACCENT if advisor_shown_on else TEXT_MUTED
     if not config.get("gui_combined_mode", 0):
         draw_toggle_row(
             screen,
@@ -24260,7 +24472,11 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
             advisor_colour = TEXT_STATUS
         elif _advisor.get("status"):
             advisor_status = _advisor["status"]
-        advisor_colour = TEXT_ACCENT if advisor_shown_on else TEXT_MUTED
+        advisor_colour = (
+            TEXT_STATUS if _advisor.get("error")
+            else TEXT_ACCENT if advisor_shown_on
+            else TEXT_MUTED
+        )
     else:
         advisor_status = "cliv-gui live overlay"
         advisor_colour = TEXT_MUTED
@@ -24288,8 +24504,9 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
 
     line1 = font_tiny.render("When on, the engine's best move is played for you", True, TEXT_MUTED)
     line2 = font_tiny.render(f"as soon as the search reaches depth {threshold}.", True, TEXT_MUTED)
-    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, 254 + offset_y))
-    screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, 272 + offset_y))
+    hint_y = 344 if auto_move_enabled else 254
+    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, hint_y + offset_y))
+    screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, hint_y + 18 + offset_y))
 
     _am_row, _am_track, _am_val, _ = get_auto_move_depth_rects(offset_x, offset_y)
     pygame.draw.rect(screen, (36, 38, 48), _am_track, border_radius=3)
@@ -24305,7 +24522,7 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
 
     if auto_move_enabled:
         label = font_small.render("Auto-move for", True, TEXT_COLOR)
-        screen.blit(label, (WIDTH // 2 - label.get_width() // 2 + offset_x, 376 + offset_y))
+        screen.blit(label, (WIDTH // 2 - label.get_width() // 2 + offset_x, 230 + offset_y))
         for color, crect in get_auto_move_color_rects(offset_x, offset_y).items():
             selected = color == auto_move_color
             hovered = idle and crect.collidepoint(mx, my)
@@ -24316,7 +24533,7 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
             screen.blit(txt, txt.get_rect(center=crect.center))
         status = auto_move_status_text or "Active"
         status_s = font_tiny.render(status, True, TEXT_ACCENT)
-        screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 464 + offset_y))
+        screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 316 + offset_y))
 
     # Board Detection action card (not a toggle): opens the window picker.
     bd_rect = get_board_detection_button_rect(offset_x, offset_y)
@@ -24387,7 +24604,7 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
         screen,
         autoplay_rect,
         "Combined Mode" if config.get("gui_combined_mode", 0) else "Auto-play",
-        _elide_text(autoplay_setup_subtitle, font_tiny, 360),
+        _elide_text(autoplay_setup_subtitle, font_tiny, 220),
         (autoplay_shown_on or advisor_shown_on) if config.get("gui_combined_mode", 0) else autoplay_shown_on,
         autoplay_anim,
         idle and autoplay_rect.collidepoint(mx, my),
@@ -32973,8 +33190,6 @@ def handle_menu_click(mx, my):
             return True
         if get_autoplay_toggle_rect().collidepoint(mx, my):
             toggle_autoplay()
-            if config.get("gui_combined_mode", 0):
-                toggle_advisor()
             return True
         if get_use_package_toggle_rect().collidepoint(mx, my):
             set_use_package(not use_package_enabled)
@@ -33120,24 +33335,26 @@ def draw_edit_board_button(screen, mouse_pos):
 
 
 def _edit_board_layout():
-    w, h = 540, 580
+    w, h = 460, 516
     x = WIDTH // 2 - w // 2
     y = HEIGHT // 2 - h // 2
-    sq = 48
+    sq = 40
     bx = WIDTH // 2 - (sq * 8) // 2
-    by = y + 96
+    by = y + 92
     board_rect = pygame.Rect(bx, by, sq * 8, sq * 8)
-    top_palette = [(bx + i * (sq + 8), by - sq - 10, k) for i, k in enumerate(("bk", "bq", "br", "bb", "bn", "bp"))]
-    bot_palette = [(bx + i * (sq + 8), by + sq * 8 + 10, k) for i, k in enumerate(("wk", "wq", "wr", "wb", "wn", "wp"))]
-    btn_y = by + sq * 8 + sq + 24
-    btns = {
-        "clear": pygame.Rect(x + 20, btn_y, 76, 30),
-        "start": pygame.Rect(x + 104, btn_y, 90, 30),
-        "fen": pygame.Rect(x + 202, btn_y, 92, 30),
-        "pgn": pygame.Rect(x + 302, btn_y, 92, 30),
-        "apply": pygame.Rect(x + 402, btn_y, 60, 30),
-        "cancel": pygame.Rect(x + 468, btn_y, 56, 30),
-    }
+    palette_gap = 8
+    palette_x = WIDTH // 2 - (6 * sq + 5 * palette_gap) // 2
+    top_palette = [(palette_x + i * (sq + palette_gap), by - sq - 8, k) for i, k in enumerate(("bk", "bq", "br", "bb", "bn", "bp"))]
+    bot_palette = [(palette_x + i * (sq + palette_gap), by + sq * 8 + 8, k) for i, k in enumerate(("wk", "wq", "wr", "wb", "wn", "wp"))]
+    btn_y = by + sq * 9 + 22
+    button_specs = (("clear", 62), ("start", 64), ("fen", 68), ("pgn", 68), ("apply", 60), ("cancel", 64))
+    gap = 5
+    total_width = sum(width for _, width in button_specs) + gap * (len(button_specs) - 1)
+    button_x = x + (w - total_width) // 2
+    btns = {}
+    for key, width in button_specs:
+        btns[key] = pygame.Rect(button_x, btn_y, width, 28)
+        button_x += width + gap
     return pygame.Rect(x, y, w, h), sq, board_rect, top_palette, bot_palette, btns
 
 
@@ -33155,11 +33372,11 @@ def draw_edit_board_dialog(screen):
     pygame.draw.rect(screen, (42, 44, 54), panel, border_radius=12)
     pygame.draw.rect(screen, (110, 125, 165), panel, 2, border_radius=12)
 
-    title = font_small.render("Edit Board (drag pieces on/off)", True, TEXT_COLOR)
+    title = font_small.render("Edit Board · Drag to place/remove", True, TEXT_COLOR)
     screen.blit(title, (panel.x + 18, panel.y + 12))
     if _edit_board_status:
         st = font_tiny.render(_edit_board_status, True, (255, 200, 110))
-        screen.blit(st, (panel.right - st.get_width() - 18, panel.y + 15))
+        screen.blit(st, (panel.right - st.get_width() - 18, panel.y + 40))
 
     for px, py, pkey in top_palette + bot_palette:
         pr = pygame.Rect(px, py, sq, sq)
@@ -33326,6 +33543,8 @@ _history_hold_last_step_ms = 0
 _swing_angle = 0.0
 _swing_vel = 0.0
 _swing_last_x = None
+_swing_last_time = None
+_swing_mouse_velocity = 0.0
 _mate_anim_start_ms = None
 
 
@@ -34158,17 +34377,41 @@ def draw_gui(
                     drag_sq, mouse_pos
                 )
                 global _swing_angle, _swing_vel, _swing_last_x
+                global _swing_last_time, _swing_mouse_velocity
                 if config.get("gui_swing", 0):
-                    if _swing_last_x is None:
+                    _now = time.perf_counter()
+                    if _swing_last_x is None or _swing_last_time is None:
                         _swing_last_x = float(mx)
-                    _dx = float(mx) - _swing_last_x
+                        _swing_last_time = _now
+                        _swing_mouse_velocity = 0.0
+                    _dt = max(1.0 / 240.0, min(1.0 / 30.0, _now - _swing_last_time))
+                    _raw_velocity = (float(mx) - _swing_last_x) / _dt
+                    _swing_mouse_velocity += (_raw_velocity - _swing_mouse_velocity) * (
+                        1.0 - math.exp(-_dt / 0.055)
+                    )
                     _swing_last_x = float(mx)
-                    _swing_vel += (-_dx * 0.22 - _swing_angle * 0.24)
-                    _swing_vel *= 0.80
-                    _swing_angle = max(-24.0, min(24.0, _swing_angle + _swing_vel))
-                    grab_rotation += _swing_angle
+                    _swing_last_time = _now
+
+                    # Integrate a damped, mouse-driven pendulum in small fixed steps.
+                    remaining = _dt
+                    while remaining > 0.0:
+                        step = min(remaining, 1.0 / 240.0)
+                        _omega = 15.0
+                        _damping = 0.72
+                        _acceleration = (
+                            -(_omega * _omega) * _swing_angle
+                            - 2.0 * _damping * _omega * _swing_vel
+                            - 0.0018 * _swing_mouse_velocity
+                        )
+                        _swing_vel += _acceleration * step
+                        _swing_angle += _swing_vel * step
+                        remaining -= step
+                    _swing_angle = max(-0.42, min(0.42, _swing_angle))
+                    grab_rotation += math.degrees(_swing_angle)
                 else:
                     _swing_last_x = None
+                    _swing_last_time = None
+                    _swing_mouse_velocity = 0.0
                     _swing_angle = 0.0
                     _swing_vel = 0.0
                 held_image, grab_x, grab_y = _transform_dragged_piece_image(
@@ -34501,6 +34744,15 @@ def main():
         check_effect.reset()
         engine_thread.update_position(board)
 
+    def pop_legal_redo_move():
+        if not history_redo:
+            return None
+        move = history_redo[-1]
+        if move not in board.legal_moves:
+            history_redo.clear()
+            return None
+        return history_redo.pop()
+
     def game_review_step(delta, *, from_playback=False):
         """Move one ply through the reviewed line using normal history."""
         if anim_mgr.move_anim is not None:
@@ -34517,15 +34769,15 @@ def main():
             play_sound("move")
             changed = True
         elif delta > 0 and history_redo:
-            move = history_redo[-1]
-            board_before = board.copy()
-            add_move_animation_for_move(
-                anim_mgr, board, move, reverse=False
-            )
-            history_redo.pop()
-            board.push(move)
-            play_move_sound(board_before, move)
-            changed = True
+            move = pop_legal_redo_move()
+            if move is not None:
+                board_before = board.copy()
+                add_move_animation_for_move(
+                    anim_mgr, board, move, reverse=False
+                )
+                board.push(move)
+                play_move_sound(board_before, move)
+                changed = True
         if changed:
             sync_after_history_step()
             mark_game_review_advanced()
@@ -34545,7 +34797,10 @@ def main():
         while len(board.move_stack) > target_ply:
             history_redo.append(board.pop())
         while len(board.move_stack) < target_ply and history_redo:
-            board.push(history_redo.pop())
+            move = pop_legal_redo_move()
+            if move is None:
+                break
+            board.push(move)
         sync_after_history_step()
         mark_game_review_advanced()
         return True
@@ -34757,6 +35012,7 @@ def main():
         _autoplay_poll_runner.invalidate()
         _autoplay.update({
             "running": True,
+            "sync_started_at": 0.0,
             "board_rect": result.get("board_rect"),
             "window_rect": result.get("window_rect"),
             "window_size": result.get("window_size"),
@@ -34934,6 +35190,49 @@ def main():
             )
         return True
 
+    def _autoplay_rescan_if_stuck(now, message):
+        started = float(_autoplay.get("sync_started_at", 0.0) or 0.0)
+        if not started:
+            _autoplay["sync_started_at"] = now
+            return False
+        if now - started < AUTOPLAY_SYNC_RESCAN_SECONDS:
+            return False
+        rescans = int(_autoplay.get("sync_rescans", 0) or 0)
+        if rescans >= LIVE_SYNC_RESCAN_LIMIT:
+            stop_autoplay(
+                "Auto-play could not resync after repeated full-board scans.",
+                error=True,
+            )
+            return True
+        _autoplay["sync_rescans"] = rescans + 1
+        window_info = _autoplay.get("window") or _autoplay.get("pending_window")
+        if not window_info:
+            stop_autoplay("Auto-play cannot rescan without a selected window.", error=True)
+            return True
+        _autoplay_set_status(f"{message} Rescanning the full board...")
+        start_autoplay_scan(_autoplay.get("side", "white"))
+        return True
+
+    def _advisor_rescan_if_stuck(now):
+        started = float(_advisor.get("sync_started_at", 0.0) or 0.0)
+        if not started:
+            _advisor["sync_started_at"] = now
+            return False
+        if now - started < ADVISOR_SYNC_RESCAN_SECONDS:
+            return False
+        rescans = int(_advisor.get("sync_rescans", 0) or 0)
+        if rescans >= LIVE_SYNC_RESCAN_LIMIT:
+            stop_advisor(
+                "Advisor Mode could not resync after repeated full-board scans.",
+                error=True,
+            )
+            return True
+        _advisor["sync_rescans"] = rescans + 1
+        _advisor_set_status("Advisor is stuck syncing. Rescanning the full board...")
+        if not start_advisor_scan(_advisor.get("side", "white")):
+            stop_advisor("Advisor Mode could not restart its full-board scan.", error=True)
+        return True
+
     def update_autoplay():
         # F8 is the universal Windows Auto-play toggle, useful while the
         # chess window (not ChessBotV) has keyboard focus during a game.
@@ -35103,6 +35402,8 @@ def main():
                 _autoplay_set_status("Auto-play waiting: could not screenshot the target board; retrying...")
                 return
             if not changed:
+                _autoplay["sync_started_at"] = 0.0
+                _autoplay["sync_rescans"] = 0
                 _autoplay_set_status("Auto-play waiting for the opponent (board unchanged)...")
                 return
             move = None
@@ -35119,10 +35420,13 @@ def main():
                 # Keep a GUI fallback only if that search itself failed.
                 move = _autoplay_find_legal_move(board, candidate)
             if move is None:
-                _autoplay_set_status(
-                    f"Auto-play saw {len(changed)} changed square(s); waiting for the move to settle..."
+                _autoplay_rescan_if_stuck(
+                    now,
+                    f"Auto-play saw {len(changed)} changed square(s); waiting for the move to settle...",
                 )
                 return
+            _autoplay["sync_started_at"] = 0.0
+            _autoplay["sync_rescans"] = 0
             move_san = board.san(move)
             if not autoplay_push_move(move):
                 stop_autoplay("Auto-play lost sync while applying the opponent move.", error=True)
@@ -35177,11 +35481,11 @@ def main():
                             "Auto-play could not retry the drag in the target window.",
                             error=True,
                         )
-                elif elapsed >= 2.8:
-                    stop_autoplay(
-                        "Auto-play stopped: the dragged move did not appear on the live board.",
-                        error=True,
-                    )
+                elif _autoplay_rescan_if_stuck(
+                    now,
+                    "Auto-play move was not confirmed after retrying.",
+                ):
+                    return
                 else:
                     _autoplay_set_status("Auto-play verifying move (board unchanged yet)...")
                 return
@@ -35262,13 +35566,12 @@ def main():
                 )
                 return
 
-            if elapsed >= 4.0:
-                stop_autoplay(
-                    "Auto-play stopped: the live board does not match the dragged move. Rescan to resync.",
-                    error=True,
-                )
-            else:
-                _autoplay_set_status("Auto-play verifying move; waiting for the board to settle...")
+            if _autoplay_rescan_if_stuck(
+                now,
+                "Auto-play move did not match the live board; attempting recovery.",
+            ):
+                return
+            _autoplay_set_status("Auto-play verifying move; waiting for the board to settle...")
             return
 
     # --- Advisor Mode live-window state machine ---
@@ -35426,6 +35729,8 @@ def main():
         _advisor_poll_runner.invalidate()
         _advisor.update({
             "running": True,
+            "sync_started_at": 0.0,
+            "sync_rescans": 0,
             "state": "live",
             "board_rect": result.get("board_rect"),
             "window_rect": result.get("window_rect"),
@@ -35661,6 +35966,7 @@ def main():
                         _advisor_set_status(
                             "Advisor syncing the board; waiting for it to settle..."
                         )
+                        _advisor_rescan_if_stuck(time.monotonic())
 
         advisor_refresh_overlay()
 
@@ -35886,13 +36192,19 @@ def main():
                     show_edit_board_dialog = True
                     continue
 
-                if not settings_menu_open and not game_review_is_active() and mx >= SIDE_PANEL_X:
+                if not settings_menu_open and mx >= SIDE_PANEL_X:
                     _handled_side = False
                     for _hrect, _hply in _side_panel_history_hits:
                         if _hrect.collidepoint(mx, my):
-                            view_ply = _hply if _hply < len(board.move_stack) else None
-                            selected_sq = None
-                            dragging = False
+                            game_review_jump_to_ply(_hply)
+                            view_ply = None
+                            _side_panel_history_scroll = max(
+                                0,
+                                min(
+                                    _side_panel_history_max_scroll,
+                                    (_hply // 2) - max(0, _side_panel_history_max_scroll - 2),
+                                ),
+                            )
                             _handled_side = True
                             break
                     if _handled_side:
@@ -35982,25 +36294,27 @@ def main():
                         continue
                     if promotion_pending is not None:
                         rects = get_promotion_rects()
-                        handled = False
+                        if not isinstance(promotion_pending, dict):
+                            promotion_pending = None
+                            continue
+                        from_sq = promotion_pending.get("from_sq")
+                        to_sq = promotion_pending.get("to_sq")
+                        if not is_promotion_move(board, from_sq, to_sq):
+                            promotion_pending = None
+                            selected_sq = None
+                            continue
                         for idx, rect in enumerate(rects):
                             if rect.collidepoint(mx, my):
-                                promo_piece = PROMOTION_CHOICES[idx]
-                                if try_execute_promotion(board, anim_mgr, engine_thread, promotion_pending["from_sq"], promotion_pending["to_sq"], promo_piece, animate=True):
+                                if idx < len(PROMOTION_CHOICES) and try_execute_promotion(
+                                    board, anim_mgr, engine_thread, from_sq, to_sq,
+                                    PROMOTION_CHOICES[idx], animate=True,
+                                ):
                                     note_new_move()
-                                selected_sq = None
-                                dragging = False
-                                drag_sq = None
-                                drag_offset = None
-                                promotion_pending = None
-                                handled = True
-                                break
-                        if handled:
-                            continue
-                        outside = True
-                        for rect in rects:
-                            if rect.collidepoint(mx, my):
-                                outside = False
+                                    selected_sq = None
+                                    dragging = False
+                                    drag_sq = None
+                                    drag_offset = None
+                                    promotion_pending = None
                                 break
                         continue
 
@@ -36259,14 +36573,15 @@ def main():
                     else:
                         # Next move — only if it has actually been played
                         if history_redo:
-                            next_move = history_redo[-1]
-                            board_before = board.copy()
-                            add_move_animation_for_move(anim_mgr, board, next_move, reverse=False)
-                            board.push(history_redo.pop())
-                            play_move_sound(board_before, next_move)
-                            sync_after_history_step()
-                            if game_review_is_active():
-                                set_game_review_playing(False)
+                            next_move = pop_legal_redo_move()
+                            if next_move is not None:
+                                board_before = board.copy()
+                                add_move_animation_for_move(anim_mgr, board, next_move, reverse=False)
+                                board.push(next_move)
+                                play_move_sound(board_before, next_move)
+                                sync_after_history_step()
+                                if game_review_is_active():
+                                    set_game_review_playing(False)
                 elif event.key == pygame.K_f and menu_anim_progress == 0 and not show_newgame_confirm:
                     toggle_flip_board()
                 elif event.key == pygame.K_e and menu_anim_progress == 0 and not show_newgame_confirm:
@@ -36299,17 +36614,15 @@ def main():
                         if game_review_is_active():
                             set_game_review_playing(False)
                     elif _history_hold_dir == 1 and history_redo:
-                        next_move = history_redo[-1]
-                        if next_move in board.legal_moves:
+                        next_move = pop_legal_redo_move()
+                        if next_move is not None:
                             board_before = board.copy()
                             add_move_animation_for_move(anim_mgr, board, next_move, reverse=False)
-                            board.push(history_redo.pop())
+                            board.push(next_move)
                             play_move_sound(board_before, next_move)
                             sync_after_history_step()
                             if game_review_is_active():
                                 set_game_review_playing(False)
-                        else:
-                            history_redo.clear()
 
 
         draw_gui(
