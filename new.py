@@ -11213,6 +11213,12 @@ _GUI_SECTIONS = [
             ("gui_rule_always_queen", "Always Queen on Promotion", "toggle", "Automatically promote to a Queen without a dialog"),
         ],
     ),
+    (
+        "Advisor",
+        [
+            ("autoplay_instant_checking", "Faster Advisor", "toggle", "Zero screenshot delay in Advisor/Auto-Play; ideal for bullet"),
+        ],
+    ),
 ]
 
 
