@@ -18251,7 +18251,7 @@ def open_board_detection_dialog(purpose="detect"):
 
 def get_board_detection_dialog_rects():
     e = cubic_ease_in_out(max(0.0, min(1.0, board_detection_dialog_anim)))
-    w, h = 680, 720
+    w, h = 660, 620
     x = WIDTH // 2 - w // 2
     y = HEIGHT // 2 - h // 2 - int((1 - e) * 18)
     panel = pygame.Rect(x, y, w, h)
@@ -18261,18 +18261,18 @@ def get_board_detection_dialog_rects():
     visible = board_detection_windows[start:start + BOARD_DETECTION_WINDOWS_PER_PAGE]
     for index, _window in enumerate(visible):
         card = pygame.Rect(
-            panel.x + 32 + (index % 2) * (300 + 16),
-            panel.y + 108 + (index // 2) * (150 + 14),
-            300,
-            150,
+            panel.x + 28 + (index % 2) * (294 + 16),
+            panel.y + 110 + (index // 2) * (132 + 12),
+            294,
+            132,
         )
         cards.append((start + index, card))
 
-    prev_rect = pygame.Rect(panel.x + 32, panel.y + 66, 74, 30)
-    next_rect = pygame.Rect(panel.x + 114, panel.y + 66, 74, 30)
-    refresh_rect = pygame.Rect(panel.x + 32, panel.bottom - 62, 130, 40)
-    cancel_rect = pygame.Rect(panel.centerx - 65, panel.bottom - 62, 130, 40)
-    detect_rect = pygame.Rect(panel.right - 32 - 170, panel.bottom - 62, 170, 40)
+    prev_rect = pygame.Rect(panel.x + 28, panel.y + 72, 72, 28)
+    next_rect = pygame.Rect(panel.x + 108, panel.y + 72, 72, 28)
+    refresh_rect = pygame.Rect(panel.x + 28, panel.bottom - 54, 126, 38)
+    cancel_rect = pygame.Rect(panel.centerx - 63, panel.bottom - 54, 126, 38)
+    detect_rect = pygame.Rect(panel.right - 28 - 166, panel.bottom - 54, 166, 38)
     return panel, cards, refresh_rect, cancel_rect, detect_rect, prev_rect, next_rect
 
 
@@ -18317,7 +18317,7 @@ def draw_board_detection_dialog(screen):
         else "Board Detection"
     )
     title = font_large.render(title_text, True, TEXT_COLOR)
-    screen.blit(title, (panel.x + 32, panel.y + 20))
+    screen.blit(title, (panel.x + 28, panel.y + 16))
     subtitle_text = (
         "Choose the window to broadcast on"
         if advisor_picker
@@ -18326,7 +18326,7 @@ def draw_board_detection_dialog(screen):
         else "Choose the window containing the chessboard"
     )
     subtitle = font_small.render(subtitle_text, True, TEXT_MUTED)
-    screen.blit(subtitle, (panel.x + 32, panel.y + 50))
+    screen.blit(subtitle, (panel.x + 28, panel.y + 44))
 
     page_count = max(
         1,
