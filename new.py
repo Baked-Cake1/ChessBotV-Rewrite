@@ -11217,6 +11217,7 @@ _GUI_SECTIONS = [
         "Advisor",
         [
             ("autoplay_instant_checking", "Faster Advisor", "toggle", "Zero screenshot delay in Advisor/Auto-Play; ideal for bullet"),
+            ("gui_combined_mode", "Combined Mode", "toggle", "Combine Auto-Play and Advisor Mode into a single toggle"),
         ],
     ),
 ]
