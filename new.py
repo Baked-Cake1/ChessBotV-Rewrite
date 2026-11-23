@@ -32958,6 +32958,8 @@ def handle_menu_click(mx, my):
             return True
         if get_autoplay_toggle_rect().collidepoint(mx, my):
             toggle_autoplay()
+            if config.get("gui_combined_mode", 0):
+                toggle_advisor()
             return True
         if get_use_package_toggle_rect().collidepoint(mx, my):
             set_use_package(not use_package_enabled)
