@@ -874,6 +874,7 @@ def save_config():
                 "gui_disable_legal_moves_anim",
                 "gui_rotate_piece_on_move",
                 "gui_swing",
+                "gui_combined_mode",
                 "gui_mate_animation",
                 "gui_rule_insufficient_material",
                 "gui_rule_king_capturing",
