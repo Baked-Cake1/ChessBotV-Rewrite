@@ -22094,9 +22094,11 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
                     2,
                 )
             for item in section["items"]:
-                if config.get("gui_combined_mode", 0) and item.get("key") == "advisor":
+                _ikey = str(item.get("key", "")).lower()
+                _ilbl = str(item.get("label", "")).lower()
+                if config.get("gui_combined_mode", 0) and (_ikey in ("advisor", "advisor_mode") or "advisor" in _ilbl):
                     continue
-                if config.get("gui_combined_mode", 0) and item.get("key") == "autoplay":
+                if config.get("gui_combined_mode", 0) and (_ikey in ("autoplay", "auto_play") or "auto-play" in _ilbl):
                     item = dict(item)
                     item["label"] = "Combined Mode"
                     item["description"] = "Auto-Play + Advisor Mode running together"
