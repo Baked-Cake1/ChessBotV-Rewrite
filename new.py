@@ -24234,7 +24234,8 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
     screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 84 + offset_y))
 
-    advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
+    if not config.get("gui_combined_mode", 0):
+        advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
     advisor_shown_on = bool(
         _advisor.get("enabled")
         or show_advisor_side_dialog
@@ -32875,7 +32876,7 @@ def handle_menu_click(mx, my):
             return True
 
     elif settings_menu_state == "autoplay_settings":
-        if get_advisor_toggle_rect().collidepoint(mx, my):
+        if not config.get("gui_combined_mode", 0) and get_advisor_toggle_rect().collidepoint(mx, my):
             toggle_advisor()
             return True
         if get_auto_move_toggle_rect().collidepoint(mx, my):
