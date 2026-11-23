@@ -24242,8 +24242,8 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
             and board_detection_picker_purpose == "advisor"
         )
     )
+    advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
     if not config.get("gui_combined_mode", 0):
-        advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
         draw_toggle_row(
             screen,
             advisor_rect,
