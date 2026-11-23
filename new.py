@@ -16913,7 +16913,7 @@ def request_autoplay_start():
             show_board_detection_dialog
             and board_detection_picker_purpose == "advisor"
         )
-    ):
+    ) and not config.get("gui_combined_mode", 0):
         message = "Stop Advisor Mode before starting Auto-play."
         _autoplay_set_status(message, error=message)
         return False
@@ -17234,7 +17234,7 @@ def toggle_autoplay():
             show_board_detection_dialog
             and board_detection_picker_purpose == "advisor"
         )
-    ):
+    ) and not config.get("gui_combined_mode", 0):
         message = "Stop Advisor Mode before starting Auto-play."
         _autoplay_set_status(message, error=message)
         return False
@@ -17355,7 +17355,7 @@ def request_advisor_start():
             show_board_detection_dialog
             and board_detection_picker_purpose == "autoplay"
         )
-    ):
+    ) and not config.get("gui_combined_mode", 0):
         message = "Stop Auto-play before starting Advisor Mode."
         _advisor_set_status(message, error=message)
         return False
