@@ -17201,11 +17201,11 @@ def restart_autoplay_scan():
     if not _autoplay.get("window"):
         return request_autoplay_start()
     _autoplay["enabled"] = True
-    if config.get("gui_combined_mode", 0) and not advisor_is_active() and window is not None:
+    if config.get("gui_combined_mode", 0) and not advisor_is_active():
         try:
-            start_advisor_on_window(window)
-        except Exception:
-            pass
+            start_advisor_scan(side=_autoplay.get("side"))
+        except Exception as _adv_err:
+            print(f"Combined Mode advisor start failed: {_adv_err}")
     return start_autoplay_scan(_autoplay.get("side", "white"))
 
 
