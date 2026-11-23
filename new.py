@@ -24234,8 +24234,6 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     intro = font_small.render("Engine assistance while you play", True, TEXT_MUTED)
     screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 84 + offset_y))
 
-    if not config.get("gui_combined_mode", 0):
-        advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
     advisor_shown_on = bool(
         _advisor.get("enabled")
         or show_advisor_side_dialog
@@ -24244,20 +24242,22 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
             and board_detection_picker_purpose == "advisor"
         )
     )
-    draw_toggle_row(
-        screen,
-        advisor_rect,
-        "Advisor Mode",
-        "",
-        advisor_shown_on,
-        advisor_anim,
-        idle and advisor_rect.collidepoint(mx, my),
-    )
-    if _advisor.get("error"):
-        advisor_status = _advisor["error"]
-        advisor_colour = TEXT_STATUS
-    elif _advisor.get("status"):
-        advisor_status = _advisor["status"]
+    if not config.get("gui_combined_mode", 0):
+        advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
+        draw_toggle_row(
+            screen,
+            advisor_rect,
+            "Advisor Mode",
+            "",
+            advisor_shown_on,
+            advisor_anim,
+            idle and advisor_rect.collidepoint(mx, my),
+        )
+        if _advisor.get("error"):
+            advisor_status = _advisor["error"]
+            advisor_colour = TEXT_STATUS
+        elif _advisor.get("status"):
+            advisor_status = _advisor["status"]
         advisor_colour = TEXT_ACCENT if advisor_shown_on else TEXT_MUTED
     else:
         advisor_status = "cliv-gui live overlay"
@@ -24374,9 +24374,9 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     draw_toggle_row(
         screen,
         autoplay_rect,
-        "Auto-play",
+        "Combined Mode" if config.get("gui_combined_mode", 0) else "Auto-play",
         _elide_text(autoplay_setup_subtitle, font_tiny, 360),
-        autoplay_shown_on,
+        (autoplay_shown_on or advisor_shown_on) if config.get("gui_combined_mode", 0) else autoplay_shown_on,
         autoplay_anim,
         idle and autoplay_rect.collidepoint(mx, my),
     )
