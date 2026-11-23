@@ -17282,6 +17282,8 @@ def _advisor_set_status(status, error=""):
 
 
 def stop_advisor(reason="Advisor Mode stopped", error=False):
+    if config.get("gui_combined_mode", 0) and isinstance(reason, str):
+        reason = reason.replace("Advisor Mode", "Combined Mode")
     """Stop Advisor, destroy its overlay, and forget the target window."""
     global show_advisor_side_dialog
     global show_board_detection_dialog, board_detection_picker_purpose
@@ -22696,15 +22698,10 @@ def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
 
 
 def get_auto_move_depth_rects(offset_x=0, offset_y=0):
-    """Row, slider track, and value chip for Auto-Move's target depth."""
-    row = pygame.Rect(
-        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        304 + offset_y,
-        AUTOPLAY_SETTINGS_ROW_WIDTH,
-        58,
-    )
-    track = pygame.Rect(row.right - 260, row.centery - 3, 170, 6)
-    value = pygame.Rect(row.right - 78, row.centery - 16, 62, 32)
+    """Row, slider track, and value chip built into Auto-Move's toggle row."""
+    row = get_auto_move_toggle_rect(offset_x, offset_y)
+    track = pygame.Rect(row.right - 255, row.centery - 3, 120, 6)
+    value = pygame.Rect(row.right - 128, row.centery - 14, 48, 28)
     return row, track, value, pygame.Rect(0, 0, 0, 0)
 
 
@@ -24289,7 +24286,17 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
     screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, 254 + offset_y))
     screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, 272 + offset_y))
 
-    _draw_auto_move_depth_row(screen, offset_x, offset_y, idle=idle)
+    _am_row, _am_track, _am_val, _ = get_auto_move_depth_rects(offset_x, offset_y)
+    pygame.draw.rect(screen, (36, 38, 48), _am_track, border_radius=3)
+    _am_frac = max(0.0, min(1.0, float(auto_move_depth) / 40.0))
+    _am_fill = int(round(_am_track.width * _am_frac))
+    if _am_fill > 0:
+        pygame.draw.rect(screen, (95, 145, 245), (_am_track.x, _am_track.y, _am_fill, _am_track.height), border_radius=3)
+    pygame.draw.circle(screen, (235, 240, 255), (_am_track.x + _am_fill, _am_track.centery), 7)
+    pygame.draw.rect(screen, (42, 44, 56), _am_val, border_radius=7)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, _am_val, 1, border_radius=7)
+    _am_vs = font_tiny.render("Auto" if auto_move_depth == 0 else str(auto_move_depth), True, TEXT_COLOR)
+    screen.blit(_am_vs, _am_vs.get_rect(center=_am_val.center))
 
     if auto_move_enabled:
         label = font_small.render("Auto-move for", True, TEXT_COLOR)
