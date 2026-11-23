@@ -22093,6 +22093,12 @@ def draw_analysis_content(screen, offset_x=0, offset_y=0):
                     2,
                 )
             for item in section["items"]:
+                if config.get("gui_combined_mode", 0) and item.get("key") == "advisor":
+                    continue
+                if config.get("gui_combined_mode", 0) and item.get("key") == "autoplay":
+                    item = dict(item)
+                    item["label"] = "Combined Mode"
+                    item["description"] = "Auto-Play + Advisor Mode running together"
                 rect = item["rect"]
                 if rect.bottom < viewport.y or rect.y > viewport.bottom:
                     continue
