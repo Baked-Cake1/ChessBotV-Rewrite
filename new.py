@@ -1156,6 +1156,18 @@ AUTOPLAY_POLL_SECONDS = 0.05
 AUTOPLAY_SYNC_RESCAN_SECONDS = 2.5
 ADVISOR_SYNC_RESCAN_SECONDS = 2.5
 LIVE_SYNC_RESCAN_LIMIT = 2
+# Auto-play never ends a live session just because the external board no
+# longer matches ChessBot. When the changed squares cannot be traced back
+# to a legal move it waits briefly for the position to settle, then
+# recaptures the whole board and re-imports it from its FEN. These delays
+# rate-limit that recovery: too short spins while a piece is mid-drag, too
+# long stalls a real game.
+AUTOPLAY_RESYNC_DELAY_SECONDS = 0.8
+AUTOPLAY_RESYNC_RETRY_SECONDS = 1.5
+# A recapture that cannot be read (an animation frame, an overlay, an
+# impossible FEN) is retried this many times before the session reports a
+# real error instead of spinning forever on an unreadable board.
+AUTOPLAY_SCAN_RETRY_LIMIT = 3
 # Bullet Auto-Play: fastest Auto-play preset. Zero poll delay, fast drags,
 # and a bounded think: search to depth 18 but stop at 3 s, whichever first.
 BULLET_AUTOPLAY_DEPTH = 18
@@ -1242,6 +1254,11 @@ _autoplay = {
     "pending_causes_checkmate": False,
     "sync_started_at": 0.0,
     "sync_rescans": 0,
+    "resync_requested": False,
+    "next_resync_at": 0.0,
+    "resync_reason": "",
+    "resync_count": 0,
+    "scan_failures": 0,
     "drag_attempts": 0,
     "drag_id": 0,
     "drag_running": False,
@@ -13814,6 +13831,40 @@ def _autoplay_fen_from_visual_grid(visual_grid, side):
     )
 
 
+def _autoplay_resync_turn(imported, previous_board):
+    """Pick whose turn it is when a live session re-imports its board.
+
+    One screenshot cannot show whose move it is. The recaptured placement
+    is matched against the position the session was tracking: an unchanged
+    board keeps the tracked side to move, and a board one or two legal
+    plies ahead takes the turn that line leaves behind. Anything
+    untraceable keeps the fresh-scan rule the caller already applied (the
+    player whose side Auto-play is on), because the live board is the
+    source of truth and the session must keep playing.
+    """
+    if previous_board is None:
+        return imported
+    target = imported.board_fen()
+    tracked = previous_board.copy(stack=False)
+    if tracked.board_fen() == target:
+        imported.turn = tracked.turn
+        return imported
+    try:
+        sequence = _advisor_find_move_sequence(
+            tracked, _autoplay_board_grid_from_board(imported), max_plies=2
+        )
+    except Exception:
+        sequence = None
+    if sequence:
+        for move in sequence:
+            if move not in tracked.legal_moves:
+                return imported
+            tracked.push(move)
+        if tracked.board_fen() == target:
+            imported.turn = tracked.turn
+    return imported
+
+
 def _autoplay_candidate_matches(candidate_grid, after_grid, before_grid):
     """True if a partially-observed grid uniquely supports an end grid.
 
@@ -17047,6 +17098,75 @@ def _autoplay_set_status(status, error=""):
     _autoplay["error"] = str(error or "")
 
 
+def _autoplay_request_resync(delay=None, reason=""):
+    """Keep a live session alive and schedule a full-board re-scan.
+
+    Auto-play treats the external board as the source of truth. Whenever
+    its changed squares cannot be traced back to a legal move, the session
+    is not stopped: the pending drag is dropped, the position is given a
+    moment to settle, and the whole board is recaptured and re-imported
+    from its FEN so play continues from whatever the board really shows.
+    """
+    if not _autoplay.get("enabled"):
+        return False
+    if delay is None:
+        delay = AUTOPLAY_RESYNC_DELAY_SECONDS
+    try:
+        delay = max(0.0, float(delay))
+    except Exception:
+        delay = AUTOPLAY_RESYNC_DELAY_SECONDS
+    if _autoplay.get("drag_running"):
+        # The pending move is being discarded; cancel its physical drag so
+        # the recovery does not wait for a move the board no longer wants.
+        _autoplay_invalidate_drag()
+    _autoplay.update({
+        "state": "resync_wait",
+        # Keep the session alive and its last good position on screen
+        # while the recovery runs; the recapture replaces them once it has
+        # something readable.
+        "running": True,
+        "resync_requested": True,
+        "resync_reason": str(reason or ""),
+        "next_resync_at": time.monotonic() + delay,
+        "resync_count": int(_autoplay.get("resync_count", 0) or 0) + 1,
+        "sync_started_at": 0.0,
+        "sync_rescans": 0,
+        "pending_move": None,
+        "pending_before_image": None,
+        "pending_before_grid": None,
+        "pending_causes_checkmate": False,
+        "drag_attempts": 0,
+    })
+    return True
+
+
+def _autoplay_recoverable_failure(message):
+    """Handle an unreadable recapture without ending a live game.
+
+    The first scan of a fresh session still reports its error, because
+    there is nothing to recover yet. A recapture inside a live game (whose
+    ``resync_count`` is set) retries a few times with a longer settle
+    delay instead, and only reports a real error once the board stays
+    unreadable.
+    """
+    attempts = int(_autoplay.get("scan_failures", 0) or 0) + 1
+    _autoplay["scan_failures"] = attempts
+    resuming = bool(
+        _autoplay.get("resync_count") or _autoplay.get("resync_requested")
+    )
+    if resuming and attempts <= AUTOPLAY_SCAN_RETRY_LIMIT:
+        _autoplay_request_resync(
+            delay=AUTOPLAY_RESYNC_RETRY_SECONDS,
+            reason=message,
+        )
+        _autoplay_set_status(
+            f"Auto-play could not read the board yet ({message}); "
+            "waiting and recapturing..."
+        )
+        return False
+    return stop_autoplay(message, error=True)
+
+
 def stop_autoplay(reason="Auto-play stopped", error=False):
     """Stop any scan/game loop and close Auto-play's modal dialogs."""
     global show_autoplay_side_dialog, show_autoplay_gameover_dialog
@@ -17067,6 +17187,11 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
         "pending_causes_checkmate": False,
         "game_result": None,
         "awaiting_f8_restart": False,
+        "resync_requested": False,
+        "resync_reason": "",
+        "next_resync_at": 0.0,
+        "resync_count": 0,
+        "scan_failures": 0,
     })
     _autoplay_set_status(reason, error=reason if error else "")
     # Leave Bullet Auto-Play's bounded search as soon as Auto-play stops so
@@ -17122,10 +17247,18 @@ def request_autoplay_start():
 
     _autoplay_invalidate_drag()
     _autoplay_poll_runner.invalidate()
+    # In Ask mode every fresh start asks for the side again; a side left
+    # over from the previous session must not answer for the user.
     _autoplay.update({
         "enabled": True,
         "running": False,
         "state": "choosing_window",
+        "side": "",
+        "scan_failures": 0,
+        "resync_count": 0,
+        "resync_requested": False,
+        "resync_reason": "",
+        "next_resync_at": 0.0,
         "pending_window": None,
         "window": None,
         "game_result": None,
@@ -17321,7 +17454,7 @@ def _autoplay_scan_worker(window_info, side, scan_id, use_package=None):
         _autoplay_set_status("Board scanned. Importing the position as FEN...")
     except Exception as exc:
         if int(_autoplay.get("scan_id", 0)) == int(scan_id) and _autoplay.get("enabled"):
-            stop_autoplay(f"Auto-play scan failed: {exc}", error=True)
+            _autoplay_recoverable_failure(f"Auto-play scan failed: {exc}")
     finally:
         if int(_autoplay.get("scan_id", 0)) == int(scan_id):
             _autoplay["scan_running"] = False
@@ -17366,8 +17499,14 @@ def _start_combined_advisor_scan(window_info, side):
     return start_advisor_scan(side)
 
 
-def start_autoplay_scan(side=None):
-    """Start (or restart for a new game) the initial full-board scan."""
+def start_autoplay_scan(side=None, resume=False):
+    """Start a full-board scan, or recapture a live session's board.
+
+    ``resume=True`` is Auto-play's own in-game recovery: the current side
+    is kept and no question is raised. A fresh start (``resume=False``) in
+    Ask mode always raises the side question again, even after a previous
+    session answered it.
+    """
     global menu_anim_closing
     window_info = _autoplay.get("pending_window") or _autoplay.get("window")
     if not window_info:
@@ -17377,15 +17516,32 @@ def start_autoplay_scan(side=None):
         # Snapshot our rect on the GUI thread; the worker only uses the
         # tuple to mask ChessBotV out of its first full-screen locator.
         window_info["capture_exclude_rect"] = _own_window_rect_snapshot()
-    if side is None:
-        saved_side = _normalise_autoplay_side_preference(
-            autoplay_side_preference
-        )
-        side = (
-            saved_side
-            if saved_side in ("white", "black")
-            else _autoplay.get("side", "white")
-        )
+    global show_autoplay_side_dialog
+    saved_side = _normalise_autoplay_side_preference(autoplay_side_preference)
+
+    def _answered_side(value):
+        return str(value or "").strip().lower() in ("white", "black")
+
+    if not _answered_side(side) and resume:
+        # In-game recovery keeps playing the side this session already has
+        # and never interrupts the game with a question.
+        side = _autoplay.get("side")
+        if not _answered_side(side):
+            side = "white"
+    if not _answered_side(side) and saved_side == "ask":
+        # Ask mode never guesses: a fresh start without an explicit answer
+        # asks again rather than reusing the previous session's side.
+        _autoplay.update({
+            "enabled": True,
+            "running": False,
+            "state": "choosing_side",
+            "side": "",
+        })
+        _autoplay_set_status("Choose the side you are playing.")
+        show_autoplay_side_dialog = True
+        return True
+    if not _answered_side(side):
+        side = saved_side
     side = _autoplay_side_name(side)
     _autoplay_invalidate_drag()
     _autoplay_poll_runner.invalidate()
@@ -17393,7 +17549,10 @@ def start_autoplay_scan(side=None):
     use_package_snapshot = bool(use_package_enabled)
     _autoplay.update({
         "enabled": True,
-        "running": False,
+        # A recapture keeps the game "live" so the engine, status rails and
+        # F8 all still treat it as an active session; it re-enters the
+        # state machine once the new position imports.
+        "running": bool(resume),
         "state": "scanning",
         "window": dict(window_info),
         "pending_window": dict(window_info),
@@ -17415,6 +17574,22 @@ def start_autoplay_scan(side=None):
         "game_result": None,
         "awaiting_f8_restart": False,
         "session_ready": False,
+        # A recapture inside a live game (``resume=True``) keeps
+        # resync_count/resync_requested set so the import preserves —
+        # rather than resets — whose turn it is, and keeps scan_failures so
+        # repeated unreadable recaptures eventually give up. A fresh start
+        # clears all of it.
+        **(
+            {}
+            if resume
+            else {
+                "resync_count": 0,
+                "resync_requested": False,
+                "resync_reason": "",
+                "next_resync_at": 0.0,
+                "scan_failures": 0,
+            }
+        ),
     })
     _autoplay_set_status(
         f"Scanning {_autoplay_broadcast_target_label(window_info)} as "
@@ -17429,10 +17604,13 @@ def start_autoplay_scan(side=None):
                 f"Combined Mode advisor scan failed: {exc}", error=True
             )
             return False
-    try:
-        begin_settings_menu_close()
-    except Exception:
-        pass
+    if not resume:
+        # A fresh start closes Settings; an in-game recapture must not tear
+        # the menu away from someone who opened it mid-game.
+        try:
+            begin_settings_menu_close()
+        except Exception:
+            pass
     thread = threading.Thread(
         target=_autoplay_scan_worker,
         args=(dict(window_info), side, scan_id, use_package_snapshot),
@@ -17450,7 +17628,9 @@ def restart_autoplay_scan():
     if not _autoplay.get("window"):
         return request_autoplay_start()
     _autoplay["enabled"] = True
-    return start_autoplay_scan(_autoplay.get("side", "white"))
+    # A new game is a fresh start: in Ask mode this raises the side
+    # question again instead of reusing the finished game's answer.
+    return start_autoplay_scan(None)
 
 
 def toggle_autoplay():
@@ -17912,15 +18092,22 @@ def _autoplay_capture_board_crop():
         window_info, board_rect, _autoplay.get("window_size")
     )
     if result.get("status") == "resized":
-        source_name = (
-            "screen" if _autoplay_target_kind(window_info) == "screen"
-            else "window"
-        )
-        stop_autoplay(
-            f"The broadcast {source_name} changed size; restart Auto-play "
-            "to scan its board again.",
-            error=True,
-        )
+        # Called by the drag worker (active drag) or by the GUI loop (idle).
+        # Only the GUI loop may touch session state; while a drag is in
+        # flight, just report that no crop was available and let the next
+        # poll recover the board.
+        if not _autoplay.get("drag_running"):
+            source_name = (
+                "screen" if _autoplay_target_kind(window_info) == "screen"
+                else "window"
+            )
+            _autoplay_request_resync(
+                reason=f"The broadcast {source_name} changed size.",
+            )
+            _autoplay_set_status(
+                f"The broadcast {source_name} changed size; recapturing "
+                "its board..."
+            )
         return None
     _apply_capture_window_geometry(_autoplay, result)
     return result.get("crop")
@@ -23533,10 +23720,18 @@ def _autoplay_settings_button_summary():
         autoplay_state = "error"
         autoplay_label = "Auto-play needs attention"
         autoplay_subtitle = ""
-    elif autoplay_scan or autoplay_phase_text in ("scanning", "importing"):
+    elif autoplay_scan or autoplay_phase_text in (
+        "scanning",
+        "importing",
+        "resync_wait",
+    ):
         autoplay_state = "working"
         autoplay_label = f"Auto-play working {autoplay_detail}"
-        autoplay_subtitle = "Auto-play scanning…"
+        autoplay_subtitle = (
+            "Auto-play resyncing…"
+            if autoplay_phase_text == "resync_wait"
+            else "Auto-play scanning…"
+        )
     elif autoplay_setup or autoplay_phase_text in (
         "choosing_side",
         "choosing_window",
@@ -35155,18 +35350,55 @@ def main():
             if result.get("piece_grid", [[None] * 8] * 8)[row][col] == "?"
         ]
         if unknown:
-            return stop_autoplay(
-                f"Auto-play scan stopped: {len(unknown)} square(s) are still unknown.",
-                error=True,
+            return _autoplay_import_failed(
+                f"Auto-play scan stopped: {len(unknown)} square(s) are "
+                "still unknown."
             )
 
         try:
             fen = _autoplay_fen_from_visual_grid(result["piece_grid"], side)
             imported = chess.Board(fen)
-            if imported.status():
+            # A live recapture reads a position that may already be one or
+            # two plies ahead; legality is judged after the turn is
+            # re-derived below, so an empty king box does not need to pass
+            # ``status()`` yet.
+            if imported.status() and not (
+                _autoplay.get("resync_requested") or _autoplay.get("resync_count")
+            ):
                 raise ValueError(f"scanned position is not a valid chess position ({fen})")
         except Exception as exc:
-            return stop_autoplay(f"Auto-play could not import the scan as FEN: {exc}", error=True)
+            return _autoplay_import_failed(
+                f"Auto-play could not import the scan as FEN: {exc}"
+            )
+
+        # A recapture in the middle of a live game replaces the tracked
+        # board, so it must be read like a move rather than a fresh scan:
+        # an unchanged placement keeps the side to move, and a placement
+        # reached by one or two legal moves keeps that line's turn. Without
+        # this Auto-play would hand the turn back to the player after every
+        # recovery and stall on a board it just re-read.
+        if _autoplay.get("resync_requested") or _autoplay.get("resync_count"):
+            imported = _autoplay_resync_turn(imported, board)
+            fen = imported.fen()
+            # Now that the turn is known, the position itself must be legal:
+            # a broken capture (missing king, impossible placement) is
+            # retried rather than accepted.
+            if imported.status():
+                return _autoplay_import_failed(
+                    "Auto-play recaptured a board that is not a legal "
+                    f"position ({fen})."
+                )
+
+        # The board image is part of the import: check it before the live
+        # position is replaced, so an unreadable recapture leaves the game
+        # exactly as it was while the recovery retries.
+        board_crop = _autoplay_board_crop_from_screenshot(
+            result.get("screenshot"), result.get("board_rect")
+        )
+        if board_crop is None:
+            return _autoplay_import_failed(
+                "Auto-play scan did not include a usable board image."
+            )
 
         old_board = board.copy()
         anim_mgr.add_board_reset(old_board, imported.copy())
@@ -35189,12 +35421,6 @@ def main():
         anim_mgr.set_multipv_arrows({})
         check_effect.reset()
         engine_thread.update_position(board)
-
-        board_crop = _autoplay_board_crop_from_screenshot(
-            result.get("screenshot"), result.get("board_rect")
-        )
-        if board_crop is None:
-            return stop_autoplay("Auto-play scan did not include a usable board image.", error=True)
 
         _autoplay_poll_runner.invalidate()
         _autoplay.update({
@@ -35226,6 +35452,10 @@ def main():
             "drag_attempts": 0,
             "awaiting_f8_restart": False,
             "session_ready": True,
+            "scan_failures": 0,
+            "resync_requested": False,
+            "resync_reason": "",
+            "resync_count": 0,
         })
         auto_seen_ply = len(board.move_stack)
         auto_fired_key = None
@@ -35248,6 +35478,10 @@ def main():
             )
         return True
 
+    def _autoplay_import_failed(message):
+        """A recapture that cannot be read is retried, not fatal."""
+        return _autoplay_recoverable_failure(message)
+
     def autoplay_poll_candidate_async(
         kind,
         base_grid,
@@ -35266,10 +35500,16 @@ def main():
         therefore no longer stall pygame's event/render loop; all session
         and board mutations below still happen on this GUI thread.
         """
+        if _autoplay.get("resync_requested"):
+            # A board capture from before the mismatch describes a position
+            # Auto-play is about to replace; wait for the fresh scan.
+            return None
         result = _autoplay_poll_runner.take(kind)
         if result is not None:
             context = result.get("context") or {}
             if context.get("board_fen") not in (None, board.fen()):
+                # The board moved on while this capture was in flight; the
+                # result is dropped, and callers simply poll again.
                 return None
             expected_pending = str(context.get("pending_move_uci", "") or "")
             actual_pending = (
@@ -35285,13 +35525,17 @@ def main():
                     if _autoplay_target_kind(_autoplay.get("window")) == "screen"
                     else "window"
                 )
-                stop_autoplay(
-                    f"The broadcast {source_name} changed size; restart "
-                    "Auto-play to scan its board again.",
-                    error=True,
+                # A resized source is recoverable: recapture the whole board
+                # in its new geometry rather than ending the session.
+                _autoplay_request_resync(
+                    reason=f"The broadcast {source_name} changed size.",
+                )
+                _autoplay_set_status(
+                    f"The broadcast {source_name} changed size; recapturing "
+                    "its board..."
                 )
                 return {
-                    "status": "stopped",
+                    "status": "resync",
                     "crop": None,
                     "candidate": None,
                     "changed": [],
@@ -35344,9 +35588,12 @@ def main():
 
         pending = _autoplay.get("pending_move")
         if pending is None or result.get("move") != pending:
-            stop_autoplay(
-                "Auto-play stopped: its background drag finished out of sync.",
-                error=True,
+            _autoplay_request_resync(
+                reason="A background drag finished after the board moved on.",
+            )
+            _autoplay_set_status(
+                "Auto-play: a drag finished after the board changed; "
+                "recapturing the live board..."
             )
             return True
 
@@ -35357,7 +35604,15 @@ def main():
                 message = "Auto-play could not drag the piece in the target window."
             if result.get("error"):
                 message = f"{message} ({result['error']})"
-            stop_autoplay(message, error=True)
+            # The piece may simply not have been where the screenshot said.
+            # Re-sync from the live board instead of ending the game.
+            _autoplay_request_resync(
+                delay=AUTOPLAY_RESYNC_RETRY_SECONDS,
+                reason=message,
+            )
+            _autoplay_set_status(
+                f"{message} Recapturing the live board..."
+            )
             return True
 
         now = time.monotonic()
@@ -35384,27 +35639,29 @@ def main():
                 )
         return True
 
-    def _autoplay_rescan_if_stuck(now, message):
+    def _autoplay_wait_or_resync(now, message):
+        """Hold a live session open, then recapture the board from its FEN.
+
+        Returns True once the session has switched into its resync wait.
+        Auto-play deliberately never stops here: an untraceable board is
+        given `AUTOPLAY_SYNC_RESCAN_SECONDS` to settle (a held piece, an
+        animation, a site's own overlay), and otherwise the whole board is
+        recaptured and re-imported so play continues from what is really
+        on screen.
+        """
+        if _autoplay.get("resync_requested"):
+            return True
         started = float(_autoplay.get("sync_started_at", 0.0) or 0.0)
         if not started:
             _autoplay["sync_started_at"] = now
+            _autoplay_set_status(message)
             return False
         if now - started < AUTOPLAY_SYNC_RESCAN_SECONDS:
             return False
-        rescans = int(_autoplay.get("sync_rescans", 0) or 0)
-        if rescans >= LIVE_SYNC_RESCAN_LIMIT:
-            stop_autoplay(
-                "Auto-play could not resync after repeated full-board scans.",
-                error=True,
-            )
-            return True
-        _autoplay["sync_rescans"] = rescans + 1
-        window_info = _autoplay.get("window") or _autoplay.get("pending_window")
-        if not window_info:
-            stop_autoplay("Auto-play cannot rescan without a selected window.", error=True)
-            return True
-        _autoplay_set_status(f"{message} Rescanning the full board...")
-        start_autoplay_scan(_autoplay.get("side", "white"))
+        _autoplay_set_status(
+            f"{message} Recapturing the full board and resuming from its FEN..."
+        )
+        _autoplay_request_resync(reason=message)
         return True
 
     def _advisor_rescan_if_stuck(now):
@@ -35461,12 +35718,22 @@ def main():
         if not _autoplay.get("running"):
             return
 
+        # The ChessBot board changing underneath a live session is not a
+        # failure: the external board is the source of truth, so wait until
+        # it settles and re-import it instead of giving up.
         expected_fen = _autoplay.get("expected_fen")
         if expected_fen is not None and board.fen() != expected_fen:
-            stop_autoplay(
-                "Auto-play stopped: the ChessBot board was changed manually and is no longer synced.",
-                error=True,
-            )
+            _autoplay["expected_fen"] = board.fen()
+            if not _autoplay.get("resync_requested"):
+                _autoplay_invalidate_drag()
+                _autoplay_poll_runner.invalidate()
+                _autoplay_request_resync(
+                    reason="The ChessBot board changed during the game.",
+                )
+                _autoplay_set_status(
+                    "Auto-play: the ChessBot board changed; waiting for it to "
+                    "settle, then recapturing it..."
+                )
             return
         if autoplay_finish_if_game_over():
             return
@@ -35480,6 +35747,15 @@ def main():
 
         now = time.monotonic()
         state = _autoplay.get("state")
+        if state == "resync_wait":
+            # Auto-play never gives up on a board it cannot trace: it waits
+            # for the position to settle, then recaptures the whole board
+            # and restarts from that FEN.
+            if now < float(_autoplay.get("next_resync_at", 0.0) or 0.0):
+                return
+            _autoplay_set_status("Auto-play recapturing the live board...")
+            start_autoplay_scan(_autoplay.get("side"), resume=True)
+            return
         player = autoplay_player_color()
         side = _autoplay_side_name(_autoplay.get("side"))
 
@@ -35584,23 +35860,97 @@ def main():
             if not _autoplay.get("enabled"):
                 return
             crop = pre_drag_poll.get("crop")
-            if crop is not None and _autoplay.get("last_image") is not None:
-                changed = pre_drag_poll.get("changed") or []
-                candidate = pre_drag_poll.get("candidate")
-                if changed and candidate is not None:
-                    known_mismatch = any(
-                        candidate[row][col] != "?"
-                        and candidate[row][col] != pre_drag_base_grid[row][col]
-                        for row in range(8)
-                        for col in range(8)
-                    )
-                    if known_mismatch:
-                        stop_autoplay(
-                            "Auto-play stopped before dragging: the live board no longer matches ChessBot.",
-                            error=True,
-                        )
+            if crop is None:
+                # Never move a piece on a screenshot that could not be read:
+                # confirm the board first, or recover it from its FEN.
+                if pre_drag_poll.get("status") == "resync":
+                    return
+                if _autoplay_wait_or_resync(
+                    now,
+                    f"Auto-play ({side}) could not screenshot the board "
+                    "before dragging...",
+                ):
+                    return
+                _autoplay_set_status(
+                    f"Auto-play ({side}) is re-reading the live board "
+                    "before dragging..."
+                )
+                _autoplay["next_poll_at"] = now + _autoplay_poll_seconds()
+                return
+            # A changed board that is not the expected position means the
+            # live game moved on without us. Trace those changed squares to
+            # a legal line and follow it; if the change cannot be traced,
+            # wait for the board to settle and recapture it from its FEN.
+            changed = pre_drag_poll.get("changed") or []
+            candidate = pre_drag_poll.get("candidate")
+            if changed and candidate is not None:
+                known_mismatch = any(
+                    candidate[row][col] != "?"
+                    and candidate[row][col] != pre_drag_base_grid[row][col]
+                    for row in range(8)
+                    for col in range(8)
+                )
+                if known_mismatch:
+                    if _autoplay.get("resync_requested"):
+                        # A recapture is already queued for this board.
                         return
-                _autoplay["last_image"] = crop
+                    traced = None
+                    try:
+                        traced = _advisor_find_move_sequence(
+                            board, candidate, max_plies=2
+                        )
+                    except Exception:
+                        traced = None
+                    if traced:
+                        trailed = 0
+                        for move in list(traced):
+                            if move not in board.legal_moves:
+                                trailed = 0
+                                break
+                            if not autoplay_push_move(move):
+                                trailed = 0
+                                break
+                            trailed += 1
+                        if trailed:
+                            _autoplay.update({
+                                "last_image": crop,
+                                "last_grid": _autoplay_board_grid_from_board(
+                                    board
+                                ),
+                                "state": (
+                                    "our_turn"
+                                    if board.turn == autoplay_player_color()
+                                    else "wait_opponent"
+                                ),
+                                "sync_started_at": 0.0,
+                                "sync_rescans": 0,
+                                "next_poll_at": now + _autoplay_poll_seconds(),
+                                "pending_move": None,
+                                "pending_before_image": None,
+                                "pending_before_grid": None,
+                                "pending_causes_checkmate": False,
+                                "drag_attempts": 0,
+                            })
+                            if autoplay_finish_if_game_over():
+                                return
+                            _autoplay_set_status(
+                                "Auto-play followed the live board "
+                                f"({trailed} updated move"
+                                f"{'' if trailed == 1 else 's'})."
+                            )
+                            return
+                    if not _autoplay.get("resync_requested"):
+                        _autoplay_request_resync(
+                            delay=AUTOPLAY_RESYNC_RETRY_SECONDS,
+                            reason="The live board no longer matches ChessBot.",
+                        )
+                        _autoplay_set_status(
+                            "Auto-play: the live board no longer matches "
+                            "ChessBot and its change cannot be traced; "
+                            "recapturing it..."
+                        )
+                    return
+            _autoplay["last_image"] = crop
 
             pending_before_image = _autoplay.get("last_image")
             pending_before_grid = _autoplay_board_grid_from_board(board)
@@ -35621,9 +35971,13 @@ def main():
                 f"Auto-play dragging {move_san} in the target window..."
             )
             if not _autoplay_start_drag_async("our_move", move, move_san):
-                stop_autoplay(
-                    "Auto-play could not drag the piece in the target window.",
-                    error=True,
+                _autoplay_request_resync(
+                    delay=AUTOPLAY_RESYNC_RETRY_SECONDS,
+                    reason="Auto-play could not start its drag.",
+                )
+                _autoplay_set_status(
+                    "Auto-play could not start its drag; recapturing the "
+                    "live board..."
                 )
             return
 
@@ -35646,7 +36000,23 @@ def main():
             candidate = poll_result.get("candidate")
             changed = poll_result.get("changed") or []
             if crop is None:
-                _autoplay_set_status("Auto-play waiting: could not screenshot the target board; retrying...")
+                if poll_result.get("status") == "resync":
+                    # The poll already asked for a recapture; its status
+                    # message must survive.
+                    return
+                # An unreadable screenshot is not a dead end: let the board
+                # settle, then recapture it and resume from that FEN.
+                _autoplay_set_status(
+                    "Auto-play waiting: could not read the target board; "
+                    "retrying..."
+                )
+                # Only recapture if the board stays unreadable; a single
+                # blurred frame should just be retried on the next poll.
+                _autoplay_wait_or_resync(
+                    now,
+                    "Auto-play could not read the live board while waiting "
+                    "for the opponent...",
+                )
                 return
             if not changed:
                 _autoplay["sync_started_at"] = 0.0
@@ -35667,16 +36037,24 @@ def main():
                 # Keep a GUI fallback only if that search itself failed.
                 move = _autoplay_find_legal_move(board, candidate)
             if move is None:
-                _autoplay_rescan_if_stuck(
+                _autoplay_wait_or_resync(
                     now,
-                    f"Auto-play saw {len(changed)} changed square(s); waiting for the move to settle...",
+                    f"Auto-play saw {len(changed)} changed square(s) it "
+                    "cannot trace to a legal move; waiting for the board to "
+                    "settle...",
                 )
                 return
             _autoplay["sync_started_at"] = 0.0
             _autoplay["sync_rescans"] = 0
             move_san = board.san(move)
             if not autoplay_push_move(move):
-                stop_autoplay("Auto-play lost sync while applying the opponent move.", error=True)
+                _autoplay_request_resync(
+                    reason="The opponent move could not be applied.",
+                )
+                _autoplay_set_status(
+                    "Auto-play: the opponent move could not be applied; "
+                    "recapturing the live board..."
+                )
                 return
             _autoplay["last_image"] = crop
             _autoplay["last_grid"] = _autoplay_board_grid_from_board(board)
@@ -35711,7 +36089,17 @@ def main():
             candidate = poll_result.get("candidate")
             changed = poll_result.get("changed") or []
             if crop is None:
-                _autoplay_set_status("Auto-play verifying move: could not screenshot the board; retrying...")
+                if poll_result.get("status") == "resync":
+                    return
+                _autoplay_set_status(
+                    "Auto-play verifying move: could not read the board; "
+                    "retrying..."
+                )
+                _autoplay_wait_or_resync(
+                    now,
+                    "Auto-play could not read the live board while verifying "
+                    "its move...",
+                )
                 return
             elapsed = now - float(_autoplay.get("pending_started_at", now))
             if not changed:
@@ -35731,13 +36119,18 @@ def main():
                         pending,
                         board.san(pending),
                     ):
-                        stop_autoplay(
-                            "Auto-play could not retry the drag in the target window.",
-                            error=True,
+                        _autoplay_request_resync(
+                            delay=AUTOPLAY_RESYNC_RETRY_SECONDS,
+                            reason="Auto-play could not retry its drag.",
                         )
-                elif _autoplay_rescan_if_stuck(
+                        _autoplay_set_status(
+                            "Auto-play could not retry its drag; recapturing "
+                            "the live board..."
+                        )
+                elif _autoplay_wait_or_resync(
                     now,
-                    "Auto-play move was not confirmed after retrying.",
+                    "Auto-play move was not confirmed after retrying; "
+                    "waiting for the board to settle...",
                 ):
                     return
                 else:
@@ -35760,7 +36153,13 @@ def main():
             if verified:
                 move_san = board.san(pending)
                 if not autoplay_push_move(pending):
-                    stop_autoplay("Auto-play lost sync while applying its verified move.", error=True)
+                    _autoplay_request_resync(
+                        reason="Auto-play's verified move could not be applied.",
+                    )
+                    _autoplay_set_status(
+                        "Auto-play: its verified move could not be applied; "
+                        "recapturing the live board..."
+                    )
                     return
                 _autoplay.update({
                     "last_image": crop,
@@ -35797,11 +36196,23 @@ def main():
             if opponent_move is not None:
                 our_san = board.san(pending)
                 if not autoplay_push_move(pending):
-                    stop_autoplay("Auto-play lost sync while applying its verified move.", error=True)
+                    _autoplay_request_resync(
+                        reason="Auto-play's verified move could not be applied.",
+                    )
+                    _autoplay_set_status(
+                        "Auto-play: its verified move could not be applied; "
+                        "recapturing the live board..."
+                    )
                     return
                 opponent_san = board.san(opponent_move)
                 if not autoplay_push_move(opponent_move):
-                    stop_autoplay("Auto-play lost sync while applying the fast opponent reply.", error=True)
+                    _autoplay_request_resync(
+                        reason="A fast opponent reply could not be applied.",
+                    )
+                    _autoplay_set_status(
+                        "Auto-play: a fast opponent reply could not be "
+                        "applied; recapturing the live board..."
+                    )
                     return
                 _autoplay.update({
                     "last_image": crop,
@@ -35821,9 +36232,10 @@ def main():
                 )
                 return
 
-            if _autoplay_rescan_if_stuck(
+            if _autoplay_wait_or_resync(
                 now,
-                "Auto-play move did not match the live board; attempting recovery.",
+                "Auto-play move did not match the live board; waiting for it "
+                "to settle...",
             ):
                 return
             _autoplay_set_status("Auto-play verifying move; waiting for the board to settle...")
