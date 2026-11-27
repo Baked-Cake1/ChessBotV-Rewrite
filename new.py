@@ -24754,7 +24754,13 @@ def _draw_vision_model_selector(screen, mouse_pos, offset_x=0, offset_y=0):
 # geometry can never drift between what is drawn and what is clickable.
 AUTOPLAY_PAGE_TOP = 82
 AUTOPLAY_SECTION_GAP = 10
-AUTOPLAY_SECTION_HEADER_HEIGHT = 30
+# Section headings are a title plus a right-aligned sentence on a shared
+# baseline, with a hairline rule underneath. The header has to be tall enough
+# for the tallest of the two plus breathing room above the rule, so measure it
+# instead of guessing: a fixed height let the title's descenders sit on the
+# divider.
+AUTOPLAY_SECTION_HEADER_TEXT_TOP = 6
+AUTOPLAY_SECTION_HEADER_RULE_GAP = 7
 AUTOPLAY_CARD_GAP = 8
 AUTOPLAY_PAGE_SCROLL_SPEED = 96.0
 autoplay_page_scroll = 0.0
@@ -24793,6 +24799,34 @@ AUTOPLAY_PAGE_SECTIONS = (
 AUTOPLAY_PAGE_DEPENDENTS = {"auto_move_colour": "auto_move"}
 
 
+def _autoplay_section_header_metrics():
+    """Title top, sentence top, rule offset and total height of a header.
+
+    Both texts share one baseline, and the rule goes below the *rendered*
+    line boxes of whichever is taller plus ``AUTOPLAY_SECTION_HEADER_RULE_GAP``.
+    Measuring beats a fixed height: the old hard-coded 30 px header put the
+    divider at ``bottom - 8``, which cut through the descenders of the title
+    whenever the loaded font was taller than the assumed one.
+    """
+    title_font = font_large
+    sentence_font = font_tiny
+    text_top = AUTOPLAY_SECTION_HEADER_TEXT_TOP
+    shared_ascent = max(title_font.get_ascent(), sentence_font.get_ascent())
+    title_top = text_top + shared_ascent - title_font.get_ascent()
+    sentence_top = text_top + shared_ascent - sentence_font.get_ascent()
+    text_bottom = max(
+        title_top + title_font.get_height(),
+        sentence_top + sentence_font.get_height(),
+    )
+    rule_y = text_bottom + AUTOPLAY_SECTION_HEADER_RULE_GAP
+    return {
+        "title_top": title_top,
+        "sentence_top": sentence_top,
+        "rule_offset": rule_y,
+        "height": rule_y + 4,
+    }
+
+
 def _autoplay_page_cards():
     """Ordered (section title, card key, height) with collapsed rows removed."""
     cards = []
@@ -24829,15 +24863,16 @@ def _autoplay_page_layout(offset_x=0, offset_y=0):
         if section_title != current_section:
             if current_section is not None:
                 cursor += AUTOPLAY_SECTION_GAP
+            header_height = _autoplay_section_header_metrics()["height"]
             rows.append(
                 {
                     "kind": "header",
                     "section": section_title,
                     "y": cursor,
-                    "height": AUTOPLAY_SECTION_HEADER_HEIGHT,
+                    "height": header_height,
                 }
             )
-            cursor += AUTOPLAY_SECTION_HEADER_HEIGHT
+            cursor += header_height
             current_section = section_title
         else:
             cursor += AUTOPLAY_CARD_GAP
@@ -25033,11 +25068,9 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
             rect = row["rect"]
             if rect.bottom < viewport.top - 4 or rect.top > viewport.bottom + 4:
                 continue
+            metrics = _autoplay_section_header_metrics()
             title_s = font_large.render(row["section"], True, TEXT_COLOR)
-            screen.blit(
-                title_s,
-                (rect.x, rect.centery - title_s.get_height() // 2),
-            )
+            screen.blit(title_s, (rect.x, rect.y + metrics["title_top"]))
             sentence = next(
                 (
                     text
@@ -25052,14 +25085,15 @@ def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
                     sentence_s,
                     (
                         rect.right - sentence_s.get_width(),
-                        rect.centery - sentence_s.get_height() // 2,
+                        rect.y + metrics["sentence_top"],
                     ),
                 )
+            rule_y = rect.y + metrics["rule_offset"]
             pygame.draw.line(
                 screen,
                 MENU_BORDER_COLOR,
-                (rect.x, rect.bottom - 8),
-                (rect.right, rect.bottom - 8),
+                (rect.x, rule_y),
+                (rect.right, rule_y),
                 2,
             )
 
