@@ -2051,9 +2051,10 @@ def get_preview_images(theme):
 # Board theme state — theme is persisted in configuration.cfg
 # cache for preview images (theme_id -> {piece_key: surface 28x28})
 _theme_preview_cache = {}
-# Full-size piece surfaces are also kept in RAM, keyed by theme. main()
-# preloads every installed set once at startup so later theme/board use
-# never has to wait on PNG decoding/scaling again.
+# Full-size piece surfaces are also kept in RAM, keyed by theme. They are
+# decoded lazily on first use (the active theme at startup, a theme when it
+# is clicked, a preview when its style card is actually drawn), so an
+# install with dozens of piece sets does not pay for the unused ones.
 _piece_image_cache = {}
 
 
@@ -2062,26 +2063,6 @@ def get_piece_images(theme):
     if theme not in _piece_image_cache:
         _piece_image_cache[theme] = load_images(theme)
     return _piece_image_cache[theme]
-
-
-def preload_piece_images(themes=None):
-    """Decode and cache every installed piece set and its previews."""
-    if themes is None:
-        themes = [theme_id for theme_id, _name in get_available_themes()]
-    loaded = 0
-    for theme in themes:
-        try:
-            get_piece_images(theme)
-            get_preview_images(theme)
-        except Exception as exc:
-            # One unused/corrupt optional piece set must not prevent the
-            # application from starting; it can still be reported clearly.
-            print(f"Piece image preload skipped {theme!r}: {exc}")
-            continue
-        loaded += 1
-    if loaded:
-        print(f"Preloaded {loaded} piece image set(s) into memory.")
-    return loaded
 
 
 _piece_shadow_cache = {}
@@ -35038,15 +35019,11 @@ def main():
     # blank/frozen window. The selected vision model itself stays lazy (so
     # ordinary play does not pay PyTorch/package import cost), but its later
     # worker-thread load publishes the same loading overlay.
-    show_startup_loading(
-        "Loading piece styles", "Decoding board piece images", 0.12
-    )
-    preload_piece_images()
-    show_startup_loading("Loading sounds", "Preparing move audio", 0.34)
+    show_startup_loading("Loading sounds", "Preparing move audio", 0.25)
     preload_game_sounds()
     preload_game_review_voice_clips()
     show_startup_loading(
-        "Loading openings", "Preparing the opening books", 0.56
+        "Loading openings", "Preparing the opening books", 0.55
     )
     preload_opening_books()
     show_startup_loading(
