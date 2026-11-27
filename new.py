@@ -626,7 +626,7 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_instant_checking": 0, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1, "gui_swing": 0, "gui_combined_mode": 0, "gui_mate_animation": 0, "gui_rule_repetition": "Three-Fold", "gui_rule_insufficient_material": 1, "gui_rule_king_capturing": 0, "gui_rule_double_pawn": 1, "gui_rule_en_passant": 1, "gui_rule_promotion": 1, "gui_rule_castling": 1, "gui_rule_friendly_fire": 0, "gui_rule_always_queen": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_instant_checking": 0, "autoplay_bullet_mode": 0, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1, "gui_swing": 0, "gui_combined_mode": 0, "gui_mate_animation": 0, "gui_rule_repetition": "Three-Fold", "gui_rule_insufficient_material": 1, "gui_rule_king_capturing": 0, "gui_rule_double_pawn": 1, "gui_rule_en_passant": 1, "gui_rule_promotion": 1, "gui_rule_castling": 1, "gui_rule_friendly_fire": 0, "gui_rule_always_queen": 0}
 _STRING_CONFIG_KEYS = (
     "theme",
     "board_theme",
@@ -893,6 +893,7 @@ def save_config():
             f.write(f"auto_move_depth={int(config.get('auto_move_depth', 0))}\n")
             f.write(f"autoplay_depth={int(config.get('autoplay_depth', 20))}\n")
             f.write(f"autoplay_instant_checking={1 if config.get('autoplay_instant_checking', 0) else 0}\n")
+            f.write(f"autoplay_bullet_mode={1 if config.get('autoplay_bullet_mode', 0) else 0}\n")
             f.write(
                 "autoplay_side="
                 f"{_normalise_autoplay_side_preference(config.get('autoplay_side', 'ask'))}\n"
@@ -1155,10 +1156,42 @@ AUTOPLAY_POLL_SECONDS = 0.05
 AUTOPLAY_SYNC_RESCAN_SECONDS = 2.5
 ADVISOR_SYNC_RESCAN_SECONDS = 2.5
 LIVE_SYNC_RESCAN_LIMIT = 2
+# Bullet Auto-Play: fastest Auto-play preset. Zero poll delay, fast drags,
+# and a bounded think: search to depth 18 but stop at 3 s, whichever first.
+BULLET_AUTOPLAY_DEPTH = 18
+BULLET_AUTOPLAY_MOVETIME_MS = 3000
+BULLET_AUTOPLAY_MOVETIME_SECONDS = 3.0
+BULLET_AUTOPLAY_DRAG_SECONDS = 0.12
+BULLET_AUTOPLAY_DRAG_MIN_SECONDS = 0.08
+BULLET_AUTOPLAY_DRAG_MAX_SECONDS = 0.18
+BULLET_AUTOPLAY_APPROACH_MIN_SECONDS = 0.01
+BULLET_AUTOPLAY_APPROACH_MAX_SECONDS = 0.05
+BULLET_AUTOPLAY_VERIFY_RETRY_SECONDS = 0.6
+BULLET_AUTOPLAY_FOCUS_SECONDS = 0.01
+
+
+def _autoplay_bullet_enabled():
+    """Whether the saved Bullet Auto-Play preset is on."""
+    try:
+        return bool(config.get("autoplay_bullet_mode", 0))
+    except Exception:
+        return False
+
+
+def _autoplay_bullet_depth():
+    """Bullet target depth: 18, capped by the Depth Limit like normal."""
+    try:
+        limit = int(globals().get("ANALYSIS_DEPTH", config.get("depth", 25)))
+    except Exception:
+        limit = 25
+    limit = max(1, limit)
+    return max(1, min(int(BULLET_AUTOPLAY_DEPTH), limit))
 
 
 def _autoplay_poll_seconds():
-    return 0.0 if config.get("autoplay_instant_checking", 0) else AUTOPLAY_POLL_SECONDS
+    if config.get("autoplay_instant_checking", 0) or _autoplay_bullet_enabled():
+        return 0.0
+    return AUTOPLAY_POLL_SECONDS
 # Nominal one-square drag time. The physical drag varies this by travel
 # distance and a small per-move random factor rather than always taking
 # exactly the same time between two square centres.
@@ -1412,8 +1445,13 @@ def get_autoplay_depth():
 
     The saved Auto-play depth is 1..40. It is capped by the current Depth
     Limit for the same reason Auto-Move's positive depth is: the shared
-    analysis search never reports a depth beyond that limit.
+    analysis search never reports a depth beyond that limit. Bullet
+    Auto-Play overrides the saved depth with its fixed depth-18 target
+    (still capped by the Depth Limit); the engine additionally stops
+    that search at 3 s via ``movetime``.
     """
+    if _autoplay_bullet_enabled():
+        return _autoplay_bullet_depth()
     try:
         limit = int(globals().get("ANALYSIS_DEPTH", config.get("depth", 25)))
     except Exception:
@@ -1425,6 +1463,14 @@ def get_autoplay_depth():
         chosen = AUTOPLAY_DEFAULT_DEPTH
     chosen = max(AUTOPLAY_DEPTH_MIN, min(int(chosen), AUTOPLAY_DEPTH_MAX))
     return min(chosen, limit)
+
+
+def autoplay_depth_wait_label():
+    """Human text for the depth Auto-play is waiting to reach."""
+    target = get_autoplay_depth()
+    if _autoplay_bullet_enabled():
+        return f"Bullet depth {target} or 3s"
+    return f"depth {target}"
 
 
 def set_autoplay_depth(depth, persist=True):
@@ -3937,6 +3983,11 @@ class EngineThread:
         if isinstance(cfg, dict):
             ANALYSIS_DEPTH = _normalise_config_int(cfg, "depth", 25, 5, 40)
         self.training_depth = None
+        # Bullet Auto-Play: when True (Bullet preset on + Auto-play live),
+        # searches use ``go depth 18 movetime 3000`` instead of the plain
+        # Depth Limit so Auto-play thinks at most 3 s and stops early at
+        # depth 18. Synced from the GUI thread via set_autoplay_bullet().
+        self.autoplay_bullet = False
         self.running = True
         self.board = chess.Board()
         self.lock = threading.Lock()
@@ -3966,6 +4017,7 @@ class EngineThread:
             "searching": False,
             "published_at": time.monotonic(),
             "search_started_at": 0.0,
+            "search_finished_at": 0.0,
             "updated_at": time.monotonic(),
         }
 
@@ -4058,6 +4110,7 @@ class EngineThread:
                     "searching": False,
                     "published_at": published_at,
                     "search_started_at": 0.0,
+                    "search_finished_at": 0.0,
                     "updated_at": published_at,
                 }
 
@@ -4080,6 +4133,7 @@ class EngineThread:
                 "searching": False,
                 "published_at": time.monotonic(),
                 "search_started_at": 0.0,
+                "search_finished_at": 0.0,
                 "updated_at": time.monotonic(),
             }
 
@@ -4087,6 +4141,26 @@ class EngineThread:
         """Queue UCI options to apply before the next engine search."""
         with self.lock:
             self.pending_params.update(params)
+
+    def set_autoplay_bullet(self, active):
+        """Sync Bullet Auto-Play search limits from the GUI thread.
+
+        Only the transition restarts the current search: enabling Bullet
+        mid-game must stop the unbounded depth search and restart with
+        ``depth 18 movetime 3000``, and disabling it (or stopping
+        Auto-play) must resume the normal Depth Limit search instead of
+        idling at depth 18.
+        """
+        active = bool(active)
+        if bool(getattr(self, "autoplay_bullet", False)) == active:
+            return False
+        self.autoplay_bullet = active
+        if getattr(self, "engine_active", False):
+            try:
+                self.recalculate_current()
+            except Exception:
+                pass
+        return True
 
     def recalculate_current(self):
         """Force the current board to be searched again.
@@ -4202,7 +4276,12 @@ class EngineThread:
             # depth/nps restart from 0 and climb during the new search.
             self._reset_info(fen, token)
             cached = training_store.lookup(current_board)
-            target = self.training_depth or ANALYSIS_DEPTH
+            if self.training_depth:
+                target = self.training_depth
+            elif getattr(self, "autoplay_bullet", False):
+                target = _autoplay_bullet_depth()
+            else:
+                target = ANALYSIS_DEPTH
             if cached:
                 with self.lock:
                     if self.search_token == token:
@@ -4275,9 +4354,22 @@ class EngineThread:
         cannot slip between them during very fast consecutive moves.
         """
         try:
-            depth = max(1, min(40, round(float(self.training_depth or ANALYSIS_DEPTH))))
+            if self.training_depth:
+                depth = max(1, min(40, round(float(self.training_depth))))
+                go_command = f"go depth {depth}"
+            elif getattr(self, "autoplay_bullet", False):
+                # Bullet Auto-Play: whichever comes first, depth 18 (capped
+                # by the Depth Limit) or 3 s of thinking.
+                depth = _autoplay_bullet_depth()
+                go_command = (
+                    f"go depth {depth} movetime {BULLET_AUTOPLAY_MOVETIME_MS}"
+                )
+            else:
+                depth = max(1, min(40, round(float(ANALYSIS_DEPTH))))
+                go_command = f"go depth {depth}"
         except Exception:
             depth = 25
+            go_command = f"go depth {depth}"
         with self.search_start_lock:
             with self.lock:
                 if token is not None and int(token) != int(self.search_token):
@@ -4288,18 +4380,28 @@ class EngineThread:
                 if int(self.info.get("token", -1)) == int(self.search_token):
                     self.info["searching"] = True
                     self.info["search_started_at"] = started_at
+                    # Clear any timestamp from the previous search so a
+                    # consumer never mistakes a stale finish for this one.
+                    self.info["search_finished_at"] = 0.0
                     self.info["updated_at"] = started_at
             # position + go go out as a single atomic write so a "stop"
             # from the main thread can never squeeze in between them.
-            self._send(f"position fen {fen}\ngo depth {depth}")
+            self._send(f"position fen {fen}\n{go_command}")
 
         while True:
             line = self._read_line()
             if line.startswith("bestmove"):
                 with self.lock:
                     if token is None or int(token) == int(self.search_token):
+                        finished_at = time.monotonic()
+                        # A bounded search (Bullet Auto-Play's ``depth 18
+                        # movetime 3000``) can legitimately end below its
+                        # target depth when the time budget runs out, so
+                        # record when it finished: consumers use this to
+                        # tell "search complete" from "still searching".
+                        self.info["search_finished_at"] = finished_at
                         self.info["searching"] = False
-                        self.info["updated_at"] = time.monotonic()
+                        self.info["updated_at"] = finished_at
                 return True
             if line.startswith("info") and not line.startswith("info string"):
                 self._parse_info_line(line, white_to_move, token=token)
@@ -11256,6 +11358,7 @@ _GUI_SECTIONS = [
         "Advisor",
         [
             ("autoplay_instant_checking", "Faster Advisor", "toggle", "Zero screenshot delay in Advisor/Auto-Play; ideal for bullet"),
+            ("autoplay_bullet_mode", "Bullet Auto-Play", "toggle", "Fastest Auto-Play: no poll delay, fast drags, 3s think or depth 18"),
             ("gui_combined_mode", "Combined Mode", "toggle", "Combine Auto-Play and Advisor Mode into a single toggle"),
         ],
     ),
@@ -15307,6 +15410,19 @@ def _autoplay_human_drag_duration(start, end, requested=None, rng=None):
     """Held-piece travel time, varied by distance and from move to move."""
     rng = rng or random.Random()
     distance = math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+    if _autoplay_bullet_enabled():
+        # Bullet Auto-Play: fastest reliable held travel, still varied
+        # slightly per move so the drag does not look frame-perfect.
+        if distance <= 2:
+            return 0.06
+        duration = BULLET_AUTOPLAY_DRAG_SECONDS + min(
+            0.04, distance * 0.00015
+        )
+        duration *= rng.uniform(0.94, 1.06)
+        return max(
+            BULLET_AUTOPLAY_DRAG_MIN_SECONDS,
+            min(BULLET_AUTOPLAY_DRAG_MAX_SECONDS, duration),
+        )
     if requested is not None:
         try:
             requested = float(requested)
@@ -15331,6 +15447,13 @@ def _autoplay_human_approach_duration(start, end, rng=None):
     distance = math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
     if distance <= 3:
         return 0.0
+    if _autoplay_bullet_enabled():
+        duration = 0.02 + min(0.02, distance * 0.00005)
+        duration *= rng.uniform(0.94, 1.06)
+        return max(
+            BULLET_AUTOPLAY_APPROACH_MIN_SECONDS,
+            min(BULLET_AUTOPLAY_APPROACH_MAX_SECONDS, duration),
+        )
     duration = 0.045 + 0.06 * math.log2(distance / 18.0 + 1.0)
     duration *= rng.uniform(0.90, 1.10)
     return max(
@@ -15493,7 +15616,11 @@ def _autoplay_focus_window(hwnd, drag_id=None):
         focused = bool(user32.SetForegroundWindow(window))
         if not _autoplay_drag_is_current(drag_id):
             return False
-        time.sleep(0.05)
+        time.sleep(
+            BULLET_AUTOPLAY_FOCUS_SECONDS
+            if _autoplay_bullet_enabled()
+            else 0.05
+        )
         return focused and _autoplay_drag_is_current(drag_id)
     except Exception:
         return False
@@ -15515,10 +15642,11 @@ def _autoplay_click_screen_point(point, drag_id=None, rng=None):
             if not user32.SetCursorPos(*target):
                 return False
         elif math.hypot(target[0] - current[0], target[1] - current[1]) > 2:
+            approach_cap = 0.05 if _autoplay_bullet_enabled() else 0.28
             approach_duration = min(
-                0.28,
+                approach_cap,
                 max(
-                    0.04,
+                    0.01 if _autoplay_bullet_enabled() else 0.04,
                     _autoplay_human_approach_duration(current, target, rng=rng),
                 ),
             )
@@ -15529,15 +15657,21 @@ def _autoplay_click_screen_point(point, drag_id=None, rng=None):
                 approach_duration,
                 drag_id,
                 rng=rng,
-                curve_scale=0.65,
+                curve_scale=0.3 if _autoplay_bullet_enabled() else 0.65,
             ):
                 return False
 
-        if not _autoplay_drag_sleep(rng.uniform(0.025, 0.07), drag_id):
+        if _autoplay_bullet_enabled():
+            if not _autoplay_drag_sleep(rng.uniform(0.005, 0.015), drag_id):
+                return False
+        elif not _autoplay_drag_sleep(rng.uniform(0.025, 0.07), drag_id):
             return False
         user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
         mouse_down = True
-        held_current = _autoplay_drag_sleep(rng.uniform(0.045, 0.095), drag_id)
+        if _autoplay_bullet_enabled():
+            held_current = _autoplay_drag_sleep(rng.uniform(0.015, 0.03), drag_id)
+        else:
+            held_current = _autoplay_drag_sleep(rng.uniform(0.045, 0.095), drag_id)
         user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
         mouse_down = False
         return held_current and _autoplay_drag_is_current(drag_id)
@@ -15595,7 +15729,7 @@ def _autoplay_drag_screen_points(
                     approach_duration,
                     drag_id,
                     rng=rng,
-                    curve_scale=0.8,
+                    curve_scale=0.3 if _autoplay_bullet_enabled() else 0.8,
                 ):
                     return False
             elif current != start:
@@ -15604,11 +15738,18 @@ def _autoplay_drag_screen_points(
 
         # A brief aim/grab/settle sequence is what makes the pickup read
         # as a hand rather than a scripted instantaneous mouse-down.
-        if not _autoplay_drag_sleep(rng.uniform(0.02, 0.065), drag_id):
+        # Bullet keeps only a minimal beat so the move lands faster.
+        if _autoplay_bullet_enabled():
+            if not _autoplay_drag_sleep(rng.uniform(0.005, 0.015), drag_id):
+                return False
+        elif not _autoplay_drag_sleep(rng.uniform(0.02, 0.065), drag_id):
             return False
         user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
         mouse_down = True
-        if not _autoplay_drag_sleep(rng.uniform(0.025, 0.075), drag_id):
+        if _autoplay_bullet_enabled():
+            if not _autoplay_drag_sleep(rng.uniform(0.005, 0.02), drag_id):
+                return False
+        elif not _autoplay_drag_sleep(rng.uniform(0.025, 0.075), drag_id):
             return False
 
         held_duration = _autoplay_human_drag_duration(
@@ -15621,12 +15762,15 @@ def _autoplay_drag_screen_points(
             held_duration,
             drag_id,
             rng=rng,
-            curve_scale=1.0,
-            allow_overshoot=True,
+            curve_scale=0.3 if _autoplay_bullet_enabled() else 1.0,
+            allow_overshoot=not _autoplay_bullet_enabled(),
         ):
             return False
 
-        if not _autoplay_drag_sleep(rng.uniform(0.02, 0.065), drag_id):
+        if _autoplay_bullet_enabled():
+            if not _autoplay_drag_sleep(rng.uniform(0.005, 0.015), drag_id):
+                return False
+        elif not _autoplay_drag_sleep(rng.uniform(0.02, 0.065), drag_id):
             return False
         user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
         mouse_down = False
@@ -15659,7 +15803,10 @@ def _autoplay_drag_move(
     rng = random.Random()
     # A tiny, varied beat after focusing the board breaks up the old
     # focus -> teleport -> drag sequence before the cursor approaches.
-    if not _autoplay_drag_sleep(rng.uniform(0.02, 0.07), drag_id):
+    if _autoplay_bullet_enabled():
+        if not _autoplay_drag_sleep(rng.uniform(0.005, 0.015), drag_id):
+            return False
+    elif not _autoplay_drag_sleep(rng.uniform(0.02, 0.07), drag_id):
         return False
     start, end = _autoplay_human_move_screen_points(
         screen_board_rect, move, side, rng=rng
@@ -15673,7 +15820,10 @@ def _autoplay_drag_move(
         # this also harmlessly confirms auto-queen boards in most themes.
         # For an underpromotion, classify those choice cells and click
         # the one that actually shows the desired piece when possible.
-        if not _autoplay_drag_sleep(rng.uniform(0.12, 0.20), drag_id):
+        if _autoplay_bullet_enabled():
+            if not _autoplay_drag_sleep(rng.uniform(0.02, 0.04), drag_id):
+                return False
+        elif not _autoplay_drag_sleep(rng.uniform(0.12, 0.20), drag_id):
             return False
         order = (chess.QUEEN, chess.KNIGHT, chess.ROOK, chess.BISHOP)
         try:
@@ -16919,6 +17069,13 @@ def stop_autoplay(reason="Auto-play stopped", error=False):
         "awaiting_f8_restart": False,
     })
     _autoplay_set_status(reason, error=reason if error else "")
+    # Leave Bullet Auto-Play's bounded search as soon as Auto-play stops so
+    # the shared engine returns to the normal Depth Limit search.
+    try:
+        if engine_thread is not None:
+            engine_thread.set_autoplay_bullet(False)
+    except Exception:
+        pass
     if config.get("gui_combined_mode", 0) and (
         _advisor.get("enabled") or _advisor.get("running")
         or _advisor.get("scan_running")
@@ -23032,7 +23189,12 @@ def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
     pygame.draw.rect(screen, (34, 34, 44), outer, border_radius=7)
     pygame.draw.rect(screen, MENU_BORDER_COLOR, outer, 1, border_radius=7)
 
-    label = font_tiny.render("Depth", True, TEXT_MUTED)
+    bullet = _autoplay_bullet_enabled()
+    label = font_tiny.render(
+        "Bullet" if bullet else "Depth",
+        True,
+        (255, 197, 110) if bullet else TEXT_MUTED,
+    )
     screen.blit(
         label,
         label.get_rect(center=(outer.x + 27, outer.centery + 1)),
@@ -23046,9 +23208,11 @@ def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
     effective = get_autoplay_depth()
 
     mouse_x, mouse_y = mouse_pos or (-9999, -9999)
+    # Bullet Auto-Play pins the target to depth 18, so the stepper is a
+    # readout instead of an editor while it is on.
     for key, symbol, enabled in (
-        ("minus", "−", stored > AUTOPLAY_DEPTH_MIN),
-        ("plus", "+", stored < AUTOPLAY_DEPTH_MAX),
+        ("minus", "−", not bullet and stored > AUTOPLAY_DEPTH_MIN),
+        ("plus", "+", not bullet and stored < AUTOPLAY_DEPTH_MAX),
     ):
         rect = rects[key]
         hovered = enabled and rect.collidepoint(mouse_x, mouse_y)
@@ -23085,11 +23249,14 @@ def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
         border_radius=6,
     )
     capped = effective != stored
-    value_text = f"{stored}>{effective}" if capped else str(stored)
+    if bullet:
+        value_text = str(effective)
+    else:
+        value_text = f"{stored}>{effective}" if capped else str(stored)
     value_surface = font_tiny.render(
         value_text,
         True,
-        (255, 197, 110) if capped else TEXT_ACCENT,
+        (255, 197, 110) if (capped or bullet) else TEXT_ACCENT,
     )
     screen.blit(
         value_surface,
@@ -23356,7 +23523,12 @@ def _autoplay_settings_button_summary():
         autoplay_depth_now = int(get_autoplay_depth())
     except Exception:
         autoplay_depth_now = AUTOPLAY_DEFAULT_DEPTH
-    autoplay_detail = f"({autoplay_side}, depth {autoplay_depth_now})"
+    if _autoplay_bullet_enabled():
+        autoplay_detail = (
+            f"({autoplay_side}, Bullet depth {autoplay_depth_now}/3s)"
+        )
+    else:
+        autoplay_detail = f"({autoplay_side}, depth {autoplay_depth_now})"
     if autoplay_error_text and not (autoplay_scan or autoplay_running):
         autoplay_state = "error"
         autoplay_label = "Auto-play needs attention"
@@ -23379,9 +23551,15 @@ def _autoplay_settings_button_summary():
     elif autoplay_enabled or autoplay_running:
         autoplay_state = "on"
         autoplay_label = f"Auto-play on {autoplay_detail}"
-        autoplay_subtitle = (
-            f"Auto-play · {autoplay_side} · depth {autoplay_depth_now}"
-        )
+        if _autoplay_bullet_enabled():
+            autoplay_subtitle = (
+                f"Bullet Auto-Play · {autoplay_side} · "
+                f"depth {autoplay_depth_now}/3s"
+            )
+        else:
+            autoplay_subtitle = (
+                f"Auto-play · {autoplay_side} · depth {autoplay_depth_now}"
+            )
     else:
         autoplay_state = "off"
         autoplay_label = "Auto-play off"
@@ -33179,10 +33357,12 @@ def handle_menu_click(mx, my):
             return True
         autoplay_depth_rects = get_autoplay_depth_rects()
         if autoplay_depth_rects["minus"].collidepoint(mx, my):
-            _adjust_autoplay_depth(-1)
+            if not _autoplay_bullet_enabled():
+                _adjust_autoplay_depth(-1)
             return True
         if autoplay_depth_rects["plus"].collidepoint(mx, my):
-            _adjust_autoplay_depth(1)
+            if not _autoplay_bullet_enabled():
+                _adjust_autoplay_depth(1)
             return True
         if autoplay_depth_rects["outer"].collidepoint(mx, my):
             # The label/value part of the stepper is a control surface,
@@ -34710,6 +34890,13 @@ def main():
         anim_mgr.arrow_target_alpha = 0.0
         anim_mgr.set_multipv_arrows({})
         check_effect.reset()
+        # Apply the Bullet preset before the imported position is searched:
+        # the flag is read by the engine loop when it builds this search's
+        # ``go`` command, so no separate recalculation is needed here.
+        try:
+            engine_thread.autoplay_bullet = bool(_autoplay_bullet_enabled())
+        except Exception:
+            pass
         engine_thread.update_position(board)
         promotion_pending = None
         show_game_over = False
@@ -35051,7 +35238,8 @@ def main():
         if board.turn == autoplay_player_color():
             _autoplay["state"] = "our_turn"
             _autoplay_set_status(
-                f"Auto-play synced as {side.capitalize()}. Waiting for depth {get_autoplay_depth()}..."
+                f"Auto-play synced as {side.capitalize()}. "
+                f"Waiting for {autoplay_depth_wait_label()}..."
             )
         else:
             _autoplay["state"] = "wait_opponent"
@@ -35184,10 +35372,16 @@ def main():
                 f"Auto-play dragged {move_san} again; checking the board..."
             )
         else:
-            _autoplay_set_status(
-                f"Auto-play played {move_san}; checking the board in "
-                f"{round(AUTOPLAY_POLL_SECONDS * 1000)}ms..."
-            )
+            poll_ms = round(_autoplay_poll_seconds() * 1000)
+            if poll_ms <= 0:
+                _autoplay_set_status(
+                    f"Auto-play played {move_san}; checking the board..."
+                )
+            else:
+                _autoplay_set_status(
+                    f"Auto-play played {move_san}; checking the board in "
+                    f"{poll_ms}ms..."
+                )
         return True
 
     def _autoplay_rescan_if_stuck(now, message):
@@ -35250,6 +35444,20 @@ def main():
             if result is not None and _autoplay.get("enabled"):
                 autoplay_import_scan_result(result)
 
+        # Keep the shared engine's search limits in sync with Bullet
+        # Auto-Play. The flag only matters while Auto-play is live; the
+        # transition restarts the current search with the new limits.
+        try:
+            if engine_thread is not None:
+                engine_thread.set_autoplay_bullet(
+                    bool(
+                        _autoplay_bullet_enabled()
+                        and _autoplay.get("running")
+                    )
+                )
+        except Exception:
+            pass
+
         if not _autoplay.get("running"):
             return
 
@@ -35302,17 +35510,56 @@ def main():
                     engine_thread.board.fen()
                     if getattr(engine_thread, "board", None) is not None else None
                 )
+                search_started_at = float(
+                    engine_thread.info.get("search_started_at", 0.0) or 0.0
+                )
+                search_finished_at = float(
+                    engine_thread.info.get("search_finished_at", 0.0) or 0.0
+                )
+                searching = bool(engine_thread.info.get("searching", False))
             target_depth = get_autoplay_depth()
+            bullet = _autoplay_bullet_enabled()
+            # The engine only uses the Bullet limits when its own flag is
+            # set and a training search is not taking precedence; readiness
+            # must follow what the engine actually did.
+            engine_bullet = bool(
+                getattr(engine_thread, "autoplay_bullet", False)
+            ) and not getattr(engine_thread, "training_depth", None)
+            depth_ready = depth_now >= target_depth
+            bullet_ready = False
+            bullet_elapsed = 0.0
+            if bullet and engine_bullet and search_started_at > 0.0:
+                bullet_elapsed = max(0.0, now - search_started_at)
+                # Bullet searches are bounded by the engine itself
+                # (``go depth 18 movetime 3000``), so a finished search is
+                # ready even below depth 18: the 3 s budget or a proven
+                # mate ended it early. The elapsed check is a backstop for
+                # a search that outlived its own movetime.
+                search_complete = (
+                    search_finished_at > 0.0
+                    and search_finished_at >= search_started_at
+                    and not searching
+                )
+                bullet_ready = search_complete or (
+                    bullet_elapsed >= BULLET_AUTOPLAY_MOVETIME_SECONDS
+                )
             if (
-                depth_now < target_depth
+                (not depth_ready and not bullet_ready)
                 or not pv_now
                 or pv_now[0] not in board.legal_moves
                 or engine_fen != board.fen()
                 or info_fen != board.fen()
             ):
-                _autoplay_set_status(
-                    f"Auto-play ({side}) waiting for depth {target_depth} (now {depth_now})..."
-                )
+                if bullet:
+                    _autoplay_set_status(
+                        f"Bullet Auto-Play ({side}) waiting for depth "
+                        f"{target_depth} or 3s (now {depth_now}, "
+                        f"{bullet_elapsed:.1f}s)..."
+                    )
+                else:
+                    _autoplay_set_status(
+                        f"Auto-play ({side}) waiting for depth {target_depth} (now {depth_now})..."
+                    )
                 return
 
             move = pv_now[0]
@@ -35368,7 +35615,7 @@ def main():
                 "pending_started_at": time.monotonic(),
                 "pending_causes_checkmate": bool(mate_clone.is_checkmate()),
                 "drag_attempts": 1,
-                "next_poll_at": time.monotonic() + AUTOPLAY_POLL_SECONDS,
+                "next_poll_at": time.monotonic() + _autoplay_poll_seconds(),
             })
             _autoplay_set_status(
                 f"Auto-play dragging {move_san} in the target window..."
@@ -35437,7 +35684,8 @@ def main():
                 return
             _autoplay["state"] = "our_turn"
             _autoplay_set_status(
-                f"Auto-play detected opponent move {move_san}. Waiting for depth {get_autoplay_depth()}..."
+                f"Auto-play detected opponent move {move_san}. "
+                f"Waiting for {autoplay_depth_wait_label()}..."
             )
             return
 
@@ -35467,7 +35715,13 @@ def main():
                 return
             elapsed = now - float(_autoplay.get("pending_started_at", now))
             if not changed:
-                if elapsed >= 1.2 and int(_autoplay.get("drag_attempts", 0)) < 2:
+                # Bullet cannot afford a 1.2 s wait before retrying an
+                # unseen drag, so it retries much sooner.
+                retry_after = (
+                    BULLET_AUTOPLAY_VERIFY_RETRY_SECONDS
+                    if _autoplay_bullet_enabled() else 1.2
+                )
+                if elapsed >= retry_after and int(_autoplay.get("drag_attempts", 0)) < 2:
                     _autoplay_set_status("Auto-play move was not seen; dragging once more...")
                     _autoplay["drag_attempts"] = int(
                         _autoplay.get("drag_attempts", 0)
@@ -35520,7 +35774,7 @@ def main():
                 if autoplay_finish_if_game_over():
                     return
                 _autoplay["state"] = "wait_opponent"
-                _autoplay["next_poll_at"] = time.monotonic() + AUTOPLAY_POLL_SECONDS
+                _autoplay["next_poll_at"] = time.monotonic() + _autoplay_poll_seconds()
                 _autoplay_set_status(
                     f"Auto-play verified {move_san}. Waiting for the opponent..."
                 )
@@ -35562,7 +35816,8 @@ def main():
                     return
                 _autoplay["state"] = "our_turn"
                 _autoplay_set_status(
-                    f"Auto-play verified {our_san} and detected {opponent_san}. Waiting for depth {get_autoplay_depth()}..."
+                    f"Auto-play verified {our_san} and detected {opponent_san}. "
+                    f"Waiting for {autoplay_depth_wait_label()}..."
                 )
                 return
 
