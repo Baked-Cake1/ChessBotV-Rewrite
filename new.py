@@ -18624,21 +18624,10 @@ def handle_autoplay_gameover_click(mx, my):
     return True
 
 
-# Extra height the Auto-Move colour picker, status and hint add when Auto-Move
-# is on; everything below Auto-Move moves down by this amount.
-AUTOPLAY_PAGE_AUTO_MOVE_SHIFT = 62
-
-
-def _autoplay_page_auto_move_shift():
-    return AUTOPLAY_PAGE_AUTO_MOVE_SHIFT if auto_move_enabled else 0
-
-
 def get_board_detection_button_rect(offset_x=0, offset_y=0):
-    return pygame.Rect(
-        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        330 + _autoplay_page_auto_move_shift() + offset_y,
-        AUTOPLAY_SETTINGS_ROW_WIDTH,
-        72,
+    """The Board Detection card (a control surface, not a toggle)."""
+    return _autoplay_page_card_rect("board_detection", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=76)
     )
 
 
@@ -23229,11 +23218,9 @@ def draw_polished_always_on_top_toggle(screen, rect, on, anim, hovered):
 
 
 def get_auto_move_toggle_rect(offset_x=0, offset_y=0):
-    return pygame.Rect(
-        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        140 + offset_y,
-        AUTOPLAY_SETTINGS_ROW_WIDTH,
-        78,
+    """The Auto-Move card on the Auto-Play page, or an inert off-screen rect."""
+    return _autoplay_page_card_rect("auto_move", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=78)
     )
 
 
@@ -23302,30 +23289,44 @@ def _draw_auto_move_depth_row(screen, offset_x=0, offset_y=0, idle=True):
 
 
 def get_auto_move_color_rects(offset_x=0, offset_y=0):
+    """White/Black/Both segments inside the Auto-Move colour card."""
     colors = ("white", "black", "both")
-    # Three equal buttons plus their gaps exactly fill the shared
-    # Auto-Play Settings row width used by the cards above and below.
-    w, h, gap = 190, 46, 15
-    total = 3 * w + 2 * gap
-    x0 = WIDTH // 2 - total // 2 + offset_x
-    return {c: pygame.Rect(x0 + i * (w + gap), 262 + offset_y, w, h) for i, c in enumerate(colors)}
+    card = _autoplay_page_card_rect("auto_move_colour", offset_x, offset_y)
+    if card is None:
+        return {
+            c: _autoplay_page_hidden_rect(width=150, height=34) for c in colors
+        }
+    strip = pygame.Rect(card.x + 16, card.y + 30, card.width - 32, 34)
+    w, gap = (strip.width - 10) // 3, 5
+    return {
+        c: pygame.Rect(strip.x + i * (w + gap), strip.y, w, strip.height)
+        for i, c in enumerate(colors)
+    }
 
 
 def get_autoplay_toggle_rect(offset_x=0, offset_y=0):
-    """Expanded Auto-play card below Board Detection (dynamic Y)."""
-    bd_rect = get_board_detection_button_rect(offset_x, offset_y)
-    return pygame.Rect(bd_rect.x, bd_rect.bottom + 38, bd_rect.width, 124)
+    """The Auto-play on/off card (title, saved Side/Screen summary, status)."""
+    return _autoplay_page_card_rect("autoplay", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=122)
+    )
 
 
 def get_autoplay_depth_rects(offset_x=0, offset_y=0):
-    """Compact depth stepper in the expanded card's top-right area."""
-    row = get_autoplay_toggle_rect(offset_x, offset_y)
-    outer = pygame.Rect(row.right - 188, row.y + 10, 172, 23)
-    minus = pygame.Rect(outer.x + 52, outer.y + 2, 26, 19)
-    value = pygame.Rect(minus.right + 4, outer.y + 2, 48, 19)
-    plus = pygame.Rect(value.right + 4, outer.y + 2, 26, 19)
+    """The -/+ stepper inside the dedicated Search depth card.
+
+    ``_draw_autoplay_depth_card`` draws exactly these rects, so the visible
+    control and its hit area cannot drift apart.
+    """
+    card = _autoplay_page_card_rect("autoplay_depth", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=54)
+    )
+    outer = pygame.Rect(card.right - 128, card.y + 18, 112, 28)
+    minus = pygame.Rect(outer.x + 4, outer.y + 4, 26, 20)
+    value = pygame.Rect(minus.right + 4, outer.y + 4, 44, 20)
+    plus = pygame.Rect(value.right + 4, outer.y + 4, 26, 20)
     return {
-        "row": row,
+        "row": card,
+        "card": card,
         "outer": outer,
         "minus": minus,
         "value": value,
@@ -23350,107 +23351,37 @@ def _adjust_autoplay_depth(delta):
     return True
 
 
-def _draw_autoplay_depth_stepper(screen, mouse_pos, offset_x=0, offset_y=0):
-    """Draw the saved/effective Auto-play depth control on the card."""
-    rects = get_autoplay_depth_rects(offset_x, offset_y)
-    outer = rects["outer"]
-    pygame.draw.rect(screen, (34, 34, 44), outer, border_radius=7)
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, outer, 1, border_radius=7)
-
-    bullet = _autoplay_bullet_enabled()
-    label = font_tiny.render(
-        "Bullet" if bullet else "Depth",
-        True,
-        (255, 197, 110) if bullet else TEXT_MUTED,
-    )
-    screen.blit(
-        label,
-        label.get_rect(center=(outer.x + 27, outer.centery + 1)),
-    )
-
-    try:
-        stored = int(autoplay_depth)
-    except Exception:
-        stored = AUTOPLAY_DEFAULT_DEPTH
-    stored = max(AUTOPLAY_DEPTH_MIN, min(stored, AUTOPLAY_DEPTH_MAX))
-    effective = get_autoplay_depth()
-
-    mouse_x, mouse_y = mouse_pos or (-9999, -9999)
-    # Bullet Auto-Play pins the target to depth 18, so the stepper is a
-    # readout instead of an editor while it is on.
-    for key, symbol, enabled in (
-        ("minus", "−", not bullet and stored > AUTOPLAY_DEPTH_MIN),
-        ("plus", "+", not bullet and stored < AUTOPLAY_DEPTH_MAX),
-    ):
-        rect = rects[key]
-        hovered = enabled and rect.collidepoint(mouse_x, mouse_y)
-        pygame.draw.rect(
-            screen,
-            BUTTON_HOVER_COLOR if hovered else (48, 48, 60),
-            rect,
-            border_radius=6,
-        )
-        pygame.draw.rect(
-            screen,
-            (150, 170, 255) if hovered else MENU_BORDER_COLOR,
-            rect,
-            1,
-            border_radius=6,
-        )
-        symbol_surface = font_small.render(
-            symbol,
-            True,
-            TEXT_COLOR if enabled else TEXT_MUTED,
-        )
-        screen.blit(
-            symbol_surface,
-            symbol_surface.get_rect(center=rect.center),
-        )
-
-    value_rect = rects["value"]
-    pygame.draw.rect(screen, (25, 25, 34), value_rect, border_radius=6)
-    pygame.draw.rect(
-        screen,
-        MENU_BORDER_COLOR,
-        value_rect,
-        1,
-        border_radius=6,
-    )
-    capped = effective != stored
-    if bullet:
-        value_text = str(effective)
-    else:
-        value_text = f"{stored}>{effective}" if capped else str(stored)
-    value_surface = font_tiny.render(
-        value_text,
-        True,
-        (255, 197, 110) if (capped or bullet) else TEXT_ACCENT,
-    )
-    screen.blit(
-        value_surface,
-        value_surface.get_rect(center=value_rect.center),
-    )
-    return rects
-
-
 def get_autoplay_setup_rects(offset_x=0, offset_y=0):
-    """Side/source setup controls in the expanded Auto-play card."""
-    row = get_autoplay_toggle_rect(offset_x, offset_y)
-    strip_y = row.bottom - 32
-    side_label = pygame.Rect(row.x + 16, strip_y, 34, 24)
-    side = {}
-    side_x = row.x + 52
-    for name, width in (("ask", 48), ("white", 54), ("black", 54)):
-        side[name] = pygame.Rect(side_x, strip_y, width, 24)
-        side_x += width + 4
+    """"When Auto-play starts" card: two labelled segmented control rows."""
+    row = _autoplay_page_card_rect("autoplay_setup", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=118)
+    )
+    label_w = 62
+    inner_x = row.x + 16 + label_w
+    inner_w = row.width - 32 - label_w
+    side_y = row.y + 34
+    source_y = row.y + 76
 
-    source_label = pygame.Rect(row.x + 240, strip_y, 48, 24)
-    source_ask = pygame.Rect(row.x + 290, strip_y, 48, 24)
-    source_saved = pygame.Rect(source_ask.right + 4, strip_y, 56, 24)
-    source_choose = pygame.Rect(source_saved.right + 4, strip_y, 70, 24)
+    side_label = pygame.Rect(row.x + 16, side_y, label_w, 30)
+    side = {}
+    seg_w = (inner_w - 10) // 3
+    for index, name in enumerate(("ask", "white", "black")):
+        side[name] = pygame.Rect(
+            inner_x + index * (seg_w + 5), side_y, seg_w, 30
+        )
+
+    source_label = pygame.Rect(row.x + 16, source_y, label_w, 30)
+    source_ask = pygame.Rect(inner_x, source_y, (inner_w - 10) // 3, 30)
+    source_saved = pygame.Rect(
+        source_ask.right + 5, source_y, (inner_w - 10) // 3, 30
+    )
+    source_choose = pygame.Rect(
+        source_saved.right + 5, source_y,
+        inner_x + inner_w - (source_saved.right + 5), 30,
+    )
     return {
         "row": row,
-        "strip": pygame.Rect(row.x + 18, strip_y, row.width - 36, 29),
+        "strip": pygame.Rect(row.x + 16, side_y, row.width - 32, 72),
         "side_label": side_label,
         "side": side,
         "source_label": source_label,
@@ -23460,127 +23391,26 @@ def get_autoplay_setup_rects(offset_x=0, offset_y=0):
     }
 
 
-def _draw_autoplay_setup_controls(screen, mouse_pos, offset_x=0, offset_y=0):
-    """Draw saved Side and broadcast Screen controls on the Auto-play card."""
-    rects = get_autoplay_setup_rects(offset_x, offset_y)
-    row = rects["row"]
-    mouse_x, mouse_y = mouse_pos or (-9999, -9999)
-    locked = _autoplay_setup_preferences_locked()
-
-    pygame.draw.line(
-        screen,
-        (92, 96, 112),
-        (row.x + 16, row.bottom - 39),
-        (row.right - 16, row.bottom - 39),
-        1,
-    )
-    for label, rect in (
-        ("Side", rects["side_label"]),
-        ("Screen", rects["source_label"]),
-    ):
-        label_surface = font_tiny.render(label, True, TEXT_MUTED)
-        screen.blit(
-            label_surface,
-            label_surface.get_rect(midleft=(rect.x, rect.centery + 1)),
-        )
-
-    def draw_choice(rect, label, selected, enabled, side_disc=None):
-        hovered = enabled and rect.collidepoint(mouse_x, mouse_y)
-        if selected:
-            background = (62, 105, 83) if locked else (58, 139, 82)
-            border = (140, 230, 160)
-        elif hovered:
-            background = BUTTON_HOVER_COLOR
-            border = (150, 170, 255)
-        elif enabled:
-            background = (48, 48, 60)
-            border = MENU_BORDER_COLOR
-        else:
-            background = (42, 42, 50)
-            border = (72, 72, 82)
-        pygame.draw.rect(screen, background, rect, border_radius=7)
-        pygame.draw.rect(screen, border, rect, 1, border_radius=7)
-
-        text_colour = TEXT_COLOR if enabled or selected else TEXT_MUTED
-        text = font_tiny.render(label, True, text_colour)
-        text_centre = rect.center
-        if side_disc in ("white", "black"):
-            pygame.draw.circle(
-                screen,
-                (242, 242, 242) if side_disc == "white" else (22, 22, 22),
-                (rect.x + 11, rect.centery),
-                5,
-            )
-            pygame.draw.circle(
-                screen,
-                (150, 150, 150),
-                (rect.x + 11, rect.centery),
-                5,
-                1,
-            )
-            text_centre = (rect.centerx + 7, rect.centery)
-        screen.blit(text, text.get_rect(center=text_centre))
-
-    side_preference = _normalise_autoplay_side_preference(
-        autoplay_side_preference
-    )
-    for side, label in (("ask", "Ask"), ("white", "White"), ("black", "Black")):
-        draw_choice(
-            rects["side"][side],
-            label,
-            side_preference == side,
-            not locked,
-            side_disc=side if side in ("white", "black") else None,
-        )
-
-    saved_mode = (
-        _normalise_autoplay_broadcast_mode(autoplay_broadcast_mode) == "saved"
-        and bool(autoplay_broadcast_target)
-    )
-    draw_choice(
-        rects["source_ask"],
-        "Ask",
-        not saved_mode,
-        not locked,
-    )
-    draw_choice(
-        rects["source_saved"],
-        "Saved",
-        saved_mode,
-        not locked and bool(autoplay_broadcast_target),
-    )
-    draw_choice(
-        rects["source_choose"],
-        "Choose…",
-        False,
-        not locked,
-    )
-    return rects
-
-
 def get_use_package_toggle_rect(offset_x=0, offset_y=0):
-    """Recognition-backend toggle below Auto-play and its status line."""
-    autoplay_rect = get_autoplay_toggle_rect(offset_x, offset_y)
-    return pygame.Rect(
-        autoplay_rect.x,
-        autoplay_rect.bottom + 26,
-        autoplay_rect.width,
-        74,
+    """Recognition-backend toggle (first card of the Board vision section)."""
+    return _autoplay_page_card_rect("use_package", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=76)
     )
 
 
 def get_vision_model_row_rect(offset_x=0, offset_y=0):
-    """Model selector under the Use Package row (Analysis page)."""
-    toggle = get_use_package_toggle_rect(offset_x, offset_y)
-    return pygame.Rect(toggle.x, toggle.bottom + 6, toggle.width, 46)
+    """Model selector card under Use Package (Board vision section)."""
+    return _autoplay_page_card_rect("vision_model", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=80)
+    )
 
 
 def get_vision_model_button_rects(offset_x=0, offset_y=0):
     """Previous/next model chevrons and the selector's name plate."""
     row = get_vision_model_row_rect(offset_x, offset_y)
-    prev_rect = pygame.Rect(row.x + 12, row.y + 7, 32, 32)
-    next_rect = pygame.Rect(row.right - 44, row.y + 7, 32, 32)
-    plate = pygame.Rect(prev_rect.right + 10, row.y + 6, 0, 34)
+    prev_rect = pygame.Rect(row.x + 14, row.y + 32, 30, 30)
+    next_rect = pygame.Rect(row.right - 44, row.y + 32, 30, 30)
+    plate = pygame.Rect(prev_rect.right + 10, row.y + 32, 0, 30)
     plate.width = max(80, next_rect.x - 10 - plate.x)
     return {"row": row, "prev": prev_rect, "next": next_rect, "plate": plate}
 
@@ -23598,18 +23428,9 @@ def _set_vision_model_step(delta):
 
 
 def get_advisor_toggle_rect(offset_x=0, offset_y=0):
-    """Compact Advisor row in the Analysis header space.
-
-    The rest of the Analysis page is already exactly full when Auto-Move
-    is on (Use Package ends at y852 of 860), so Advisor uses the unused
-    strip between the intro line and the Auto-Move card rather than
-    moving any established card.
-    """
-    return pygame.Rect(
-        (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x,
-        88 + offset_y,
-        AUTOPLAY_SETTINGS_ROW_WIDTH,
-        32,
+    """Compact Advisor row: the first card of the Live board tools section."""
+    return _autoplay_page_card_rect("advisor", offset_x, offset_y) or (
+        _autoplay_page_hidden_rect(width=AUTOPLAY_SETTINGS_ROW_WIDTH, height=40)
     )
 
 
@@ -24738,39 +24559,171 @@ def draw_polished_autoplay_settings_button(screen, rect, hovered):
         screen.blit(tip, tip.get_rect(center=tip_rect.center))
 
 
-def _draw_vision_model_selector(screen, mouse_pos, offset_x=0, offset_y=0):
-    """Compact model picker: models/<name>.pth for the built-in CNN.
+def _draw_autoplay_setup_controls(screen, mouse_pos, offset_x=0, offset_y=0):
+    """Draw the saved Side and Screen defaults as two clean labelled rows."""
+    rects = get_autoplay_setup_rects(offset_x, offset_y)
+    row = rects["row"]
+    locked = _autoplay_setup_preferences_locked()
+    _draw_autoplay_card_frame(screen, row, False)
+    title_s = font_small.render("When Auto-play starts", True, TEXT_COLOR)
+    screen.blit(title_s, (row.x + 16, row.y + 8))
 
-    Each trained checkpoint lives in ``models/``, so this row picks the one
+    for label, rect in (
+        ("Side", rects["side_label"]),
+        ("Screen", rects["source_label"]),
+    ):
+        label_surface = font_tiny.render(label, True, TEXT_MUTED)
+        screen.blit(
+            label_surface,
+            label_surface.get_rect(midleft=(rect.x, rect.centery)),
+        )
+
+    side_preference = _normalise_autoplay_side_preference(
+        autoplay_side_preference
+    )
+    _draw_autoplay_segmented_control(
+        screen,
+        pygame.Rect(
+            rects["side"]["ask"].x,
+            rects["side"]["ask"].y,
+            rects["side"]["black"].right - rects["side"]["ask"].x,
+            rects["side"]["ask"].height,
+        ),
+        (
+            ("ask", "Ask every time", None),
+            ("white", "White", "white"),
+            ("black", "Black", "black"),
+        ),
+        side_preference,
+        mouse_pos=mouse_pos,
+        enabled=not locked,
+        locked=locked,
+    )
+
+    saved_mode = (
+        _normalise_autoplay_broadcast_mode(autoplay_broadcast_mode) == "saved"
+        and bool(autoplay_broadcast_target)
+    )
+    source_rect = pygame.Rect(
+        rects["source_ask"].x,
+        rects["source_ask"].y,
+        rects["source_choose"].right - rects["source_ask"].x,
+        rects["source_ask"].height,
+    )
+    _draw_autoplay_segmented_control(
+        screen,
+        source_rect,
+        (
+            ("ask", "Ask every time", None),
+            ("saved", "Saved", None),
+            ("choose", "Choose…", None),
+        ),
+        "saved" if saved_mode else "ask",
+        mouse_pos=mouse_pos,
+        enabled=not locked,
+        locked=locked,
+    )
+    return rects
+
+
+def _draw_autoplay_depth_card(screen, rect, mouse_pos, offset_x=0, offset_y=0):
+    """Search-depth card: explanation plus the -/+ depth stepper."""
+    rects = get_autoplay_depth_rects(offset_x, offset_y)
+    _draw_autoplay_card_frame(screen, rect, False)
+    bullet = _autoplay_bullet_enabled()
+    try:
+        stored = int(autoplay_depth)
+    except Exception:
+        stored = AUTOPLAY_DEFAULT_DEPTH
+    stored = max(AUTOPLAY_DEPTH_MIN, min(stored, AUTOPLAY_DEPTH_MAX))
+    effective = get_autoplay_depth()
+    capped = effective != stored
+
+    title_s = font_small.render(
+        "Bullet search" if bullet else "Search depth", True, TEXT_COLOR
+    )
+    screen.blit(title_s, (rect.x + 16, rect.y + 9))
+    if bullet:
+        detail = (
+            f"Pinned to depth {effective} and a 3 s cap while Bullet "
+            "Auto-Play is on."
+        )
+    elif capped:
+        detail = f"Saved {stored}, capped to {effective} by the Depth Limit."
+    else:
+        detail = f"Drag once the search reaches depth {effective}."
+    detail_s = font_tiny.render(
+        _elide_text(detail, font_tiny, rect.width - 190), True, TEXT_MUTED
+    )
+    screen.blit(detail_s, (rect.x + 16, rect.bottom - 20))
+
+    mouse_x, mouse_y = mouse_pos or (-9999, -9999)
+    accent = (255, 197, 110) if (bullet or capped) else TEXT_ACCENT
+    for symbol, button in (("−", rects["minus"]), ("+", rects["plus"])):
+        button_hovered = (not bullet) and button.collidepoint(mouse_x, mouse_y)
+        pygame.draw.rect(
+            screen,
+            BUTTON_HOVER_COLOR if button_hovered else (48, 48, 60),
+            button,
+            border_radius=6,
+        )
+        pygame.draw.rect(
+            screen,
+            (150, 170, 255) if button_hovered else MENU_BORDER_COLOR,
+            button,
+            1,
+            border_radius=6,
+        )
+        symbol_s = font_small.render(
+            symbol, True, TEXT_COLOR if not bullet else TEXT_MUTED
+        )
+        screen.blit(symbol_s, symbol_s.get_rect(center=button.center))
+    value_box = rects["value"]
+    pygame.draw.rect(screen, (25, 25, 34), value_box, border_radius=6)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, value_box, 1, border_radius=6)
+    value_text = f"{stored}>{effective}" if (capped and not bullet) else str(effective)
+    value_s = font_tiny.render(
+        _elide_text(value_text, font_tiny, value_box.width - 6), True, accent
+    )
+    screen.blit(value_s, value_s.get_rect(center=value_box.center))
+
+
+def _draw_vision_model_selector(screen, mouse_pos, offset_x=0, offset_y=0):
+    """Checkpoint card: models/<name>.pth with prev/next chevrons.
+
+    Each trained checkpoint lives in ``models/``, so this card picks the one
     Board Detection and Auto-play load. It is shown as inactive while the
     external package backend is selected, because that backend does not use
     a local checkpoint.
     """
-    mx, my = mouse_pos
-    rects = get_vision_model_button_rects(offset_x, offset_y)
-    row = rects["row"]
+    mx, my = mouse_pos if mouse_pos else (-9999, -9999)
+    rect = get_vision_model_row_rect(offset_x, offset_y)
     enabled = not use_package_enabled
-    pygame.draw.rect(screen, (52, 52, 62), row, border_radius=10)
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, row, 1, border_radius=10)
-    label_x = rects["prev"].right + 12
-    available = max(60, rects["next"].x - 12 - label_x)
-    label = font_small.render(
-        _elide_text(f"models/{vision_model_name}.pth", font_small, available),
-        True,
-        TEXT_COLOR if enabled else TEXT_MUTED,
-    )
-    screen.blit(label, (label_x, row.centery - label.get_height() // 2))
-    hint = font_tiny.render(
-        "Model used by the built-in CNN"
+    _draw_autoplay_card_frame(screen, rect, False)
+    hint_s = font_tiny.render(
+        "Checkpoint used by the built-in CNN"
         if enabled
         else "Unused while Use Package is on",
         True,
         TEXT_ACCENT if enabled else TEXT_MUTED,
     )
-    screen.blit(hint, (row.x + 2, row.bottom + 1))
+    screen.blit(hint_s, (rect.x + 16, rect.y + 9))
+
+    buttons = get_vision_model_button_rects(offset_x, offset_y)
+    plate = buttons["plate"]
+    pygame.draw.rect(screen, (44, 46, 58), plate, border_radius=7)
+    pygame.draw.rect(screen, MENU_BORDER_COLOR, plate, 1, border_radius=7)
+    label = font_small.render(
+        _elide_text(
+            f"models/{vision_model_name}.pth", font_small, plate.width - 20
+        ),
+        True,
+        TEXT_COLOR if enabled else TEXT_MUTED,
+    )
+    screen.blit(label, label.get_rect(center=plate.center))
     for key, symbol in (("prev", "‹"), ("next", "›")):
-        rect = rects[key]
-        hovered = enabled and rect.collidepoint(mx, my)
+        button = buttons[key]
+        hovered = enabled and button.collidepoint(mx, my)
         pygame.draw.rect(
             screen,
             (92, 92, 120)
@@ -24778,255 +24731,602 @@ def _draw_vision_model_selector(screen, mouse_pos, offset_x=0, offset_y=0):
             else (70, 70, 82)
             if enabled
             else (48, 48, 56),
-            rect,
+            button,
             border_radius=8,
         )
         pygame.draw.rect(
             screen,
             (150, 170, 255) if hovered else MENU_BORDER_COLOR,
-            rect,
+            button,
             1,
             border_radius=8,
         )
         symbol_s = font_large.render(
             symbol, True, TEXT_COLOR if enabled else TEXT_MUTED
         )
-        screen.blit(symbol_s, symbol_s.get_rect(center=rect.center))
+        screen.blit(symbol_s, symbol_s.get_rect(center=button.center))
+
+
+
+# --- Auto-Play Settings page ------------------------------------------------
+# The page is one scrolling column of grouped cards. Every card is measured by
+# ``_autoplay_page_layout`` and the draw/click paths both read that table, so
+# geometry can never drift between what is drawn and what is clickable.
+AUTOPLAY_PAGE_TOP = 82
+AUTOPLAY_SECTION_GAP = 10
+AUTOPLAY_SECTION_HEADER_HEIGHT = 30
+AUTOPLAY_CARD_GAP = 8
+AUTOPLAY_PAGE_SCROLL_SPEED = 96.0
+autoplay_page_scroll = 0.0
+
+AUTOPLAY_PAGE_SECTIONS = (
+    (
+        "Live board tools",
+        "Read or play a board inside another window",
+        (
+            ("advisor", 38),
+            ("auto_move", 74),
+            ("auto_move_colour", 98),
+            ("board_detection", 72),
+        ),
+    ),
+    (
+        "Auto-play",
+        "Play a live broadcast game for you",
+        (
+            ("autoplay", 104),
+            ("autoplay_setup", 112),
+            ("autoplay_depth", 54),
+        ),
+    ),
+    (
+        "Board vision",
+        "How captured squares are recognised",
+        (
+            ("use_package", 70),
+            ("vision_model", 72),
+        ),
+    ),
+)
+# A row that only makes sense while its parent is on collapses (not just
+# hides) so the page never leaves an empty gap behind.
+AUTOPLAY_PAGE_DEPENDENTS = {"auto_move_colour": "auto_move"}
+
+
+def _autoplay_page_cards():
+    """Ordered (section title, card key, height) with collapsed rows removed."""
+    cards = []
+    for section_title, _sentence, items in AUTOPLAY_PAGE_SECTIONS:
+        for key, height in items:
+            parent = AUTOPLAY_PAGE_DEPENDENTS.get(key)
+            if parent == "auto_move" and not auto_move_enabled:
+                continue
+            cards.append((section_title, key, height))
+    return cards
+
+
+def _autoplay_page_layout(offset_x=0, offset_y=0):
+    """Viewport, measured rows and scroll bounds for the Auto-Play page.
+
+    Returns ``(viewport, rows, max_scroll, scroll)``. Every row carries its
+    settled ``rect`` and either ``key`` (a card) or ``sentence`` (a header),
+    already offset by the current scroll position.
+    """
+    global autoplay_page_scroll
+    viewport = pygame.Rect(
+        22 + offset_x,
+        AUTOPLAY_PAGE_TOP + offset_y,
+        WIDTH - 44,
+        max(120, HEIGHT - AUTOPLAY_PAGE_TOP - 26),
+    )
+    row_x = (WIDTH - AUTOPLAY_SETTINGS_ROW_WIDTH) // 2 + offset_x
+    row_width = AUTOPLAY_SETTINGS_ROW_WIDTH
+
+    rows = []
+    cursor = 4
+    current_section = None
+    for section_title, key, height in _autoplay_page_cards():
+        if section_title != current_section:
+            if current_section is not None:
+                cursor += AUTOPLAY_SECTION_GAP
+            rows.append(
+                {
+                    "kind": "header",
+                    "section": section_title,
+                    "y": cursor,
+                    "height": AUTOPLAY_SECTION_HEADER_HEIGHT,
+                }
+            )
+            cursor += AUTOPLAY_SECTION_HEADER_HEIGHT
+            current_section = section_title
+        else:
+            cursor += AUTOPLAY_CARD_GAP
+        rows.append(
+            {
+                "kind": "card",
+                "section": section_title,
+                "key": key,
+                "y": cursor,
+                "height": height,
+            }
+        )
+        cursor += height
+
+    total_height = cursor + 8
+    # A couple of pixels of slack keeps the last card's border fully visible
+    # instead of being shaved by the viewport edge.
+    max_scroll = max(0, total_height - viewport.height + 6)
+    try:
+        scroll = float(autoplay_page_scroll)
+    except Exception:
+        scroll = 0.0
+    scroll = max(0.0, min(scroll, float(max_scroll)))
+    autoplay_page_scroll = scroll
+
+    top = viewport.y - int(round(scroll))
+    for row in rows:
+        row["rect"] = pygame.Rect(row_x, top + row["y"], row_width, row["height"])
+    return viewport, rows, max_scroll, scroll
+
+
+def scroll_autoplay_page(delta):
+    global autoplay_page_scroll
+    _viewport, _rows, max_scroll, _scroll = _autoplay_page_layout()
+    autoplay_page_scroll = max(
+        0.0,
+        min(max_scroll, autoplay_page_scroll + delta * AUTOPLAY_PAGE_SCROLL_SPEED),
+    )
+
+
+def _autoplay_page_card_rect(key, offset_x=0, offset_y=0):
+    """Settled rect for one card (``None`` when that card is collapsed)."""
+    _viewport, rows, _max_scroll, _scroll = _autoplay_page_layout(
+        offset_x, offset_y
+    )
+    for row in rows:
+        if row["kind"] == "card" and row["key"] == key:
+            return row["rect"]
+    return None
+
+
+def _autoplay_page_hidden_rect(*, width=1, height=1):
+    """Off-screen rect that keeps a collapsed card's click guard inert."""
+    return pygame.Rect(-10000, -10000, max(width, 1), max(height, 1))
+
+
+def _draw_autoplay_card_frame(screen, rect, hovered, *, accent=None):
+    """Shared card surface: rounded panel, shadow and 1-2 px border."""
+    pygame.draw.rect(screen, (30, 30, 36), rect.move(0, 2), border_radius=12)
+    pygame.draw.rect(screen, (78, 78, 118) if hovered else (58, 58, 68), rect,
+                     border_radius=12)
+    pygame.draw.rect(
+        screen,
+        accent or ((150, 170, 255) if hovered else MENU_BORDER_COLOR),
+        rect,
+        2 if hovered else 1,
+        border_radius=12,
+    )
+
+
+def _draw_autoplay_toggle_pill(screen, rect, on, anim=1.0, *, enabled=True):
+    """Right-hand on/off pill used by every toggle card on the page."""
+    pill_w, pill_h = 54, 28
+    pill = pygame.Rect(rect.right - 18 - pill_w, rect.centery - pill_h // 2,
+                       pill_w, pill_h)
+    e = cubic_ease_in_out(max(0.0, min(1.0, anim)))
+    on_col, off_col = (72, 175, 105), (95, 95, 105)
+    if not enabled:
+        on_col = tuple(int(c * 0.62) for c in on_col)
+        off_col = tuple(int(c * 0.78) for c in off_col)
+    pill_col = tuple(int(off_col[i] + (on_col[i] - off_col[i]) * e) for i in range(3))
+    pygame.draw.rect(screen, pill_col, pill, border_radius=pill_h // 2)
+    pygame.draw.rect(screen, (35, 35, 40), pill, 1, border_radius=pill_h // 2)
+    knob_r = 11
+    knob_x = int(pill.x + 4 + knob_r + e * (pill_w - 8 - knob_r * 2))
+    pygame.draw.circle(screen, (235, 235, 240) if enabled else (150, 150, 158),
+                       (knob_x, pill.centery), knob_r)
+    try:
+        pygame.gfxdraw.aacircle(
+            screen, knob_x, pill.centery, knob_r,
+            (235, 235, 240) if enabled else (150, 150, 158),
+        )
+    except Exception:
+        pass
+    state_s = font_tiny.render(
+        "On" if on else "Off", True, (140, 230, 160) if on else TEXT_MUTED
+    )
+    screen.blit(
+        state_s,
+        (pill.x - state_s.get_width() - 10,
+         rect.centery - state_s.get_height() // 2),
+    )
+    return pill
+
+
+def _draw_autoplay_segmented_control(
+    screen, rect, options, selected, *, mouse_pos, enabled=True, locked=False
+):
+    """One labelled row of mutually exclusive choices (Side / Screen).
+
+    Replaces the old inline strip where every chip sat on the same baseline
+    as a mid-sentence label. Each option is its own segment with a disc for
+    White/Black; the row fills the card width exactly.
+    """
+    mouse_x, mouse_y = mouse_pos or (-9999, -9999)
+    count = max(1, len(options))
+    gap = 5
+    seg_w = (rect.width - gap * (count - 1)) // count
+    for index, (value, label, disc) in enumerate(options):
+        seg = pygame.Rect(rect.x + index * (seg_w + gap), rect.y, seg_w, rect.height)
+        is_selected = value == selected
+        hovered = enabled and seg.collidepoint(mouse_x, mouse_y)
+        if is_selected:
+            background = (62, 105, 83) if locked else (58, 139, 82)
+            border = (140, 230, 160)
+        elif hovered:
+            background = BUTTON_HOVER_COLOR
+            border = (150, 170, 255)
+        elif enabled:
+            background = (48, 48, 60)
+            border = MENU_BORDER_COLOR
+        else:
+            background = (42, 42, 50)
+            border = (72, 72, 82)
+        pygame.draw.rect(screen, background, seg, border_radius=8)
+        pygame.draw.rect(screen, border, seg, 1, border_radius=8)
+        text_colour = TEXT_COLOR if (enabled or is_selected) else TEXT_MUTED
+        text_s = font_tiny.render(label, True, text_colour)
+        centre = seg.center
+        if disc in ("white", "black"):
+            pygame.draw.circle(
+                screen,
+                (242, 242, 242) if disc == "white" else (22, 22, 22),
+                (seg.x + 13, seg.centery),
+                5,
+            )
+            pygame.draw.circle(
+                screen, (150, 150, 150), (seg.x + 13, seg.centery), 5, 1
+            )
+            centre = (seg.centerx + 8, seg.centery)
+        screen.blit(text_s, text_s.get_rect(center=centre))
 
 
 def draw_autoplay_settings_content(screen, offset_x=0, offset_y=0):
+    """The Auto-Play Settings page: three grouped, scrolling card sections."""
+    global autoplay_page_scroll
     mx, my = pygame.mouse.get_pos()
     idle = menu_transition_direction == "none"
-    intro = font_small.render("Live board tools and detection", True, TEXT_MUTED)
-    screen.blit(intro, (WIDTH // 2 - intro.get_width() // 2 + offset_x, 84 + offset_y))
+    viewport, rows, max_scroll, _scroll = _autoplay_page_layout(offset_x, offset_y)
+    total_height = (rows[-1]["y"] + rows[-1]["height"] + 8) if rows else 0
+    autoplay_page_scroll = max(0.0, min(autoplay_page_scroll, float(max_scroll)))
+    cards = {row["key"]: row["rect"] for row in rows if row["kind"] == "card"}
+    cards_in_view = {
+        key: rect
+        for key, rect in cards.items()
+        if rect.bottom > viewport.top - 4 and rect.top < viewport.bottom + 4
+    }
 
-    advisor_shown_on = bool(
-        _advisor.get("enabled")
-        or show_advisor_side_dialog
-        or (
-            show_board_detection_dialog
-            and board_detection_picker_purpose == "advisor"
+    def card_rect(key, *, width=None, height=None):
+        """Rect of a visible card, or an inert off-screen rect."""
+        rect = cards_in_view.get(key)
+        if rect is None:
+            return _autoplay_page_hidden_rect(
+                width=width or AUTOPLAY_SETTINGS_ROW_WIDTH,
+                height=height or 1,
+            )
+        return rect
+
+    def hovered(rect, *, enabled=True):
+        return bool(
+            idle and enabled and viewport.collidepoint(mx, my)
+            and rect.collidepoint(mx, my)
         )
-    )
-    advisor_rect = get_advisor_toggle_rect(offset_x, offset_y)
-    advisor_status = "Idle"
-    advisor_colour = TEXT_ACCENT if advisor_shown_on else TEXT_MUTED
-    if not config.get("gui_combined_mode", 0):
+
+    pointer = (mx, my) if idle else (-9999, -9999)
+    previous_clip = screen.get_clip()
+    screen.set_clip(viewport)
+    try:
+        # --- Section headers -------------------------------------------------
+        for row in rows:
+            if row["kind"] != "header":
+                continue
+            rect = row["rect"]
+            if rect.bottom < viewport.top - 4 or rect.top > viewport.bottom + 4:
+                continue
+            title_s = font_large.render(row["section"], True, TEXT_COLOR)
+            screen.blit(
+                title_s,
+                (rect.x, rect.centery - title_s.get_height() // 2),
+            )
+            sentence = next(
+                (
+                    text
+                    for name, text, _items in AUTOPLAY_PAGE_SECTIONS
+                    if name == row["section"]
+                ),
+                "",
+            )
+            if sentence:
+                sentence_s = font_tiny.render(sentence, True, TEXT_MUTED)
+                screen.blit(
+                    sentence_s,
+                    (
+                        rect.right - sentence_s.get_width(),
+                        rect.centery - sentence_s.get_height() // 2,
+                    ),
+                )
+            pygame.draw.line(
+                screen,
+                MENU_BORDER_COLOR,
+                (rect.x, rect.bottom - 8),
+                (rect.right, rect.bottom - 8),
+                2,
+            )
+
+        # --- Live board tools ------------------------------------------------
+        advisor_rect = card_rect("advisor")
+        if not config.get("gui_combined_mode", 0):
+            advisor_on = bool(
+                _advisor.get("enabled")
+                or show_advisor_side_dialog
+                or (
+                    show_board_detection_dialog
+                    and board_detection_picker_purpose == "advisor"
+                )
+            )
+            draw_toggle_row(
+                screen,
+                advisor_rect,
+                "Advisor Mode",
+                "",
+                advisor_on,
+                advisor_anim,
+                hovered(advisor_rect),
+            )
+            advisor_status = (
+                _advisor.get("error")
+                or _advisor.get("status")
+                or "Suggest moves with the cliv-gui overlay"
+            )
+            advisor_colour = (
+                TEXT_STATUS
+                if _advisor.get("error")
+                else TEXT_ACCENT if advisor_on else TEXT_MUTED
+            )
+            advisor_status_s = font_tiny.render(
+                _elide_text(advisor_status, font_tiny, 300), True, advisor_colour
+            )
+            screen.blit(
+                advisor_status_s,
+                (
+                    advisor_rect.x + 150,
+                    advisor_rect.centery - advisor_status_s.get_height() // 2,
+                ),
+            )
+        else:
+            combined_on = bool(
+                _advisor.get("enabled") or _autoplay.get("enabled")
+            )
+            _draw_autoplay_card_frame(screen, advisor_rect, False)
+            combined_title = font_small.render("Combined Mode", True, TEXT_COLOR)
+            screen.blit(combined_title, (advisor_rect.x + 16, advisor_rect.y + 12))
+            combined_sub = font_tiny.render(
+                "Auto-play and the cliv-gui overlay running together",
+                True,
+                TEXT_MUTED,
+            )
+            screen.blit(combined_sub, (advisor_rect.x + 16, advisor_rect.y + 36))
+            _draw_autoplay_toggle_pill(screen, advisor_rect, combined_on, 1.0)
+
+        auto_move_rect = card_rect("auto_move")
+        auto_move_threshold = get_auto_move_depth()
         draw_toggle_row(
             screen,
-            advisor_rect,
-            "Advisor Mode",
-            "",
-            advisor_shown_on,
-            advisor_anim,
-            idle and advisor_rect.collidepoint(mx, my),
+            auto_move_rect,
+            "Auto-Move",
+            f"Play the engine's best move at depth {auto_move_threshold}",
+            auto_move_enabled,
+            auto_move_anim,
+            hovered(auto_move_rect),
         )
-        if _advisor.get("error"):
-            advisor_status = _advisor["error"]
-            advisor_colour = TEXT_STATUS
-        elif _advisor.get("status"):
-            advisor_status = _advisor["status"]
-        advisor_colour = (
-            TEXT_STATUS if _advisor.get("error")
-            else TEXT_ACCENT if advisor_shown_on
-            else TEXT_MUTED
+        _am_row, _am_track, _am_val, _ = get_auto_move_depth_rects(offset_x, offset_y)
+        _am_frac = max(0.0, min(1.0, float(auto_move_depth) / 40.0))
+        _am_fill = int(round(_am_track.width * _am_frac))
+        pygame.draw.rect(screen, (36, 38, 48), _am_track, border_radius=3)
+        if _am_fill > 0:
+            pygame.draw.rect(
+                screen,
+                (95, 145, 245),
+                (_am_track.x, _am_track.y, _am_fill, _am_track.height),
+                border_radius=3,
+            )
+        pygame.draw.circle(
+            screen, (235, 240, 255), (_am_track.x + _am_fill, _am_track.centery), 7
         )
-    else:
-        advisor_status = "cliv-gui live overlay"
-        advisor_colour = TEXT_MUTED
-    advisor_status_s = font_tiny.render(
-        _elide_text(advisor_status, font_tiny, advisor_rect.width - 262),
-        True,
-        advisor_colour,
-    )
-    screen.blit(
-        advisor_status_s,
-        (
-            advisor_rect.x + 142,
-            advisor_rect.centery - advisor_status_s.get_height() // 2,
-        ),
-    )
-
-    threshold = get_auto_move_depth()
-    rect = get_auto_move_toggle_rect(offset_x, offset_y)
-    shown_on = auto_move_enabled or show_auto_color_dialog
-    draw_toggle_row(
-        screen, rect, "Auto-Move",
-        f"Play the best move automatically at depth {threshold}",
-        shown_on, auto_move_anim, idle and rect.collidepoint(mx, my),
-    )
-
-    line1 = font_tiny.render("When on, the engine's best move is played for you", True, TEXT_MUTED)
-    line2 = font_tiny.render(f"as soon as the search reaches depth {threshold}.", True, TEXT_MUTED)
-    hint_y = 344 if auto_move_enabled else 254
-    screen.blit(line1, (WIDTH // 2 - line1.get_width() // 2 + offset_x, hint_y + offset_y))
-    screen.blit(line2, (WIDTH // 2 - line2.get_width() // 2 + offset_x, hint_y + 18 + offset_y))
-
-    _am_row, _am_track, _am_val, _ = get_auto_move_depth_rects(offset_x, offset_y)
-    pygame.draw.rect(screen, (36, 38, 48), _am_track, border_radius=3)
-    _am_frac = max(0.0, min(1.0, float(auto_move_depth) / 40.0))
-    _am_fill = int(round(_am_track.width * _am_frac))
-    if _am_fill > 0:
-        pygame.draw.rect(screen, (95, 145, 245), (_am_track.x, _am_track.y, _am_fill, _am_track.height), border_radius=3)
-    pygame.draw.circle(screen, (235, 240, 255), (_am_track.x + _am_fill, _am_track.centery), 7)
-    pygame.draw.rect(screen, (42, 44, 56), _am_val, border_radius=7)
-    pygame.draw.rect(screen, MENU_BORDER_COLOR, _am_val, 1, border_radius=7)
-    _am_vs = font_tiny.render("Auto" if auto_move_depth == 0 else str(auto_move_depth), True, TEXT_COLOR)
-    screen.blit(_am_vs, _am_vs.get_rect(center=_am_val.center))
-
-    if auto_move_enabled:
-        label = font_small.render("Auto-move for", True, TEXT_COLOR)
-        screen.blit(label, (WIDTH // 2 - label.get_width() // 2 + offset_x, 230 + offset_y))
-        for color, crect in get_auto_move_color_rects(offset_x, offset_y).items():
-            selected = color == auto_move_color
-            hovered = idle and crect.collidepoint(mx, my)
-            bg = (86, 86, 130) if selected else (72, 72, 82) if hovered else (56, 56, 66)
-            pygame.draw.rect(screen, bg, crect, border_radius=10)
-            pygame.draw.rect(screen, (130, 220, 150) if selected else (150, 170, 255) if hovered else MENU_BORDER_COLOR, crect, 2, border_radius=10)
-            txt = font_small.render(color.capitalize(), True, TEXT_COLOR)
-            screen.blit(txt, txt.get_rect(center=crect.center))
-        status = auto_move_status_text or "Active"
-        status_s = font_tiny.render(status, True, TEXT_ACCENT)
-        screen.blit(status_s, (WIDTH // 2 - status_s.get_width() // 2 + offset_x, 316 + offset_y))
-
-    # Board Detection action card (not a toggle): opens the window picker.
-    bd_rect = get_board_detection_button_rect(offset_x, offset_y)
-    bd_hovered = idle and not board_detection_running and bd_rect.collidepoint(mx, my)
-    bd_bg = (62, 72, 104) if bd_hovered else (58, 58, 68)
-    pygame.draw.rect(screen, bd_bg, bd_rect, border_radius=12)
-    pygame.draw.rect(
-        screen,
-        (80, 160, 255) if bd_hovered else MENU_BORDER_COLOR,
-        bd_rect, 2, border_radius=12,
-    )
-    bd_title = font_large.render("Board Detection", True, TEXT_COLOR)
-    screen.blit(bd_title, (bd_rect.x + 18, bd_rect.y + 14))
-    bd_sub = font_tiny.render("Find a chessboard in another window", True, TEXT_MUTED)
-    screen.blit(bd_sub, (bd_rect.x + 18, bd_rect.y + 50))
-    chip_rect = pygame.Rect(bd_rect.right - 136, bd_rect.centery - 18, 118, 36)
-    _draw_board_detection_button(
-        screen,
-        chip_rect,
-        "Working..." if board_detection_running else "Detect",
-        enabled=not board_detection_running,
-        primary=True,
-    )
-
-    if board_detection_running:
-        bd_status = board_detection_status or "Capturing and detecting board..."
-        bd_colour = TEXT_MUTED
-    elif board_detection_error:
-        bd_status = board_detection_error
-        bd_colour = TEXT_STATUS
-    elif board_detection_last_summary:
-        bd_status = board_detection_last_summary
-        bd_colour = TEXT_ACCENT
-    else:
-        bd_status = "Anchors: a8 black rook (top-left) and h1 white rook (bottom-right)."
-        bd_colour = TEXT_MUTED
-    bd_status_s = font_tiny.render(
-        _elide_text(bd_status, font_tiny, 620), True, bd_colour
-    )
-    screen.blit(
-        bd_status_s,
-        (WIDTH // 2 - bd_status_s.get_width() // 2 + offset_x, bd_rect.bottom + 16 + offset_y),
-    )
-
-    # Auto-play is a separate live-source mode from internal Auto-Move.
-    # Its toggle starts setup (skipping saved Side/Screen defaults);
-    # clicking it again (or F8 anywhere on Windows) stops immediately.
-    autoplay_rect = get_autoplay_toggle_rect(offset_x, offset_y)
-    autoplay_shown_on = bool(
-        _autoplay.get("enabled")
-        or show_autoplay_side_dialog
-        or (
-            show_board_detection_dialog
-            and board_detection_picker_purpose == "autoplay"
+        pygame.draw.rect(screen, (42, 44, 56), _am_val, border_radius=7)
+        pygame.draw.rect(screen, MENU_BORDER_COLOR, _am_val, 1, border_radius=7)
+        _am_vs = font_tiny.render(
+            "Auto" if auto_move_depth == 0 else str(auto_move_depth),
+            True,
+            TEXT_COLOR,
         )
-    )
-    if _autoplay.get("window"):
-        autoplay_setup_subtitle = (
-            f"{_autoplay_side_name(_autoplay.get('side', 'white')).capitalize()} · "
-            f"{_autoplay_broadcast_target_label(_autoplay.get('window'))}"
+        screen.blit(_am_vs, _am_vs.get_rect(center=_am_val.center))
+
+        if auto_move_enabled:
+            colour_rect = card_rect("auto_move_colour")
+            _draw_autoplay_card_frame(screen, colour_rect, False)
+            colour_title = font_tiny.render("Auto-move for", True, TEXT_MUTED)
+            screen.blit(colour_title, (colour_rect.x + 16, colour_rect.y + 10))
+            options = tuple(
+                (colour, colour.capitalize(), None)
+                for colour in ("white", "black", "both")
+            )
+            _draw_autoplay_segmented_control(
+                screen,
+                pygame.Rect(
+                    colour_rect.x + 16,
+                    colour_rect.y + 30,
+                    colour_rect.width - 32,
+                    34,
+                ),
+                options,
+                auto_move_color,
+                mouse_pos=pointer,
+            )
+            status = auto_move_status_text or "Active"
+            status_s = font_tiny.render(status, True, TEXT_ACCENT)
+            screen.blit(
+                status_s,
+                status_s.get_rect(
+                    center=(colour_rect.centerx, colour_rect.bottom - 14)
+                ),
+            )
+
+        bd_rect = card_rect("board_detection")
+        bd_hovered = hovered(bd_rect, enabled=not board_detection_running)
+        _draw_autoplay_card_frame(
+            screen,
+            bd_rect,
+            bd_hovered,
+            accent=(80, 160, 255) if bd_hovered else None,
         )
-    else:
-        autoplay_setup_subtitle = (
-            f"Side: {_autoplay_side_preference_label()} · "
-            f"Screen: {_autoplay_broadcast_preference_label()}"
+        bd_title = font_small.render("Board Detection", True, TEXT_COLOR)
+        screen.blit(bd_title, (bd_rect.x + 16, bd_rect.y + 12))
+        bd_sub = font_tiny.render(
+            "Find a chessboard in another window", True, TEXT_MUTED
         )
-    draw_toggle_row(
-        screen,
-        autoplay_rect,
-        "Combined Mode" if config.get("gui_combined_mode", 0) else "Auto-play",
-        _elide_text(autoplay_setup_subtitle, font_tiny, 220),
-        (autoplay_shown_on or advisor_shown_on) if config.get("gui_combined_mode", 0) else autoplay_shown_on,
-        autoplay_anim,
-        idle and autoplay_rect.collidepoint(mx, my),
-    )
-    _draw_autoplay_depth_stepper(
-        screen,
-        (mx, my) if idle else (-9999, -9999),
-        offset_x,
-        offset_y,
-    )
-    _draw_autoplay_setup_controls(
-        screen,
-        (mx, my) if idle else (-9999, -9999),
-        offset_x,
-        offset_y,
-    )
-    if _autoplay.get("error"):
-        autoplay_status = _autoplay["error"]
-        autoplay_colour = TEXT_STATUS
-    elif _autoplay.get("status"):
-        autoplay_status = _autoplay["status"]
-        autoplay_colour = TEXT_ACCENT if autoplay_shown_on else TEXT_MUTED
-    else:
-        autoplay_status = (
-            "Set Side/Screen or start and answer the prompts. "
-            "F8 toggles Auto-play at any time."
+        screen.blit(bd_sub, (bd_rect.x + 16, bd_rect.y + 36))
+        _draw_board_detection_button(
+            screen,
+            pygame.Rect(bd_rect.right - 132, bd_rect.y + 20, 114, 34),
+            "Working..." if board_detection_running else "Detect",
+            enabled=not board_detection_running,
+            primary=True,
         )
-        autoplay_colour = TEXT_MUTED
-    if "F8" not in autoplay_status:
+        if board_detection_running:
+            bd_status = board_detection_status or "Capturing and detecting board..."
+            bd_colour = TEXT_MUTED
+        elif board_detection_error:
+            bd_status = board_detection_error
+            bd_colour = TEXT_STATUS
+        elif board_detection_last_summary:
+            bd_status = board_detection_last_summary
+            bd_colour = TEXT_ACCENT
+        else:
+            bd_status = "Finds the 8×8 grid, then names every square."
+            bd_colour = TEXT_MUTED
+        bd_status_s = font_tiny.render(
+            _elide_text(bd_status, font_tiny, bd_rect.width - 170),
+            True,
+            bd_colour,
+        )
+        screen.blit(
+            bd_status_s,
+            (bd_rect.x + 16, bd_rect.bottom - bd_status_s.get_height() - 8),
+        )
+
+        # --- Auto-play -------------------------------------------------------
+        autoplay_rect = card_rect("autoplay")
+        autoplay_on = bool(
+            _autoplay.get("enabled")
+            or show_autoplay_side_dialog
+            or (
+                show_board_detection_dialog
+                and board_detection_picker_purpose == "autoplay"
+            )
+        )
+        if _autoplay.get("window"):
+            autoplay_subtitle = (
+                f"{_autoplay_side_name(_autoplay.get('side', 'white')).capitalize()}"
+                f" · {_autoplay_broadcast_target_label(_autoplay.get('window'))}"
+            )
+        else:
+            autoplay_subtitle = (
+                f"Side: {_autoplay_side_preference_label()} · "
+                f"Screen: {_autoplay_broadcast_preference_label()}"
+            )
+        draw_toggle_row(
+            screen,
+            autoplay_rect,
+            "Combined Mode"
+            if config.get("gui_combined_mode", 0)
+            else "Auto-play",
+            _elide_text(autoplay_subtitle, font_tiny, 330),
+            autoplay_on,
+            autoplay_anim,
+            hovered(autoplay_rect),
+        )
+        if _autoplay.get("error"):
+            autoplay_status = _autoplay["error"]
+            autoplay_colour = TEXT_STATUS
+        elif _autoplay.get("status"):
+            autoplay_status = _autoplay["status"]
+            autoplay_colour = TEXT_ACCENT if autoplay_on else TEXT_MUTED
+        else:
+            autoplay_status = "Idle — answer the prompts when you start."
+            autoplay_colour = TEXT_MUTED
         if _autoplay.get("awaiting_f8_restart"):
-            autoplay_status = f"{autoplay_status}  ·  F8 restarts"
-        elif autoplay_shown_on:
-            autoplay_status = f"{autoplay_status}  ·  F8 stops"
-    autoplay_status_s = font_tiny.render(
-        _elide_text(autoplay_status, font_tiny, 620), True, autoplay_colour
-    )
-    screen.blit(
-        autoplay_status_s,
-        (
-            WIDTH // 2 - autoplay_status_s.get_width() // 2 + offset_x,
-            autoplay_rect.bottom + 6 + offset_y,
-        ),
-    )
+            autoplay_hotkey = "F8 restarts"
+        elif autoplay_on:
+            autoplay_hotkey = "F8 stops"
+        else:
+            autoplay_hotkey = "F8 toggles"
+        hotkey_s = font_tiny.render(autoplay_hotkey, True, TEXT_MUTED)
+        status_width = autoplay_rect.width - 48 - hotkey_s.get_width()
+        autoplay_status_s = font_tiny.render(
+            _elide_text(autoplay_status, font_tiny, status_width),
+            True,
+            autoplay_colour,
+        )
+        status_y = autoplay_rect.bottom - 26
+        screen.blit(autoplay_status_s, (autoplay_rect.x + 16, status_y))
+        screen.blit(
+            hotkey_s,
+            hotkey_s.get_rect(midright=(autoplay_rect.right - 16, status_y + 7)),
+        )
 
-    # Board-vision backend for the next Board Detection / Auto-play scan.
-    # A scan or Auto-play session already in progress keeps the backend it
-    # started with; this saved preference takes over on the next scan.
-    use_package_rect = get_use_package_toggle_rect(offset_x, offset_y)
-    use_package_subtitle = (
-        "chess-fen-detector · next scan"
-        if use_package_enabled
-        else "Built-in CNN · next scan"
-    )
-    draw_toggle_row(
-        screen,
-        use_package_rect,
-        "Use Package",
-        use_package_subtitle,
-        use_package_enabled,
-        use_package_anim,
-        idle and use_package_rect.collidepoint(mx, my),
-    )
+        _draw_autoplay_setup_controls(screen, pointer, offset_x, offset_y)
 
-    # Which exported model (models/<name>.pth) the built-in CNN loads.
-    _draw_vision_model_selector(
-        screen, (mx, my) if idle else (-9999, -9999), offset_x, offset_y
-    )
+        depth_rect = card_rect("autoplay_depth")
+        _draw_autoplay_depth_card(screen, depth_rect, pointer, offset_x, offset_y)
 
+        # --- Board vision ----------------------------------------------------
+        use_package_rect = card_rect("use_package")
+        draw_toggle_row(
+            screen,
+            use_package_rect,
+            "Use Package",
+            "chess-fen-detector · next scan"
+            if use_package_enabled
+            else "Built-in CNN · next scan",
+            use_package_enabled,
+            use_package_anim,
+            hovered(use_package_rect),
+        )
+        _draw_vision_model_selector(screen, pointer, offset_x, offset_y)
+
+        # --- Scrollbar -------------------------------------------------------
+        if max_scroll > 0:
+            track = pygame.Rect(
+                viewport.right - 14, viewport.y + 4, 7, viewport.height - 8
+            )
+            pygame.draw.rect(screen, (42, 46, 58), track, border_radius=4)
+            thumb_h = max(
+                54, int(viewport.height * viewport.height / max(1, total_height))
+            )
+            thumb_h = min(track.height, thumb_h)
+            travel = max(0, track.height - thumb_h)
+            thumb_y = track.y + int(
+                round(travel * (autoplay_page_scroll / max_scroll))
+            )
+            pygame.draw.rect(
+                screen,
+                (150, 162, 188),
+                pygame.Rect(track.x, thumb_y, track.width, thumb_h),
+                border_radius=4,
+            )
+    finally:
+        screen.set_clip(previous_clip)
 
 def get_auto_color_dialog_rects():
     """Panel + White/Black/Both/Cancel rects for the colour question."""
@@ -37121,6 +37421,12 @@ def main():
                     and menu_transition_direction == "none"
                 ):
                     scroll_gui_settings(-event.y)
+                elif (
+                    settings_menu_open
+                    and settings_menu_state == "autoplay_settings"
+                    and menu_transition_direction == "none"
+                ):
+                    scroll_autoplay_page(-event.y)
                 elif (
                     not settings_menu_open
                     and not game_review_is_active()
