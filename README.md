@@ -245,6 +245,14 @@ analysis_passed_pawn=0
 pip install numpy Pillow pygame
 ```
 
+**Any screenshot format is accepted, and anything that isn't PNG is converted to PNG for you.** A dropped/selected file is identified by its actual bytes rather than its extension, so a `.png` download that is really a JPEG (or a file with no extension at all) still opens. PNG passes straight through untouched; JPEG/`.jfif`, WebP, AVIF, BMP, GIF (first frame), TIFF, TGA, PCX, QOI, JPEG 2000, DDS, ICO/CUR, PSD, PPM/PGM/PBM, SGI, XBM/XPM and the other formats Pillow decodes are re-encoded as `<original name> (converted).png` in the same folder — never overwriting an existing file — and a one-line note in the terminal names the detected source format. Transparency, EXIF rotation, CMYK and 16-bit images are handled during the conversion. iPhone **HEIC/HEIF** photos need the optional plugin, which is used automatically when installed and otherwise produces a clear "pip install pillow-heif" message:
+
+```bash
+pip install pillow-heif
+```
+
+An image that cannot be read at all now skips with an explanation and returns to the "add another screenshot" prompt instead of ending the run.
+
 Training additionally uses the existing trainer dependencies (`torch`, `torchvision`, `scikit-learn`, and `tqdm`). The trainer opens a Tk dashboard by default, with editable dataset/output paths, epochs, batch size, learning rate, seed, and duplicate-removal mode; a live training/validation accuracy graph; current epoch/batch; training and validation loss/accuracy; best validation accuracy; overall and per-step progress bars; elapsed/ETA; run details; a scrollable log and final per-class report; and Start/Stop controls.
 
 1. Run `python board-vision.py` (or drag a screenshot onto it). On startup it creates the **multiple-model** layout: `datasets/<model>/training/` and `datasets/<model>/validation/`, each containing the same 13 CNN class folders: `white_king`, `white_queen`, `white_rook`, `white_bishop`, `white_knight`, `white_pawn`, `black_king`, `black_queen`, `black_rook`, `black_bishop`, `black_knight`, `black_pawn`, and `empty`. Each uploaded board receives a new `game_id` for provenance; tiles from one board may be exported to different splits when the weighted class split is applied. Startup also **migrates an older single-model checkout once**: `datasets/training/` + `datasets/validation/` (and its `metadata.csv`/`_boards/`) are moved into `datasets/default/`, and a loose `chessbotv_cnn.pth` beside the scripts becomes `models/default.pth` — nothing is copied or deleted, only moved. Then board-vision lists the existing models and asks **which model to add this board to**: press Enter for `default`, type a number to pick one, or type a new name to start another model (its folders are created on demand). `--model <name>` skips the question for scripted runs.
