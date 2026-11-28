@@ -29,6 +29,8 @@ from torchvision import transforms
 from sklearn.metrics import classification_report
 from tqdm import tqdm
 
+import board_detection as BOARD_DETECTION
+
 
 # ============================================================
 # CHESSBOTV CNN TRAINER
@@ -1179,6 +1181,433 @@ def evaluate(
     return average_loss, accuracy, all_labels, all_predictions
 
 
+# --------------------------------------------------------------------------
+# Board-detection model: 9x9 keypoint heatmap regression
+# --------------------------------------------------------------------------
+class BoardKeypointDataset(Dataset):
+    """Screenshots -> normalised input tensor + 81 Gaussian heatmap targets.
+
+    Samples are the labelled screenshots stored by board-vision.py under
+    ``<dataset>/board_detection/samples/``. Only a modest set is needed (a
+    few dozen boards), so augmentation stays geometric plus mild colour
+    jitter: rotating/scaling the whole screenshot is exactly the variation
+    the model must tolerate on screen.
+    """
+
+    def __init__(self, records, training=False, size=BOARD_DETECTION.KEYPOINT_INPUT_SIZE):
+        self.records = list(records)
+        self.training = bool(training)
+        self.size = int(size)
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        from PIL import Image
+
+        record = self.records[index]
+        with Image.open(record["image"]) as source:
+            image = source.convert("RGB")
+        points = np.asarray(record["points"], dtype=np.float32).reshape(-1, 2)
+        visibility = np.asarray(
+            record.get("visibility", np.ones(len(points))), dtype=np.float32
+        ).reshape(-1)
+
+        if self.training:
+            # Geometric augmentation. Points are in source pixels, so they are
+            # moved with the image, then the result is re-fit to the letterbox.
+            image, points, visibility = self._augment(image, points, visibility)
+
+        original_width, original_height = image.size
+        tensor, _metadata = BOARD_DETECTION.prepare_sample_image(image, self.size)
+        # ``prepare_sample_image`` letterboxes; map pixel keypoints through
+        # the same scale/offset before normalising to 0..1.
+        size = float(self.size)
+        scale = min(
+            size / max(original_width, 1), size / max(original_height, 1)
+        )
+        new_w = max(1, int(round(original_width * scale)))
+        new_h = max(1, int(round(original_height * scale)))
+        offset_x = (self.size - new_w) // 2
+        offset_y = (self.size - new_h) // 2
+        mapped = np.stack(
+            [
+                (points[:, 0] * scale + offset_x) / size,
+                (points[:, 1] * scale + offset_y) / size,
+            ],
+            axis=1,
+        )
+        targets = BOARD_DETECTION.gaussian_heatmaps(
+            mapped,
+            heatmap_size=BOARD_DETECTION.KEYPOINT_HEATMAP_SIZE,
+            sigma=BOARD_DETECTION.KEYPOINT_SIGMA,
+            visibility=visibility,
+        )
+        import torch
+
+        return (
+            torch.from_numpy(np.ascontiguousarray(tensor)),
+            torch.from_numpy(targets),
+        )
+
+    def _augment(self, image, points, visibility):
+        """Mild rotation/scale/shift/colour, applied to image *and* points."""
+        from PIL import Image as PilImage
+
+        rng = np.random.default_rng()
+        width, height = image.size
+        angle = float(rng.uniform(-10.0, 10.0))
+        zoom = float(rng.uniform(0.9, 1.1))
+        shift_x = float(rng.uniform(-0.03, 0.03)) * width
+        shift_y = float(rng.uniform(-0.03, 0.03)) * height
+
+        centre = np.array([width / 2.0, height / 2.0], dtype=np.float64)
+        theta = math.radians(angle)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        # Same affine convention as PIL's rotate/scale around the centre.
+        matrix = np.array(
+            [
+                [zoom * cos_t, -zoom * sin_t, 0.0],
+                [zoom * sin_t, zoom * cos_t, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        offset = centre + np.array([shift_x, shift_y]) - matrix[:2, :2] @ centre
+        matrix[0, 2] = offset[0]
+        matrix[1, 2] = offset[1]
+        inverse = np.linalg.inv(matrix)
+
+        transformed = image.rotate(
+            -angle, resample=PilImage.BILINEAR, center=tuple(centre)
+        ).resize(
+            (max(1, int(round(width * zoom))), max(1, int(round(height * zoom)))),
+            resample=PilImage.BILINEAR,
+        )
+        # Re-crop/pad back to the original size so the letterbox stays fixed.
+        canvas = PilImage.new("RGB", (width, height), (0, 0, 0))
+        canvas.paste(
+            transformed,
+            (
+                int(round(centre[0] - transformed.width / 2 + shift_x)),
+                int(round(centre[1] - transformed.height / 2 + shift_y)),
+            ),
+        )
+        moved = BOARD_DETECTION.apply_homography(inverse, points)
+        keep = (
+            (moved[:, 0] >= 0)
+            & (moved[:, 0] < width)
+            & (moved[:, 1] >= 0)
+            & (moved[:, 1] < height)
+        )
+        visibility = np.where(keep, visibility, 0.0).astype(np.float32)
+
+        from PIL import ImageEnhance
+
+        colour = float(rng.uniform(0.9, 1.1))
+        canvas = ImageEnhance.Brightness(canvas).enhance(colour)
+        canvas = ImageEnhance.Contrast(canvas).enhance(float(rng.uniform(0.9, 1.1)))
+        return canvas, moved, visibility
+
+
+def _split_board_samples(records, seed=RANDOM_SEED, validation_fraction=0.2):
+    """Deterministic train/validation split for board-detection samples."""
+    ordered = sorted(records, key=lambda record: str(record["image"]))
+    random.Random(seed).shuffle(ordered)
+    if len(ordered) < 5:
+        # Too few samples to hold anything back; train and report on all of
+        # them rather than producing an empty validation set.
+        return ordered, list(ordered)
+    validation_count = max(1, int(round(len(ordered) * validation_fraction)))
+    return ordered[validation_count:], ordered[:validation_count]
+
+
+def train_board_detection_model(args, *, event_callback=None, cancel_event=None):
+    """Train ``models/<model>_board.pth`` and return a summary dictionary.
+
+    Mirrors :func:`train_model`'s event contract so the same Tk dashboard
+    reports progress, but the metric is keypoint accuracy: the share of
+    predicted intersections within a few pixels of the labelled ones, plus
+    the median pixel error of the fitted lattice.
+    """
+    run_started_at = time.perf_counter()
+    model_name = resolve_model_name(args)
+    raw_dataset_dir = getattr(args, "dataset_dir", None)
+    dataset_dir = (
+        Path(raw_dataset_dir) if raw_dataset_dir else model_dataset_dir(model_name)
+    )
+    raw_output = getattr(args, "output", None)
+    output_model = (
+        Path(raw_output) if raw_output
+        else BOARD_DETECTION.board_model_path(model_output_path(model_name))
+    )
+    if output_model.suffix.lower() != ".pth":
+        output_model = output_model.with_suffix(".pth")
+    try:
+        output_model.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    print(f"Model: {model_name} (board detection)")
+    print(f"Dataset folder: {dataset_dir}")
+    print(f"Exporting board model to: {output_model}")
+
+    epochs = max(1, int(getattr(args, "epochs", EPOCHS)))
+    batch_size = max(1, int(getattr(args, "batch_size", BATCH_SIZE)))
+    learning_rate = float(getattr(args, "learning_rate", LEARNING_RATE))
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError("Learning rate must be a positive number")
+    seed = int(getattr(args, "seed", RANDOM_SEED))
+    set_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    records = BOARD_DETECTION.collect_board_samples(dataset_dir)
+    if not records:
+        raise ValueError(
+            "No labelled board-detection samples found in "
+            f"{BOARD_DETECTION.board_sample_dir(dataset_dir)}. Add a "
+            "screenshot in board-vision.py and mark its corners first."
+        )
+    train_records, val_records = _split_board_samples(records, seed=seed)
+    print(
+        f"Board samples: {len(train_records)} training, "
+        f"{len(val_records)} validation"
+    )
+
+    train_loader = DataLoader(
+        BoardKeypointDataset(train_records, training=True),
+        batch_size=batch_size, shuffle=True, num_workers=0,
+    )
+    val_loader = DataLoader(
+        BoardKeypointDataset(val_records, training=False),
+        batch_size=batch_size, shuffle=False, num_workers=0,
+    )
+
+    model = BOARD_DETECTION.build_board_detection_model().to(device)
+    # Heatmap regression: plain MSE over the 81 Gaussian maps, as recommended.
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3
+    )
+
+    best_error = None
+    best_epoch = 0
+    history = []
+    total_batches = len(train_loader) * epochs
+
+    for epoch in range(1, epochs + 1):
+        _raise_if_cancelled(cancel_event)
+        model.train()
+        running_loss = 0.0
+        batches = 0
+        for inputs, targets in tqdm(
+            train_loader,
+            desc=f"Epoch {epoch:02d}/{epochs:02d}",
+            disable=event_callback is not None,
+            leave=False,
+        ):
+            _raise_if_cancelled(cancel_event)
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += float(loss.item())
+            batches += 1
+            if event_callback is not None:
+                _emit_training_event(
+                    event_callback,
+                    "batch_completed",
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    batch=batches,
+                    total_batches=len(train_loader),
+                    loss=float(loss.item()),
+                    overall_fraction=((epoch - 1) * len(train_loader) + batches)
+                    / max(total_batches, 1),
+                    elapsed_seconds=time.perf_counter() - run_started_at,
+                )
+        train_loss = running_loss / max(batches, 1)
+
+        # Validation runs the real inference path (peak extraction + robust
+        # lattice fit) on every validation screenshot, so the reported number
+        # is the accuracy the GUI will get, not just heatmap loss.
+        model.eval()
+        keypoint_error_total = 0.0
+        keypoint_count_total = 0
+        lattice_error_total = 0.0
+        lattice_success = 0
+        val_loss_total = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for batch_index, (inputs, targets) in enumerate(val_loader):
+                inputs = inputs.to(device)
+                outputs = model(inputs)
+                val_loss_total += float(
+                    criterion(outputs, targets.to(device)).item()
+                )
+                val_batches += 1
+                start = batch_index * batch_size
+                for offset in range(outputs.shape[0]):
+                    record_index = start + offset
+                    if record_index >= len(val_records):
+                        break
+                    record = val_records[record_index]
+                    truth = _board_truth_in_input_space(record)
+                    predicted, _confidence, _visible = (
+                        BOARD_DETECTION.heatmaps_to_points(
+                            outputs[offset].detach().cpu().numpy()
+                        )
+                    )
+                    error = np.linalg.norm(predicted - truth, axis=1)
+                    keypoint_error_total += float(error.sum())
+                    keypoint_count_total += int(error.size)
+                    fit = BOARD_DETECTION.lattice_fit(predicted)
+                    if fit is not None:
+                        lattice_success += 1
+                        rebuilt = fit["points"]
+                        lattice_error_total += float(
+                            np.linalg.norm(rebuilt - truth, axis=1).mean()
+                        )
+        val_loss = val_loss_total / max(val_batches, 1)
+        mean_keypoint_error = (
+            keypoint_error_total / keypoint_count_total
+            if keypoint_count_total else float("nan")
+        )
+        mean_lattice_error = (
+            lattice_error_total / lattice_success if lattice_success else float("inf")
+        )
+        # ``best`` tracking and the dashboard both speak accuracy, so use a
+        # negative-error score: higher is better, exactly like the classifier.
+        validation_score = -mean_lattice_error
+        is_best = best_error is None or validation_score > best_error
+        print(
+            f"Epoch {epoch:02d}: heatmap_loss={train_loss:.5f}, "
+            f"val_loss={val_loss:.5f}, keypoint_err={mean_keypoint_error:.4f} "
+            f"of frame, lattice_err={mean_lattice_error:.3f}px "
+            f"({lattice_success}/{len(val_records)} fitted)"
+        )
+        scheduler.step(val_loss)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "validation_loss": val_loss,
+                "mean_keypoint_error": mean_keypoint_error,
+                "mean_lattice_error": mean_lattice_error,
+                "lattice_success": lattice_success,
+            }
+        )
+        _emit_training_event(
+            event_callback,
+            "epoch_completed",
+            epoch=epoch,
+            total_epochs=epochs,
+            metrics={
+                "training_loss": train_loss,
+                "validation_loss": val_loss,
+                "mean_lattice_error": mean_lattice_error,
+            },
+            best_accuracy=float(validation_score),
+            best_epoch=best_epoch if not is_best else epoch,
+            is_best=bool(is_best),
+            overall_fraction=epoch / epochs,
+            elapsed_seconds=time.perf_counter() - run_started_at,
+        )
+        if is_best:
+            best_error = validation_score
+            best_epoch = epoch
+            output_model.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "model_type": BOARD_DETECTION.MODEL_TYPE_BOARD,
+                    "model_state_dict": model.state_dict(),
+                    "image_size": BOARD_DETECTION.KEYPOINT_INPUT_SIZE,
+                    "heatmap_size": BOARD_DETECTION.KEYPOINT_HEATMAP_SIZE,
+                    "keypoint_grid": BOARD_DETECTION.KEYPOINT_GRID,
+                    "keypoint_count": BOARD_DETECTION.KEYPOINT_COUNT,
+                    "mean": list(BOARD_DETECTION.IMAGENET_MEAN),
+                    "std": list(BOARD_DETECTION.IMAGENET_STD),
+                    "model_name": model_name,
+                    "dataset_dir": str(dataset_dir),
+                    "training_samples": len(train_records),
+                    "validation_samples": len(val_records),
+                    "epoch": int(epoch),
+                    "epochs_configured": int(epochs),
+                    "batch_size": int(batch_size),
+                    "learning_rate": learning_rate,
+                    "training_loss": float(train_loss),
+                    "validation_loss": float(val_loss),
+                    "metrics_history": [dict(item) for item in history],
+                },
+                output_model,
+            )
+            print(f"  Saved new best board model: {output_model}")
+            _emit_training_event(
+                event_callback,
+                "checkpoint_saved",
+                epoch=epoch,
+                total_epochs=epochs,
+                output_model=str(output_model),
+                validation_accuracy=float(-val_loss),
+                best_accuracy=float(-best_error),
+                best_epoch=best_epoch,
+            )
+
+    _raise_if_cancelled(cancel_event)
+    summary = {
+        "model": model_name,
+        "model_type": BOARD_DETECTION.MODEL_TYPE_BOARD,
+        "output": str(output_model),
+        "best_epoch": int(best_epoch),
+        "best_validation_loss": float(val_loss),
+        "best_mean_lattice_error": float(-best_error) if best_error is not None else None,
+        "training_samples": len(train_records),
+        "validation_samples": len(val_records),
+        "history": [dict(item) for item in history],
+        "elapsed_seconds": time.perf_counter() - run_started_at,
+    }
+    print(
+        f"\nBoard-detection training finished: best epoch {best_epoch}, "
+        f"lattice error {summary['best_mean_lattice_error']:.3f}px "
+        f"(validation loss {summary['best_validation_loss']:.5f})"
+    )
+    return summary
+
+
+def _board_truth_in_input_space(record, size=BOARD_DETECTION.KEYPOINT_INPUT_SIZE):
+    """A sample's labelled keypoints mapped to the model's 0..1 input space."""
+    with Image.open(record["image"]) as source:
+        width, height = source.size
+    points = np.asarray(record["points"], dtype=np.float64).reshape(-1, 2)
+    scale = min(size / max(width, 1), size / max(height, 1))
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    offset_x = (size - new_w) // 2
+    offset_y = (size - new_h) // 2
+    return np.stack(
+        [
+            (points[:, 0] * scale + offset_x) / size,
+            (points[:, 1] * scale + offset_y) / size,
+        ],
+        axis=1,
+    )
+
+
+def train_any_model(args, *, event_callback=None, cancel_event=None):
+    """Dispatch to the piece or board trainer from ``args.model_type``."""
+    model_type = BOARD_DETECTION.normalise_model_type(
+        getattr(args, "model_type", BOARD_DETECTION.MODEL_TYPE_PIECES)
+    )
+    if model_type == BOARD_DETECTION.MODEL_TYPE_BOARD:
+        return train_board_detection_model(
+            args, event_callback=event_callback, cancel_event=cancel_event
+        )
+    return train_model(args, event_callback=event_callback, cancel_event=cancel_event)
+
+
 def _dataset_has_discoverable_images(dataset_dir):
     """Whether folder/flat discovery has anything to read in a dataset root."""
     dataset_dir = Path(dataset_dir)
@@ -1202,6 +1631,15 @@ def parse_args(argv=None):
         help=(
             "Model to train: reads datasets/<model>/ and exports to "
             "models/<model>.pth (default: ask, or 'default')"
+        ),
+    )
+    parser.add_argument(
+        "--model-type",
+        choices=BOARD_DETECTION.MODEL_TYPES,
+        default=BOARD_DETECTION.MODEL_TYPE_PIECES,
+        help=(
+            "pieces = the square classifier (default); board = the 9x9 "
+            "keypoint heatmap model that replaces the OpenCV corner search"
         ),
     )
     parser.add_argument(
@@ -1947,6 +2385,11 @@ def run_training_ui(initial_args):
             self.seed_var = tk.StringVar(
                 value=str(getattr(args, "seed", RANDOM_SEED))
             )
+            self.model_type_var = tk.StringVar(
+                value=BOARD_DETECTION.model_type_label(
+                    getattr(args, "model_type", BOARD_DETECTION.MODEL_TYPE_PIECES)
+                )
+            )
             self.dedupe_var = tk.StringVar(
                 value=str(getattr(args, "dedupe", "exact-near"))
             )
@@ -2239,17 +2682,21 @@ def run_training_ui(initial_args):
                 font=("Segoe UI", 22, "bold"),
                 anchor="w",
             ).pack(fill="x")
-            tk.Label(
-                title_box,
-                text=(
+            self.subtitle_var = tk.StringVar(
+                value=(
                     "Live square-classifier training from the physical "
                     "training/validation folders"
-                ),
+                )
+            )
+            self.subtitle_label = tk.Label(
+                title_box,
+                textvariable=self.subtitle_var,
                 bg=colours["bg"],
                 fg=colours["muted"],
                 font=("Segoe UI", 10),
                 anchor="w",
-            ).pack(fill="x", pady=(1, 0))
+            )
+            self.subtitle_label.pack(fill="x", pady=(1, 0))
             self.status_label = tk.Label(
                 header,
                 text="● Ready",
@@ -2273,6 +2720,25 @@ def run_training_ui(initial_args):
 
             setup_card, setup = self._card(left, "Training setup")
             setup_card.pack(fill="x")
+            self._small_label(setup, "Model type").pack(
+                fill="x", pady=(10, 3)
+            )
+            self.model_type_combo = ttk.Combobox(
+                setup,
+                textvariable=self.model_type_var,
+                values=[
+                    BOARD_DETECTION.model_type_label(model_type)
+                    for model_type in BOARD_DETECTION.MODEL_TYPES
+                ],
+                state="readonly",
+            )
+            self.model_type_combo.pack(fill="x")
+            self.model_type_combo.bind(
+                "<<ComboboxSelected>>", self._on_model_type_selected
+            )
+            self.input_widgets.append(self.model_type_combo)
+
+
             self._small_label(setup, "Model").pack(
                 fill="x", pady=(8, 3)
             )
@@ -2667,6 +3133,43 @@ def run_training_ui(initial_args):
             self._refresh_model_choices()
 
 
+        def _selected_model_type(self):
+            """Currently chosen model type (``pieces`` or ``board``)."""
+            label = self.model_type_var.get().strip()
+            for model_type, model_label in BOARD_DETECTION.MODEL_TYPE_LABELS.items():
+                if model_label == label:
+                    return model_type
+            return BOARD_DETECTION.normalise_model_type(label)
+
+        def _on_model_type_selected(self, _event=None):
+            """Re-point the export path and explain the other dataset layout."""
+            model_type = self._selected_model_type()
+            name = sanitise_model_name(self.model_var.get())
+            if model_type == BOARD_DETECTION.MODEL_TYPE_BOARD:
+                self.output_var.set(
+                    str(BOARD_DETECTION.board_model_path(model_output_path(name)))
+                )
+                self.subtitle_var.set(
+                    "Board detection: 9x9 keypoint heatmaps from the labelled "
+                    "screenshots in board_detection/samples"
+                )
+                self._append_log(
+                    "Model type: Board detection - trains "
+                    "models/<model>_board.pth from the keypoint samples "
+                    "board-vision.py saved under "
+                    f"{BOARD_DETECTION.board_sample_dir(self.dataset_var.get().strip() or model_dataset_dir(name))}"
+                )
+            else:
+                self.output_var.set(str(model_output_path(name)))
+                self.subtitle_var.set(
+                    "Live square-classifier training from the physical "
+                    "training/validation folders"
+                )
+                self._append_log(
+                    "Model type: Piece detection - trains "
+                    "models/<model>.pth from training/<class>/"
+                )
+
         def _browse_dataset(self):
             selected = filedialog.askdirectory(
                 title="Choose the dataset folder",
@@ -2793,6 +3296,7 @@ def run_training_ui(initial_args):
             csv_text = self.csv_var.get().strip()
             return argparse.Namespace(
                 model=model_name,
+                model_type=self._selected_model_type(),
 
                 dataset_dir=Path(dataset_dir),
                 csv=Path(csv_text) if csv_text else None,
@@ -3015,7 +3519,7 @@ def run_training_ui(initial_args):
                 with contextlib.redirect_stdout(writer), (
                     contextlib.redirect_stderr(writer)
                 ):
-                    summary = train_model(
+                    summary = train_any_model(
                         run_args,
                         event_callback=post,
                         cancel_event=cancel_event,
@@ -3843,7 +4347,14 @@ def main(argv=None):
     if not getattr(args, "dataset_dir", None):
         args.dataset_dir = model_dataset_dir(resolve_model_name(args))
     if not getattr(args, "output", None):
-        args.output = model_output_path(resolve_model_name(args))
+        if BOARD_DETECTION.normalise_model_type(
+            getattr(args, "model_type", BOARD_DETECTION.MODEL_TYPE_PIECES)
+        ) == BOARD_DETECTION.MODEL_TYPE_BOARD:
+            args.output = BOARD_DETECTION.board_model_path(
+                model_output_path(resolve_model_name(args))
+            )
+        else:
+            args.output = model_output_path(resolve_model_name(args))
 
     if bool(getattr(args, "ui", True)):
         try:
@@ -3856,7 +4367,7 @@ def main(argv=None):
             )
 
     try:
-        train_model(args)
+        train_any_model(args)
     except (TrainingCancelled, KeyboardInterrupt):
         print("\nTraining cancelled.")
         return 130

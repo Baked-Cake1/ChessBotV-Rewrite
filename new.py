@@ -626,7 +626,7 @@ ANALYSIS_OVERLAY_KEYS = (
 ANALYSIS_OVERLAY_CONFIG_KEYS = {
     key: f"analysis_{key}" for key in ANALYSIS_OVERLAY_KEYS
 }
-ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_instant_checking": 0, "autoplay_bullet_mode": 0, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1, "gui_swing": 0, "gui_combined_mode": 0, "gui_mate_animation": 0, "gui_rule_repetition": "Three-Fold", "gui_rule_insufficient_material": 1, "gui_rule_king_capturing": 0, "gui_rule_double_pawn": 1, "gui_rule_en_passant": 1, "gui_rule_promotion": 1, "gui_rule_castling": 1, "gui_rule_friendly_fire": 0, "gui_rule_always_queen": 0}
+ENGINE_DEFAULTS = {"hash": 2048, "threads": 4, "skill": 20, "depth": 25, "multipv": 1, "theme": "classic", "board_theme": "classic", "always_on_top": 1, "auto_move": 0, "auto_move_color": "both", "auto_move_depth": 0, "autoplay_depth": 20, "autoplay_instant_checking": 0, "autoplay_bullet_mode": 0, "autoplay_side": "ask", "autoplay_broadcast_mode": "ask", "autoplay_broadcast_kind": "", "autoplay_broadcast_title": "", "autoplay_broadcast_process": "", "autoplay_broadcast_screen_index": -1, "autoplay_broadcast_screen_device": "", "autoplay_broadcast_left": 0, "autoplay_broadcast_top": 0, "autoplay_broadcast_right": 0, "autoplay_broadcast_bottom": 0, "use_package": 0, "vision_model": "default", "prefer_board_model": 0, "analysis_pinned_pieces": 0, "analysis_checkable_king": 0, "analysis_unprotected_pieces": 0, "analysis_piece_mobility": 0, "analysis_live_ratings": 0, "analysis_backwards_pawn": 0, "analysis_isolated_pawn": 0, "analysis_passed_pawn": 0, "gui_basic_arrows": 0, "gui_arrow_anim_style": "Cubic", "gui_legacy_buttons": 0, "gui_coordinates": 0, "gui_rounded_corners": 0, "gui_piece_anim_style": "Cubic", "gui_fancy_knight": 0, "gui_show_legal_moves": 1, "gui_disable_legal_moves_anim": 0, "gui_rotate_piece_on_move": 1, "gui_swing": 0, "gui_combined_mode": 0, "gui_mate_animation": 0, "gui_rule_repetition": "Three-Fold", "gui_rule_insufficient_material": 1, "gui_rule_king_capturing": 0, "gui_rule_double_pawn": 1, "gui_rule_en_passant": 1, "gui_rule_promotion": 1, "gui_rule_castling": 1, "gui_rule_friendly_fire": 0, "gui_rule_always_queen": 0}
 _STRING_CONFIG_KEYS = (
     "theme",
     "board_theme",
@@ -664,6 +664,12 @@ def _normalise_autoplay_broadcast_kind(value):
 
 VISION_MODELS_DIR_NAME = "models"
 VISION_DEFAULT_MODEL = "default"
+# How sure the board-detection lattice fit must be before its geometry is
+# trusted over the OpenCV locator. The lattice confidence blends keypoint
+# coverage with fit tightness, so ~0.55 rejects a lattice that only explains
+# half the board while accepting a normal, slightly noisy detection.
+BOARD_MODEL_MIN_CONFIDENCE = 0.55
+BOARD_DETECTION_MODULE_NAME = "board_detection"
 VISION_LEGACY_MODEL_FILENAME = "chessbotv_cnn.pth"
 _VISION_MODEL_NAME_SANITISE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -688,6 +694,137 @@ def vision_model_path(name):
     return os.path.join(
         vision_models_dir(), f"{_normalise_vision_model_name(name)}.pth"
     )
+
+
+def vision_board_model_path(name=None):
+    """Board-detection checkpoint beside the square model (``<name>_board.pth``)."""
+    name = _normalise_vision_model_name(
+        name if name is not None else globals().get("vision_model_name")
+    )
+    return os.path.join(vision_models_dir(), f"{name}_board.pth")
+
+
+def vision_board_model_available(name=None):
+    """Whether a trained board-detection checkpoint exists for this model."""
+    try:
+        return os.path.isfile(vision_board_model_path(name))
+    except Exception:
+        return False
+
+
+_board_detection_module = None
+_board_detection_error = ""
+_board_model_cache = {"name": None, "path": None, "model": None, "error": ""}
+_board_model_lock = threading.Lock()
+
+
+def _board_detection_module_import():
+    """Import ``board_detection.py`` once (it is NumPy-only until used)."""
+    global _board_detection_module, _board_detection_error
+    if _board_detection_module is not None:
+        return _board_detection_module
+    try:
+        module = importlib.import_module(BOARD_DETECTION_MODULE_NAME)
+    except Exception as exc:
+        _board_detection_error = str(exc)
+        return None
+    _board_detection_module = module
+    return module
+
+
+def _load_board_detection_model():
+    """Load and cache ``models/<model>_board.pth`` for the chosen model.
+
+    Returns ``(module, model)`` or ``(module, None)`` with the reason in
+    ``_board_model_cache["error"]``. Never raises: the caller falls back to the
+    OpenCV locator, which is exactly what the "experimental" switch implies.
+    """
+    module = _board_detection_module_import()
+    if module is None:
+        return None, None
+    name = _normalise_vision_model_name(
+        globals().get("vision_model_name", VISION_DEFAULT_MODEL)
+    )
+    path = vision_board_model_path(name)
+    if not os.path.isfile(path):
+        _board_model_cache["error"] = (
+            f"No board-detection model at models/{name}_board.pth"
+        )
+        return module, None
+    if (
+        _board_model_cache["model"] is not None
+        and _board_model_cache["path"] == path
+    ):
+        return module, _board_model_cache["model"]
+    with _board_model_lock:
+        if (
+            _board_model_cache["model"] is not None
+            and _board_model_cache["path"] == path
+        ):
+            return module, _board_model_cache["model"]
+        token = _begin_loading_activity(
+            "Loading board-detection model",
+            f"models/{name}_board.pth",
+        )
+        try:
+            import torch
+
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+            checkpoint = _torch_load_checkpoint(torch, path, device)
+            state_dict = _cnn_state_dict_from_checkpoint(checkpoint)
+            if state_dict is None:
+                raise ValueError("Unsupported board checkpoint format")
+            model = module.build_board_detection_model(
+                int(
+                    checkpoint.get("keypoint_count", module.KEYPOINT_COUNT)
+                    if isinstance(checkpoint, dict) else module.KEYPOINT_COUNT
+                )
+            )
+            model.load_state_dict(state_dict, strict=True)
+            model.to(device)
+            model.eval()
+        except Exception as exc:
+            _board_model_cache["error"] = (
+                f"Could not load models/{name}_board.pth: {exc}"
+            )
+            _board_model_cache["model"] = None
+            _board_model_cache["path"] = None
+            return module, None
+        finally:
+            _end_loading_activity(token)
+        _board_model_cache.update(
+            {"name": name, "path": path, "model": model, "error": ""}
+        )
+        return module, model
+
+
+def detect_board_with_model(image, min_confidence=BOARD_MODEL_MIN_CONFIDENCE):
+    """Locate the board in a BGR screenshot with the trained model.
+
+    Returns the ``board_detection`` detection dict, or ``None`` when the
+    model is unavailable or the lattice fit is not trustworthy. Rejecting an
+    unsure lattice is deliberate: falling back to OpenCV is safer than
+    warping the wrong rectangle.
+    """
+    module, model = _load_board_detection_model()
+    if module is None or model is None:
+        return None
+    try:
+        detection = module.detect_board_with_model(image, model)
+    except Exception as exc:
+        _board_model_cache["error"] = f"Board model inference failed: {exc}"
+        return None
+    if detection is None:
+        return None
+    if float(detection.get("confidence", 0.0)) < float(min_confidence):
+        _board_model_cache["error"] = (
+            f"Board model was not confident enough "
+            f"({float(detection.get('confidence', 0.0)):.2f} < {min_confidence:.2f})"
+        )
+        return None
+    return detection
 
 
 def vision_model_names():
@@ -752,6 +889,9 @@ def _clamp_config_limits(cfg):
     cfg["auto_move_color"] = color if color in ("white", "black", "both") else "both"
     cfg["always_on_top"] = 1 if cfg.get("always_on_top", 1) else 0
     cfg["use_package"] = 1 if cfg.get("use_package", 0) else 0
+    cfg["prefer_board_model"] = (
+        1 if cfg.get("prefer_board_model", 0) else 0
+    )
     cfg["vision_model"] = _normalise_vision_model_name(
         cfg.get("vision_model", VISION_DEFAULT_MODEL)
     )
@@ -869,6 +1009,7 @@ def save_config():
                 "gui_legacy_buttons",
                 "gui_coordinates",
                 "gui_rounded_corners",
+                "prefer_board_model",
                 "gui_fancy_knight",
                 "gui_show_legal_moves",
                 "gui_disable_legal_moves_anim",
@@ -2167,6 +2308,10 @@ if autoplay_broadcast_mode == "saved" and not autoplay_broadcast_target:
     autoplay_broadcast_mode = "ask"
     config["autoplay_broadcast_mode"] = "ask"
 use_package_enabled = bool(config.get("use_package", 0))
+# Display > GUI "Prefer model over OpenCV (experimental)". Off by default;
+# when on, Detect Board / Auto-Play / Advisor ask the board-detection model
+# for the board geometry before falling back to the OpenCV corner search.
+prefer_board_model = bool(config.get("prefer_board_model", 0))
 vision_model_name = _normalise_vision_model_name(
     config.get("vision_model", VISION_DEFAULT_MODEL)
 )
@@ -11320,6 +11465,18 @@ _GUI_SECTIONS = [
         ],
     ),
     (
+        "Vision",
+        [
+            (
+                "prefer_board_model",
+                "Prefer model over OpenCV (experimental)",
+                "toggle",
+                "Detect, Auto-Play and Advisor locate the board with the "
+                "trained board-detection model instead of OpenCV corners",
+            ),
+        ],
+    ),
+    (
         "Board",
         [
             ("gui_coordinates", "Coordinates", "toggle", "Show rank (1-8) and file (a-h) labels"),
@@ -11495,8 +11652,12 @@ def handle_gui_settings_click(mx, my):
     for kind, _label, rect, key, _desc in items:
         if kind in ("toggle", "dropdown") and rect.collidepoint(mx, my):
             if kind == "toggle":
-                config[key] = 0 if config.get(key, ENGINE_DEFAULTS.get(key, 0)) else 1
-                save_config()
+                enabled = not config.get(key, ENGINE_DEFAULTS.get(key, 0))
+                if key == "prefer_board_model":
+                    set_prefer_board_model(enabled)
+                else:
+                    config[key] = 1 if enabled else 0
+                    save_config()
                 return True
             elif kind == "dropdown":
                 gui_settings_dropdown_open = None if gui_settings_dropdown_open == key else key
@@ -13189,6 +13350,108 @@ def _find_board_with_opencv_classic(image):
     return None
 
 
+def _board_model_settings_enabled():
+    """Whether Display > GUI says to prefer the trained board model."""
+    value = globals().get("prefer_board_model", False)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
+
+
+def set_prefer_board_model(enabled, persist=True):
+    """Turn the experimental board-model locator on or off for future scans.
+
+    Like ``set_use_package``, this is an ordinary saved preference but the
+    value is read at the start of each detection, so toggling it never
+    changes a scan that is already running. Turning it on also drops any
+    cached load failure so the next scan retries the checkpoint.
+    """
+    global prefer_board_model
+    prefer_board_model = bool(enabled)
+    config["prefer_board_model"] = 1 if prefer_board_model else 0
+    if prefer_board_model:
+        _board_model_cache["error"] = ""
+    if persist:
+        save_config()
+    if prefer_board_model:
+        name = _normalise_vision_model_name(config.get("vision_model"))
+        if vision_board_model_available(name):
+            print(
+                f"Board locator: board model models/{name}_board.pth "
+                "(experimental)."
+            )
+        else:
+            print(
+                f"Board locator: preferred the model, but "
+                f"models/{name}_board.pth is missing - OpenCV will be used."
+            )
+    else:
+        print("Board locator: OpenCV corners.")
+    return prefer_board_model
+
+
+def _find_board_with_model(image):
+    """Locate a board with the trained board-detection model, or return None.
+
+    The model predicts 81 grid intersections, the lattice fit turns them into
+    one homography, and that homography gives both the outer rectangle and
+    the perspective-corrected corner order. The result deliberately mirrors
+    ``_find_board_with_opencv_sb``: the existing pipeline then scores,
+    refines and classifies exactly as it does for an OpenCV hit, so the only
+    thing the experimental switch changes is *where* the board is.
+    """
+    if not _board_model_settings_enabled():
+        return None
+    try:
+        detection = detect_board_with_model(image)
+    except Exception:
+        return None
+    if not detection:
+        return None
+    try:
+        rect = tuple(float(v) for v in detection["board_rect"])
+        corners = [
+            (float(point[0]), float(point[1]))
+            for point in detection["corners"]
+        ]
+    except Exception:
+        return None
+    if len(corners) != 4:
+        return None
+    side = min(rect[2], rect[3])
+    if side < BOARD_DETECTION_MIN_SIDE:
+        return None
+    # The SB/classic locators report the 7x7 internal corner grid; the model
+    # already gives the 9x9 lattice, so the outer four points are the board
+    # outline and the interior ones keep the same naming for diagnostics.
+    internal = [
+        [
+            (float(detection["points"][row * 9 + col][0]),
+             float(detection["points"][row * 9 + col][1]))
+            for col in range(1, 8)
+        ]
+        for row in range(1, 8)
+    ]
+    return {
+        "board_rect": tuple(int(round(value)) for value in rect),
+        "corners": corners,
+        "internal_corners": internal,
+        "pattern_size": (7, 7),
+        "cell_size": float(side) / 8.0,
+        "grid_error": float(detection.get("mean_error", 0.0)),
+        "max_grid_error": float(detection.get("mean_error", 0.0)),
+        "preprocessing": "board_model",
+        "method": "board_model",
+        "model_confidence": float(detection.get("confidence", 0.0)),
+        "model_inliers": int(detection.get("inlier_count", 0)),
+        "model_points": [
+            (float(point[0]), float(point[1]))
+            for point in detection["points"]
+        ],
+        "model_homography": detection.get("homography"),
+    }
+
+
 def _find_board_with_opencv_corners(image):
     """Primary board locator: OpenCV SB corners, then classic corners."""
     return (
@@ -13555,10 +13818,15 @@ def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
         classifier = _get_cnn_classifier()
     image_h, image_w = image.shape[:2]
 
-    # Primary locator: OpenCV's chessboard-corner detectors. Their
-    # helper deliberately turns every import/API/not-found/invalid-grid
-    # outcome into None, which selects the colour fallback below.
-    corner_detection = _find_board_with_opencv_corners(image)
+    # Primary locator: the trained board-detection model when Display > GUI
+    # asks for it, otherwise OpenCV's chessboard-corner detectors. Every
+    # locator returns None on any failure, which selects the next one and
+    # finally the colour fallback below, so a model miss is never fatal.
+    corner_detection = None
+    if _board_model_settings_enabled():
+        corner_detection = _find_board_with_model(image)
+    if corner_detection is None:
+        corner_detection = _find_board_with_opencv_corners(image)
 
     # Colour integrals are still useful with a corner rectangle: they
     # supply the established palette/geometry fields and can offer a
@@ -13654,6 +13922,19 @@ def detect_chessboard_in_image(image, expected_anchors=None, use_package=None):
         best["board_corner_scale"] = float(
             corner_detection.get("scale", 1.0)
         )
+        # Board-model extras: the full 9x9 lattice and its homography let a
+        # caller perspective-correct squares instead of using the rectangle.
+        if method == "board_model":
+            best["board_model_confidence"] = float(
+                corner_detection.get("model_confidence", 0.0)
+            )
+            best["board_model_inliers"] = int(
+                corner_detection.get("model_inliers", 0)
+            )
+            best["board_model_points"] = corner_detection.get("model_points")
+            best["board_model_homography"] = corner_detection.get(
+                "model_homography"
+            )
         if method == "opencv_findChessboardCornersSB":
             # Field names from the original SB-only locator.
             best["board_sb_rect"] = raw_corner_rect
@@ -16883,7 +17164,14 @@ def _board_detection_summary(result):
     detection_method = str(
         result.get("board_detection_method", "") or ""
     ).strip()
-    if detection_method == "opencv_findChessboardCornersSB":
+    if detection_method == "board_model":
+        confidence = float(result.get("board_model_confidence", 0.0) or 0.0)
+        inliers = int(result.get("board_model_inliers", 0) or 0)
+        summary += (
+            f" Locator: board model ({confidence:.0%} confident, "
+            f"{inliers}/81 points)."
+        )
+    elif detection_method == "opencv_findChessboardCornersSB":
         summary += " Locator: OpenCV corners."
     elif detection_method == "opencv_findChessboardCorners":
         summary += " Locator: OpenCV corners (classic)."
