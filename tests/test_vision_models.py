@@ -12,6 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -317,6 +320,209 @@ class ChessBotVModelSelectionTests(unittest.TestCase):
             str(self.tmp / "models" / "My_Set.pth"),
         )
         self.assertEqual(self.cbm["_normalise_vision_model_name"](""), "default")
+
+
+class ScreenshotFormatConversionTests(unittest.TestCase):
+    """Any image format is accepted and converted to PNG before import."""
+
+    def setUp(self):
+        import shutil
+
+        self.shutil = shutil
+        self.bv = _load_board_vision()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.rgb = Image.new("RGB", (8, 8), (120, 80, 40))
+
+    def tearDown(self):
+        self.shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _save(self, name, image_format, image=None):
+        path = self.tmp / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (image or self.rgb).save(path, format=image_format)
+        return path
+
+    def test_common_formats_convert_to_png_and_keep_pixels(self):
+        cases = [
+            ("board.jpg", "JPEG"),
+            ("board.jfif", "JPEG"),
+            ("board.webp", "WEBP"),
+            ("board.avif", "AVIF"),
+            ("board.bmp", "BMP"),
+            ("board.gif", "GIF"),
+            ("board.tif", "TIFF"),
+            ("board.tga", "TGA"),
+        ]
+        for name, image_format in cases:
+            with self.subTest(format=image_format):
+                # Distinct stems: same-stem sources legitimately share one
+                # conversion, which is tested separately.
+                extension = Path(name).suffix
+                source = self._save(f"board_{image_format.lower()}{extension}",
+                                    image_format)
+                png_path, details = self.bv.prepare_image_for_import(source)
+                self.assertEqual(Path(png_path).suffix, ".png")
+                self.assertTrue(details["converted"])
+                self.assertEqual(details["format"], image_format)
+                with Image.open(png_path) as converted:
+                    self.assertEqual(converted.format, "PNG")
+                    self.assertEqual(converted.size, (8, 8))
+                loaded = self.bv.load_screenshot(source)
+                self.assertEqual(loaded.shape, (8, 8, 3))
+                # JPEG/WebP/AVIF are lossy, so allow a small tolerance;
+                # lossless formats must reproduce the pixel exactly.
+                lossless = image_format in ("BMP", "PNG", "TIFF", "TGA", "GIF")
+                for channel in range(3):
+                    self.assertAlmostEqual(
+                        int(loaded[0, 0, channel]),
+                        (120, 80, 40)[channel],
+                        delta=0 if lossless else 6,
+                    )
+
+    def test_png_passes_through_untouched(self):
+        source = self._save("board.png", "PNG")
+        before = source.stat().st_mtime_ns
+        png_path, details = self.bv.prepare_image_for_import(source)
+        self.assertEqual(Path(png_path), source)
+        self.assertFalse(details["converted"])
+        self.assertEqual(source.stat().st_mtime_ns, before)
+        self.assertEqual(sorted(self.tmp.iterdir()), [source])
+
+    def test_real_format_wins_over_misleading_extension(self):
+        # A JPEG downloaded as ".png" must still open, and convert.
+        jpeg_named_png = self._save("photo.png", "JPEG")
+        png_path, details = self.bv.prepare_image_for_import(jpeg_named_png)
+        self.assertEqual(details["format"], "JPEG")
+        self.assertTrue(details["converted"])
+        self.assertEqual(png_path.name, "photo (converted).png")
+
+        # The reverse: PNG bytes behind other names are used as-is.
+        png_named_txt = self._save("board.txt", "PNG")
+        png_path, details = self.bv.prepare_image_for_import(png_named_txt)
+        self.assertFalse(details["converted"])
+        self.assertEqual(Path(png_path), png_named_txt)
+
+        # No extension at all.
+        no_suffix = self.tmp / "screenshot"
+        self.rgb.save(no_suffix, format="WEBP")
+        png_path, details = self.bv.prepare_image_for_import(no_suffix)
+        self.assertTrue(details["converted"])
+        self.assertEqual(Path(png_path).suffix, ".png")
+
+    def test_conversion_is_idempotent_and_collision_safe(self):
+        source = self._save("shot.jpg", "JPEG")
+        first_png, _ = self.bv.prepare_image_for_import(source)
+        again_png, details = self.bv.prepare_image_for_import(source)
+        # Re-importing the same screenshot reuses one converted PNG.
+        self.assertEqual(Path(first_png), Path(again_png))
+        self.assertTrue(details["reused"])
+        self.assertEqual(len(list(self.tmp.glob("*.png"))), 1)
+
+        # A different image with the same stem keeps both files.
+        other = self._save("shot.webp", "WEBP",
+                           Image.new("RGB", (16, 16), (0, 200, 0)))
+        other_png, _ = self.bv.prepare_image_for_import(other)
+        self.assertNotEqual(Path(other_png), Path(first_png))
+        with Image.open(other_png) as converted:
+            self.assertEqual(converted.size, (16, 16))
+
+        # Same stem, same dimensions, different picture: the converted file
+        # must not be shared, or one board would be reviewed as the other.
+        red = self._save("same.webp", "WEBP",
+                         Image.new("RGB", (64, 64), (255, 0, 0)))
+        blue = self._save("same.png", "PNG",
+                          Image.new("RGB", (64, 64), (0, 0, 255)))
+        red_png, _ = self.bv.prepare_image_for_import(red)
+        blue_png, _ = self.bv.prepare_image_for_import(blue)
+        self.assertNotEqual(Path(red_png), Path(blue_png))
+        with Image.open(red_png) as converted:
+            pixel = converted.convert("RGB").getpixel((0, 0))
+        self.assertGreater(pixel[0], 200)   # red, allowing WebP loss
+        self.assertLess(pixel[2], 40)
+        with Image.open(blue_png) as converted:
+            self.assertEqual(converted.convert("RGB").getpixel((0, 0)), (0, 0, 255))
+
+        # A source edited after conversion is re-converted in place.
+        import os
+        import time
+
+        time.sleep(0.01)
+        Image.new("RGB", (8, 8), (200, 0, 0)).save(source, format="JPEG")
+        stamp = source.stat()
+        os.utime(source, (stamp.st_atime, stamp.st_mtime + 5))
+        refreshed, _ = self.bv.prepare_image_for_import(source)
+        self.assertEqual(Path(refreshed), Path(first_png))
+        with Image.open(refreshed) as converted:
+            self.assertEqual(
+                tuple(converted.convert("RGB").getpixel((0, 0))), (200, 0, 0)
+            )
+
+    def test_transparency_and_exif_and_multiframe(self):
+        rgba = Image.new("RGBA", (8, 8), (10, 20, 30, 120))
+        source = self._save("alpha.webp", "WEBP", rgba)
+        png_path, _ = self.bv.prepare_image_for_import(source)
+        with Image.open(png_path) as converted:
+            self.assertEqual(converted.mode, "RGBA")
+        self.assertEqual(self.bv.load_screenshot(source).shape, (8, 8, 3))
+
+        frames = [Image.new("RGB", (8, 8), (255, 0, 0)),
+                  Image.new("RGB", (8, 8), (0, 255, 0))]
+        animated = self.tmp / "anim.gif"
+        frames[0].save(animated, save_all=True, append_images=frames[1:])
+        png_path, details = self.bv.prepare_image_for_import(animated)
+        self.assertEqual(details["frames"], 2)
+        self.assertEqual(tuple(self.bv.load_screenshot(animated)[0, 0]),
+                         (255, 0, 0))
+
+        deep = (np.arange(64, dtype=np.uint16).reshape(8, 8) * 1000)
+        Image.fromarray(deep).save(self.tmp / "deep.tif")
+        loaded = self.bv.load_screenshot(self.tmp / "deep.tif")
+        self.assertEqual(loaded.dtype, np.uint8)
+        self.assertLess(int(loaded.max()), 255)
+
+    def test_unreadable_image_raises_a_clear_error(self):
+        garbage = self.tmp / "notes.jpg"
+        garbage.write_bytes(b"not an image")
+        with self.assertRaises(ValueError):
+            self.bv.prepare_image_for_import(garbage)
+        with self.assertRaises(FileNotFoundError):
+            self.bv.load_screenshot(garbage)
+        with self.assertRaises(FileNotFoundError):
+            self.bv.prepare_image_for_import(self.tmp / "missing.png")
+        empty = self.tmp / "empty.png"
+        empty.write_bytes(b"")
+        with self.assertRaises(ValueError):
+            self.bv.prepare_image_for_import(empty)
+
+    def test_heif_missing_plugin_explains_the_fix(self):
+        heic = self.tmp / "iphone.heic"
+        heic.write_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1")
+        if self.bv._register_heif_support():
+            self.skipTest("pillow-heif is installed; real HEIC decode is tested")
+        with self.assertRaises(ValueError) as caught:
+            self.bv.prepare_image_for_import(heic)
+        self.assertIn("pillow-heif", str(caught.exception))
+
+    def test_supported_image_detection_uses_extensions_and_bytes(self):
+        self.assertTrue(self.bv.is_supported_image(self._save("a.webp", "WEBP")))
+        self.assertTrue(self.bv.is_supported_image(self._save("a.jfif", "JPEG")))
+        self.assertTrue(self.bv.is_supported_image(self._save("a.avif", "AVIF")))
+        webp_named_txt = self._save("sneaky.txt", "WEBP")
+        self.assertTrue(self.bv.is_supported_image(webp_named_txt))
+        junk = self.tmp / "notes.jpg"
+        junk.write_bytes(b"definitely not an image")
+        self.assertFalse(self.bv.is_supported_image(junk))
+
+    def test_folder_drop_collects_converted_formats(self):
+        self._save("one.webp", "WEBP")
+        self._save("two.avif", "AVIF")
+        self._save("three.jfif", "JPEG")
+        (self.tmp / "ignore.txt").write_text("not an image")
+        collected = self.bv._expand_image_inputs([str(self.tmp)])
+        self.assertEqual(
+            sorted(path.name for path in collected),
+            ["one.webp", "three.jfif", "two.avif"],
+        )
 
 
 if __name__ == "__main__":

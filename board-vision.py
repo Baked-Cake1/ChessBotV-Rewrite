@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import io
 import math
 import os
 import re
@@ -11,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 try:
@@ -259,9 +260,419 @@ PIL_RESAMPLE_LANCZOS = _PIL_RESAMPLING.LANCZOS
 PIL_RESAMPLE_BILINEAR = _PIL_RESAMPLING.BILINEAR
 PIL_RESAMPLE_NEAREST = _PIL_RESAMPLING.NEAREST
 
+# Formats a dropped/selected screenshot may arrive in. Pillow decodes all of
+# these itself except HEIC/HEIF (iPhone photos), which need the optional
+# ``pillow-heif`` plugin; that plugin is registered when it is installed and
+# the extension is simply not accepted when it isn't.
 SUPPORTED_IMAGE_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff",
+    # --- screenshots / photos: what the picker is really for --------------
+    ".png", ".apng",
+    ".jpg", ".jpeg", ".jpe", ".jfif", ".jif", ".jfi", ".pjpeg", ".pjp",
+    ".webp", ".avif", ".avifs",
+    ".bmp", ".dib",
+    ".gif",
+    ".tif", ".tiff",
+    # --- interchangeable "any image" formats ------------------------------
+    ".ppm", ".pgm", ".pbm", ".pnm", ".pfm",
+    ".tga", ".icb", ".vda", ".vst",
+    ".pcx", ".qoi", ".sgi", ".rgb", ".rgba", ".bw", ".msp", ".dds",
+    ".ico", ".cur", ".icns",
+    ".jp2", ".j2k", ".jpc", ".j2c", ".jpf", ".jpx",
+    ".psd", ".xbm", ".xpm", ".ras", ".palm", ".pxr", ".dcx",
+    # --- phone/camera containers (need the optional pillow-heif plugin) ---
+    ".heic", ".heif", ".hif",
 }
+
+# Download/save variants that are really one of the plain formats above.
+_EXTENSION_ALIASES = {
+    ".jfif": ".jpg", ".jif": ".jpg", ".jfi": ".jpg",
+    ".pjpeg": ".jpg", ".pjp": ".jpg", ".jpe": ".jpg",
+    ".apng": ".png",
+    ".avifs": ".avif",
+    ".dib": ".bmp",
+    ".heic": ".heif", ".hif": ".heif",
+    ".j2k": ".jp2", ".jpc": ".jp2", ".j2c": ".jp2",
+    ".jpf": ".jp2", ".jpx": ".jp2",
+    ".icb": ".tga", ".vda": ".tga", ".vst": ".tga",
+    ".pgm": ".ppm", ".pbm": ".ppm", ".pnm": ".ppm", ".pfm": ".ppm",
+    ".rgb": ".sgi", ".rgba": ".sgi", ".bw": ".sgi",
+}
+
+# Fallback mapping for the picker filters, in case ``Image.registered_extensions()``
+# ever misses a late-added format.
+_FALLBACK_EXTENSIONS = {
+    ".png": "PNG", ".apng": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
+    ".webp": "WEBP", ".avif": "AVIF", ".gif": "GIF", ".bmp": "BMP",
+    ".tif": "TIFF", ".tiff": "TIFF", ".tga": "TGA", ".pcx": "PCX",
+    ".qoi": "QOI", ".sgi": "SGI", ".jp2": "JPEG2000", ".ico": "ICO",
+    ".cur": "CUR", ".psd": "PSD", ".heif": "HEIF", ".dds": "DDS",
+}
+
+# Extensions the optional HEIF/AVIF-in-HEIF plugin can add.
+_HEIF_EXTENSIONS = {".heic", ".heif", ".hif"}
+
+# How many bytes :func:`_sniff_image_format` may read to identify a file whose
+# extension lies (or is missing) - a mislabelled ".png" download is common.
+_IMAGE_SNIFF_BYTES = 4096
+_HEIF_PLUGIN_READY = None
+# path/size/mtime -> bool, so a dropped folder is probed only once.
+_IMAGE_PROBE_CACHE = {}
+
+
+def _register_heif_support():
+    """Register the optional ``pillow-heif`` plugin once, tolerating absence."""
+    global _HEIF_PLUGIN_READY
+    if _HEIF_PLUGIN_READY is not None:
+        return _HEIF_PLUGIN_READY
+    _HEIF_PLUGIN_READY = False
+    try:
+        from pillow_heif import register_heif_opener
+
+        register_heif_opener()
+        _HEIF_PLUGIN_READY = True
+    except Exception:
+        _HEIF_PLUGIN_READY = False
+    return _HEIF_PLUGIN_READY
+
+
+def _normalised_extension(path):
+    """Lower-case suffix of ``path`` with download/container aliases folded."""
+    suffix = Path(path).suffix.strip().lower()
+    return _EXTENSION_ALIASES.get(suffix, suffix)
+
+
+def is_supported_image(path):
+    """True when ``path`` is an image this installation can actually open.
+
+    A known extension is not trusted on its own: a ``.jpg`` that is really a
+    text file, or a HEIC photo with no HEIF plugin, is rejected here rather
+    than failing later mid-review. Formats are confirmed from the file header,
+    so a PNG saved as ``board.jpg`` (or with no extension) is still offered.
+    Results are cached per path/size/mtime because this is called for every
+    file in a dropped folder.
+    """
+    path = Path(path)
+    if not path.name or path.name.startswith("."):
+        return False
+    if _normalised_extension(path) in _HEIF_EXTENSIONS:
+        # HEIC only decodes once the plugin is registered, which otherwise
+        # happens lazily on the first real import.
+        _register_heif_support()
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    cached = _IMAGE_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    # Cheap extension gate first, then confirm the bytes really decode; a
+    # file with an unknown extension still gets the byte probe.
+    candidate = (
+        _normalised_extension(path) in SUPPORTED_IMAGE_EXTENSIONS
+        or _sniff_image_format(path) is not None
+    )
+    supported = candidate and _can_decode_header(path)
+    if len(_IMAGE_PROBE_CACHE) > 4096:
+        _IMAGE_PROBE_CACHE.clear()
+    _IMAGE_PROBE_CACHE[cache_key] = supported
+    return supported
+
+
+def _can_decode_header(path):
+    """Whether the file header identifies a format Pillow can fully open."""
+    try:
+        with Path(path).open("rb") as handle:
+            header = handle.read(_IMAGE_SNIFF_BYTES)
+        if not header:
+            return False
+        with Image.open(io.BytesIO(header)) as probe:
+            probe.verify()
+            return True
+    except Exception:
+        return False
+
+
+def _sniff_image_format(path):
+    """Pillow format name detected from the file header, or ``None``.
+
+    Used when the extension is unknown or wrong. Failure is normal (short,
+    empty or non-image files), so every error resolves to ``None``.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            header = handle.read(_IMAGE_SNIFF_BYTES)
+    except OSError:
+        return None
+    if not header:
+        return None
+    try:
+        with Image.open(io.BytesIO(header)) as probe:
+            return probe.format
+    except Exception:
+        return None
+
+
+def _canvas_mode(image):
+    """An RGB(A) mode that preserves the source's transparency, if it has any.
+
+    Board pixels are never transparent, but converting to RGB first would
+    turn every transparent row of a WebP/PNG into black and lose the alpha a
+    later crop might need, so keep RGBA when it is meaningful.
+    """
+    if image.mode == "RGB":
+        return "RGB"
+    if image.mode in ("RGBA", "LA", "PA") or (
+        image.mode == "P" and "transparency" in image.info
+    ):
+        return "RGBA"
+    if image.mode in ("I;16", "I;16B", "I;16L", "I"):
+        # 16-bit greyscale/tiff: scale down without clipping through black.
+        return "I"
+    return "RGB"
+
+
+def _as_rgb_image(image):
+    """Any decoded Pillow image as a safely-converted RGB or RGBA image."""
+    mode = _canvas_mode(image)
+    if mode == "I":
+        # 16-bit images must be normalised before an RGB conversion clips them.
+        extrema = image.getextrema()
+        peak = max(value for value in extrema) if isinstance(
+            extrema, tuple
+        ) else 65535
+        if peak > 255:
+            image = image.point(lambda value: value * (255 / peak))
+        mode = "RGB"
+    if image.mode != mode:
+        image = image.convert(mode)
+    return image
+
+
+def convert_image_to_png(source_path, destination_dir=None):
+    """Convert any readable image into a ``.png`` next to (or near) the source.
+
+    Only the container changes: a JPEG's pixels become lossless PNG, and a
+    WebP/AVIF/TIFF/GIF/etc. is decoded by Pillow and re-encoded, so the rest of
+    board-vision (and the trainer's dataset folders) only ever sees PNG. The
+    converted file is named ``<original stem> (converted).png`` and never
+    overwrites an existing file.
+
+    Returns ``(png_path, details)`` where ``details`` records the detected
+    source format, mode and whether the file was really converted. Saving as
+    PNG can fail for images Pillow can decode but not re-encode that way (a
+    multi-megapixel 16-bit CMYK TIFF, say), so the fallback still returns a
+    usable path or raises ``ValueError`` with the reason.
+    """
+    source_path = Path(source_path)
+    try:
+        raw = source_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Could not read {source_path}") from exc
+
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            detected_format = (opened.format or "").upper()
+            source_mode = opened.mode
+            frame_count = getattr(opened, "n_frames", 1)
+            if frame_count > 1:
+                # Board screenshots are single frames; take the first one.
+                opened.seek(0)
+            exif_oriented = ImageOps.exif_transpose(opened)
+            canvas = _as_rgb_image(exif_oriented)
+            canvas.load()
+    except UnidentifiedImageError as exc:
+        if source_path.suffix.lower() in _HEIF_EXTENSIONS:
+            raise ValueError(
+                f"{source_path.name} is a HEIC/HEIF photo; install the "
+                "optional 'pillow-heif' package (pip install pillow-heif) "
+                "to import it"
+            ) from exc
+        raise ValueError(
+            f"{source_path.name} is not an image Pillow can decode"
+        ) from exc
+    except Exception as exc:
+        raise ValueError(f"Could not decode {source_path.name}: {exc}") from exc
+
+    details = {
+        "source": str(source_path),
+        "format": detected_format or "UNKNOWN",
+        "mode": source_mode,
+        "frames": frame_count,
+        "converted": False,
+        "png_path": None,
+    }
+
+    if detected_format == "PNG" and source_path.suffix.lower() in (
+        ".png", ".apng"
+    ):
+        # Already the right container; no copy needed.
+        details["png_path"] = str(source_path)
+        return source_path, details
+
+    target_dir = Path(destination_dir) if destination_dir else source_path.parent
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"{source_path.stem} (converted)"
+        png_path = target_dir / f"{base_name}.png"
+        if png_path.exists():
+            if _existing_conversion_is_current(
+                png_path, source_path, canvas
+            ):
+                # Importing the same screenshot again (or re-running after a
+                # cancelled review) reuses the PNG instead of piling up copies.
+                details["converted"] = True
+                details["reused"] = True
+                details["png_path"] = str(png_path)
+                return png_path, details
+            if _existing_conversion_is_stale(png_path, source_path):
+                # Our own earlier conversion of a since-edited source:
+                # overwrite it rather than leaving a wrong board behind.
+                pass
+            else:
+                # Occupied by a different image with the same stem: keep both.
+                png_path = _unique_converted_png_path(target_dir / base_name)
+        canvas.save(png_path, format="PNG")
+    except Exception as exc:
+        raise ValueError(
+            f"Could not convert {source_path.name} to PNG: {exc}"
+        ) from exc
+
+    details["converted"] = True
+    details["reused"] = False
+    details["png_path"] = str(png_path)
+    _report_conversion(source_path, png_path, details)
+    return png_path, details
+
+
+def _conversion_timestamps(png_path, source_path):
+    """(converted mtime, source mtime) in nanoseconds, or ``None``."""
+    try:
+        return Path(png_path).stat().st_mtime_ns, Path(source_path).stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _same_pixels(existing, canvas):
+    """Whether two Pillow images carry identical pixels.
+
+    Compare bytes for a quick yes/no and fall back to a small signature (a
+    32x32 thumbnail plus the size) so two genuinely different boards are
+    never handed the same converted file just because they share a name and
+    dimensions. A false "different" only costs an extra converted copy.
+    """
+    try:
+        if existing.mode != canvas.mode:
+            existing = existing.convert(canvas.mode)
+        if existing.tobytes() == canvas.tobytes():
+            return True
+        thumbnail = existing.copy()
+        thumbnail.thumbnail((32, 32))
+        other = canvas.copy()
+        other.thumbnail((32, 32))
+        if thumbnail.tobytes() == other.tobytes():
+            return True
+        # 32x32 can flatten a small detail (a highlighted square); compare a
+        # mid-size crop before giving up.
+        proxy = existing.copy()
+        proxy.thumbnail((256, 256))
+        other_proxy = canvas.copy()
+        other_proxy.thumbnail((256, 256))
+        return proxy.tobytes() == other_proxy.tobytes()
+    except Exception:
+        return False
+
+
+def _existing_conversion_is_current(png_path, source_path, canvas):
+    """Whether ``png_path`` already holds this source's converted pixels.
+
+    A PNG left by an earlier import is reused only when it was written after
+    its source (so an edited screenshot is never silently kept stale), has the
+    same dimensions, and really contains the same pixels - two different
+    boards saved as ``board.webp`` and ``board.avif`` must not share one PNG.
+    The one-second grace absorbs coarse filesystem timestamps, where both
+    writes can land in the same tick.
+    """
+    png_path = Path(png_path)
+    if not png_path.is_file():
+        return False
+    stamps = _conversion_timestamps(png_path, source_path)
+    if stamps is None:
+        return False
+    converted_mtime, source_mtime = stamps
+    if converted_mtime + 1_000_000_000 < source_mtime:
+        return False
+    try:
+        with Image.open(png_path) as existing:
+            if existing.format != "PNG" or tuple(existing.size) != tuple(canvas.size):
+                return False
+            return _same_pixels(existing, canvas)
+    except Exception:
+        return False
+
+
+def _existing_conversion_is_stale(png_path, source_path):
+    """Whether ``png_path`` is our own conversion of an older source version."""
+    stamps = _conversion_timestamps(png_path, source_path)
+    if stamps is None:
+        return False
+    converted_mtime, source_mtime = stamps
+    return converted_mtime + 1_000_000_000 < source_mtime
+
+
+def _unique_converted_png_path(base_path):
+    """``<base_path>.png`` unless taken, then ``<base_path> (2).png`` etc."""
+    base_path = Path(base_path)
+    candidate = base_path.with_name(base_path.name + ".png")
+    counter = 2
+    while candidate.exists():
+        candidate = base_path.with_name(f"{base_path.name} ({counter}).png")
+        counter += 1
+    return candidate
+
+
+def _report_conversion(source_path, png_path, details):
+    """One-line terminal note so a silent format change is still visible."""
+    frame_note = (
+        f", first of {details['frames']} frames"
+        if details.get("frames", 1) > 1
+        else ""
+    )
+    try:
+        print(
+            f"Converted {Path(source_path).name} "
+            f"({details['format']} {details['mode']}{frame_note}) "
+            f"-> {Path(png_path).name}"
+        )
+    except Exception:
+        pass
+
+
+def prepare_image_for_import(image_path):
+    """Return a PNG path for ``image_path``, converting other formats.
+
+    This is the single entry point used by the picker loop: PNGs (and files
+    already carrying PNG pixels whatever the extension) are returned
+    untouched, anything else is converted next to the original file first so
+    the screenshot review and the export code only ever handle one format.
+    """
+    image_path = Path(image_path)
+    if not image_path.is_file():
+        raise FileNotFoundError(
+            f"Could not load image: {image_path.resolve()}"
+        )
+    if _sniff_image_format(image_path) == "PNG":
+        # Right pixels and right container: leave the user's file alone even
+        # if the name says .jpg.
+        return image_path, {
+            "source": str(image_path),
+            "format": "PNG",
+            "mode": "PNG",
+            "frames": 1,
+            "converted": False,
+            "png_path": str(image_path),
+        }
+    return convert_image_to_png(image_path)
 
 VIEW_W, VIEW_H = 1152, 864
 PREVIEW_SIZE = 380
@@ -347,11 +758,12 @@ def _expand_image_inputs(values):
             paths.extend(
                 sorted(
                     item for item in path.iterdir()
-                    if item.is_file()
-                    and item.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+                    if item.is_file() and is_supported_image(item)
                 )
             )
         else:
+            # A dropped file is kept even with an unknown extension; the
+            # loader sniffs its actual format and converts it if needed.
             paths.append(path)
     return paths
 
@@ -371,10 +783,7 @@ def _choose_with_file_dialog():
         try:
             selected = filedialog.askopenfilenames(
                 title="Choose a chess screenshot",
-                filetypes=[
-                    ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
-                    ("All files", "*.*"),
-                ],
+                filetypes=_picker_filetypes(),
             )
         finally:
             root.destroy()
@@ -410,17 +819,71 @@ def choose_image_paths(argv=None):
 
 
 def load_screenshot(image_path):
-    """Load one dropped/selected screenshot as an RGB NumPy array."""
-    image_path = Path(image_path)
+    """Load one screenshot as an RGB NumPy array, converting PNG as needed.
+
+    Formats other than PNG are converted to a ``.png`` beside the original
+    first (see :func:`convert_image_to_png`), so the file the rest of the
+    tool - and the dataset folders - deal with is always PNG. Formats Pillow
+    cannot decode, and HEIC/HEIF without the optional ``pillow-heif``
+    plugin, raise ``FileNotFoundError`` with an explanation.
+    """
+    source_path = Path(image_path)
     try:
-        with Image.open(image_path) as image:
-            return np.asarray(
-                ImageOps.exif_transpose(image).convert("RGB")
+        png_path, _details = prepare_image_for_import(source_path)
+    except ValueError as exc:
+        raise FileNotFoundError(f"Could not load image: {exc}") from exc
+    try:
+        with Image.open(png_path) as image:
+            frame_count = getattr(image, "n_frames", 1)
+            if frame_count > 1:
+                image.seek(0)
+            pixels = np.asarray(
+                _as_rgb_image(ImageOps.exif_transpose(image)).convert("RGB")
             ).copy()
+    except UnidentifiedImageError as exc:
+        raise FileNotFoundError(
+            f"Could not load image: {source_path.resolve()} "
+            "- not a format Pillow can decode"
+        ) from exc
     except Exception as exc:
         raise FileNotFoundError(
-            f"Could not load image: {image_path.resolve()}"
+            f"Could not load image: {source_path.resolve()}"
         ) from exc
+    if pixels.size == 0:
+        raise FileNotFoundError(
+            f"Could not load image: {source_path.resolve()} is empty"
+        )
+    return pixels
+
+
+def _picker_filetypes():
+    """Filter list for the native picker, from the formats we really decode.
+
+    Pillow's registered extensions are grouped by decoder, so the picker only
+    advertises formats this installation can actually open. HEIC/HEIF is
+    only listed when its optional plugin is present.
+    """
+    registered = Image.registered_extensions()
+    usable = {
+        extension
+        for extension, format_name in registered.items()
+        if format_name
+        and (extension in SUPPORTED_IMAGE_EXTENSIONS
+             or format_name in _FALLBACK_EXTENSIONS.values())
+    }
+    usable |= {
+        ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff",
+    }
+    if not _register_heif_support():
+        usable -= _HEIF_EXTENSIONS
+    patterns = " ".join(
+        f"*{extension}" for extension in sorted(usable)
+    )
+    return [
+        ("Image files", patterns),
+        ("Common screenshots", "*.png *.jpg *.jpeg *.webp *.avif *.bmp *.gif *.tif *.tiff"),
+        ("All files", "*.*"),
+    ]
 
 
 def _path_for_csv(path):
@@ -2765,9 +3228,16 @@ def main(argv=None):
         index += 1
         print(f"\nScreenshot: {image_path}")
 
-        records = process_image(
-            image_path, duplicate_index=duplicate_index, dataset_dir=dataset_dir
-        )
+        try:
+            records = process_image(
+                image_path, duplicate_index=duplicate_index,
+                dataset_dir=dataset_dir,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            # An unreadable or unconvertible image used to end the run; report
+            # it, keep the dataset intact, and move on to the next file.
+            print(f"Could not use this image: {exc}")
+            records = None
         if records is None:
             next_path = image_paths[index] if index < len(image_paths) else None
             if not _wait_ready_for_another(next_path):
