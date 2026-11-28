@@ -210,11 +210,17 @@ def load_keypoint_label(sample_path):
 
 
 def save_keypoint_label(sample_path, points, class_meta=None):
-    """Write the sidecar JSON; ``points`` are in source-image pixels."""
+    """Write the sidecar JSON; ``points`` are in source-image pixels.
+
+    Label points are stored as whole pixels. The labeller already snaps
+    clicks, and rounding again here means a hand-edited or imported JSON
+    can never smuggle a fraction into the training targets either.
+    """
     label_path = sample_label_path(sample_path)
     label_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "points": [[round(float(x), 3), round(float(y), 3)] for x, y in points],
+        "points": [[float(round(float(x))), float(round(float(y)))]
+                   for x, y in points],
         "visibility": [1] * KEYPOINT_COUNT,
         "source": Path(sample_path).name,
         "grid": KEYPOINT_GRID,
@@ -598,9 +604,12 @@ def lattice_fit(points, visibility=None, max_error=None, min_points=6):
 def heatmaps_to_points(heatmaps, threshold=KEYPOINT_PEAK_THRESHOLD):
     """Extract ``(81, 2)`` peak positions (0..1) and per-point confidence.
 
-    Peaks are refined with a small quadratic interpolation around the argmax
-    so the model's 128x128 heatmaps are not limited to 4-pixel quantisation
-    when upscaled to a 512x512 screenshot.
+    Peaks are refined with a small quadratic interpolation around the argmax.
+    The heatmap coordinate convention matches :func:`gaussian_heatmaps`
+    exactly: a peak centred on cell ``i`` means ``i / heatmap_size``. Adding
+    half a cell there would bias every keypoint by half a heatmap cell, which
+    is only 0.5 px in heatmap space but becomes several pixels once scaled
+    back to a large screenshot, so the two functions must stay in step.
     """
     heatmaps = np.asarray(heatmaps, dtype=np.float32)
     if heatmaps.shape[0] != KEYPOINT_COUNT:
@@ -627,8 +636,8 @@ def heatmaps_to_points(heatmaps, threshold=KEYPOINT_PEAK_THRESHOLD):
             if abs(denominator) > 1e-6:
                 x += float(np.clip(0.5 * (left - right) / denominator, -0.5, 0.5))
         points[index] = (
-            (x + 0.5) / float(width),
-            (y + 0.5) / float(height),
+            x / float(width),
+            y / float(height),
         )
     visibility = confidence >= float(threshold)
     return points, confidence, visibility
@@ -923,11 +932,17 @@ def build_board_detection_model(num_keypoints=KEYPOINT_COUNT):
 # --------------------------------------------------------------------------
 # Inference helpers shared by the GUI and the trainer's evaluation
 # --------------------------------------------------------------------------
-def preprocess_screenshot(image, size=KEYPOINT_INPUT_SIZE):
+def preprocess_screenshot(image, size=KEYPOINT_INPUT_SIZE, with_metadata=False):
     """BGR uint8 screenshot -> normalised ``(1, 3, S, S)`` float32 batch.
 
     Uses Pillow for the resize so the letterboxing/pixel mapping matches
     :func:`prepare_sample_image`, which the training data went through.
+
+    Pass ``with_metadata=True`` to also receive the letterbox metadata. Any
+    caller that converts predictions back to screenshot pixels *must* use it:
+    a non-square screenshot is scaled by one factor and padded on one axis,
+    so mapping 0..1 coordinates with the raw width/height would stretch the
+    board by the aspect ratio.
     """
     from PIL import Image
 
@@ -938,8 +953,11 @@ def preprocess_screenshot(image, size=KEYPOINT_INPUT_SIZE):
         array = array[:, :, :3]
     # Callers pass OpenCV's BGR convention.
     rgb = array[:, :, ::-1]
-    prepared, _ = prepare_sample_image(Image.fromarray(rgb), size)
-    return prepared[None, ...]
+    prepared, metadata = prepare_sample_image(Image.fromarray(rgb), size)
+    batch = prepared[None, ...]
+    if with_metadata:
+        return batch, metadata
+    return batch
 
 
 def prepare_sample_image(pil_image, size=KEYPOINT_INPUT_SIZE):
@@ -997,7 +1015,7 @@ def detect_board_with_model(image, model, device=None, threshold=KEYPOINT_PEAK_T
 
     if model is None:
         return None
-    batch = preprocess_screenshot(image)
+    batch, metadata = preprocess_screenshot(image, with_metadata=True)
     if device is None:
         device = next(
             (parameter.device for parameter in model.parameters()),
@@ -1010,19 +1028,30 @@ def detect_board_with_model(image, model, device=None, threshold=KEYPOINT_PEAK_T
     normalised, confidence, visibility = heatmaps_to_points(
         heatmaps, threshold=threshold
     )
-    # Fit once, in image pixels, so residuals/thresholds are in pixels.
-    height, width = np.asarray(image).shape[:2]
-    pixel_points = normalised * np.asarray([width, height], dtype=np.float64)
+    # Undo the letterbox rather than treating 0..1 as width/height: a 16:9
+    # screenshot is padded top and bottom, so the naive mapping stretches the
+    # lattice vertically and every fitted square comes out too tall.
+    pixel_points = map_points_to_image(normalised, metadata)
+    height, width = metadata["original_size"][1], metadata["original_size"][0]
     pixel_fit = lattice_fit(pixel_points, visibility)
     if pixel_fit is None:
         return None
-    fitted = pixel_fit["points"]
+    # Snapping the fitted lattice to whole pixels is what makes the corners
+    # exact: the GUI crops squares from integer pixel boundaries, so a
+    # 0.4 px fraction only invites rounding drift between the lattice, the
+    # crop rectangle and the click-to-screen mapping. Rounding here (not on
+    # the raw peaks) keeps the homography, residuals and confidence derived
+    # from the continuous fit; only the reported geometry is quantised.
+    continuous = pixel_fit["points"]
+    fitted = np.rint(continuous)
     corners = corners_from_points(fitted)
     rect = board_rect_from_points(fitted)
     return {
         "points": fitted,
+        "continuous_points": continuous,
         "raw_points": pixel_points,
         "homography": pixel_fit["homography"],
+        "letterbox": metadata,
         "corners": corners,
         "board_rect": rect,
         "confidence": float(pixel_fit["confidence"]),
@@ -1034,6 +1063,23 @@ def detect_board_with_model(image, model, device=None, threshold=KEYPOINT_PEAK_T
         "image_size": (int(width), int(height)),
         "method": "board_model",
     }
+
+
+def snap_points_to_pixels(points, image_size=None, bounds=True):
+    """Round keypoints to whole pixels, optionally clamped inside the image.
+
+    Sub-pixel coordinates are worth keeping while fitting (they are what the
+    least-squares solve wants) but the moment a point is used to locate a
+    pixel row or column the fraction is noise: ``int`` truncation and
+    ``round`` would disagree. This is the single place that quantises.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    snapped = np.rint(points)
+    if bounds and image_size is not None:
+        width, height = float(image_size[0]), float(image_size[1])
+        snapped[:, 0] = np.clip(snapped[:, 0], 0.0, max(0.0, width - 1.0))
+        snapped[:, 1] = np.clip(snapped[:, 1], 0.0, max(0.0, height - 1.0))
+    return snapped
 
 
 def square_side(points):

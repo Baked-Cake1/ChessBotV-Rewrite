@@ -278,7 +278,15 @@ class GuiToggleTests(unittest.TestCase):
         }
         result = self._run_locator(detection, True)
         self.assertEqual(result["method"], "board_model")
+        # Whole pixels: a fractional rect would round differently in the
+        # crop maths and in the click overlay.
         self.assertEqual(result["board_rect"], (40, 61, 400, 400))
+        for value in result["board_rect"]:
+            self.assertEqual(float(value), round(float(value)))
+        np.testing.assert_array_equal(
+            np.asarray(result["model_points"]),
+            np.rint(np.asarray(result["model_points"])),
+        )
         self.assertEqual(result["pattern_size"], (7, 7))
         self.assertEqual(len(result["model_points"]), 81)
         self.assertAlmostEqual(result["cell_size"], 50.0)

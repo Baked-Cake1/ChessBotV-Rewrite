@@ -213,7 +213,14 @@ class BoardDetectionGeometryTests(unittest.TestCase):
             self.assertEqual(len(payload["points"]), 81)
             loaded = self.bd.load_keypoint_label(sample)
             self.assertIsNotNone(loaded)
-            np.testing.assert_allclose(loaded[0], self.truth, atol=0.01)
+            # Labels are stored as whole pixels, so compare against the
+            # rounded truth rather than the continuous homography output.
+            np.testing.assert_allclose(
+                loaded[0], np.rint(self.truth), atol=0.01
+            )
+            np.testing.assert_array_equal(
+                loaded[0], np.rint(loaded[0]), err_msg="labels must be integers"
+            )
         finally:
             import shutil
 
@@ -367,3 +374,183 @@ class IdealLatticeOrientationTests(unittest.TestCase):
             self.bd.IDEAL_LATTICE[8][0],
             self.bd.IDEAL_LATTICE[72][0],
         )
+
+
+class PixelAccuracyTests(unittest.TestCase):
+    """Keypoints must land on the pixel they came from, at any resolution.
+
+    The heatmap encoder places a point at ``p * heatmap_size``; the decoder
+    used to add half a cell, and inference used to treat 0..1 predictions as
+    raw width/height instead of undoing the letterbox. Both are small in
+    normalised space and large once scaled to a real screenshot, so these
+    tests check the round trip in *pixels* at several aspect ratios.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bd = _load_board_detection()
+        cls.image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def _true_pixels(self, width, height):
+        """A perspective board that fits inside a width x height screenshot."""
+        corners = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=np.float64
+        )
+        target = np.array(
+            [[120.0, 60.0], [520.0, 75.0], [500.0, 430.0], [100.0, 410.0]]
+        )
+        shrink = min(width / 640.0, height / 480.0)
+        homography = self.bd._solve_homography(corners, target * shrink)
+        return self.bd.apply_homography(homography, self.bd.IDEAL_LATTICE)
+
+    def _round_trip(self, width, height):
+        truth = self._true_pixels(width, height)
+        size = self.bd.KEYPOINT_INPUT_SIZE
+        scale = min(size / width, size / height)
+        new_w = int(round(width * scale))
+        new_h = int(round(height * scale))
+        offset_x = (size - new_w) // 2
+        offset_y = (size - new_h) // 2
+        normalised = np.stack(
+            [
+                (truth[:, 0] * scale + offset_x) / size,
+                (truth[:, 1] * scale + offset_y) / size,
+            ],
+            axis=1,
+        )
+        heatmaps = self.bd.gaussian_heatmaps(normalised)
+        predicted, _confidence, _visible = self.bd.heatmaps_to_points(heatmaps)
+        metadata = {
+            "scale": scale,
+            "offset": (offset_x, offset_y),
+            "size": (size, size),
+            "original_size": (width, height),
+        }
+        return truth, self.bd.map_points_to_image(predicted, metadata)
+
+    def test_decode_round_trip_is_sub_pixel(self):
+        for width, height in (
+            (640, 480),
+            (1280, 720),
+            (1366, 768),
+            (1920, 1080),
+            (1000, 1000),
+        ):
+            with self.subTest(size=(width, height)):
+                truth, decoded = self._round_trip(width, height)
+                error = np.linalg.norm(decoded - truth, axis=1).mean()
+                self.assertLess(error, 0.5, f"{width}x{height}: {error:.2f}px")
+
+    def test_no_systematic_half_cell_bias(self):
+        """A half-cell offset shows up as a constant shift, not random noise."""
+        truth, decoded = self._round_trip(640, 480)
+        bias = np.mean(decoded - truth, axis=0)
+        np.testing.assert_allclose(bias, [0.0, 0.0], atol=0.2)
+
+    def test_half_cell_bias_would_be_visible(self):
+        """Guard the exact regression: (x + 0.5) must not come back."""
+        source = (ROOT / "board_detection.py").read_text()
+        self.assertNotIn("(x + 0.5) / float(width)", source)
+        self.assertIn("x / float(width)", source)
+
+    def test_letterbox_metadata_is_returned(self):
+        batch, metadata = self.bd.preprocess_screenshot(
+            self.image, with_metadata=True
+        )
+        self.assertEqual(batch.shape[0], 1)
+        self.assertEqual(metadata["original_size"], (640, 480))
+        self.assertAlmostEqual(metadata["scale"], 512 / 640)
+        # Wide screenshot: padded top and bottom, flush left/right.
+        self.assertEqual(metadata["offset"][0], 0)
+        self.assertGreater(metadata["offset"][1], 0)
+
+    def test_preprocess_still_returns_a_bare_batch_by_default(self):
+        batch = self.bd.preprocess_screenshot(self.image)
+        self.assertEqual(batch.ndim, 4)
+
+    def test_non_square_mapping_is_not_stretched(self):
+        """The old width/height mapping distorted 16:9 boards vertically.
+
+        The image centre happens to agree under both mappings, so the probe
+        has to sit off-centre: ``y = offset / size`` is the very top of the
+        real content and must map back to row 0, not row 157.
+        """
+        height, width = 720, 1280
+        scale = 512 / 1280
+        new_h = int(round(height * scale))
+        offset_y = (512 - new_h) // 2
+        metadata = {
+            "scale": scale,
+            "offset": (0, offset_y),
+            "size": (512, 512),
+            "original_size": (width, height),
+        }
+        top = np.tile([[0.25, offset_y / 512.0]], (81, 1))
+        bottom = np.tile([[0.25, (offset_y + new_h) / 512.0]], (81, 1))
+        correct_top = self.bd.map_points_to_image(top, metadata)[0]
+        correct_bottom = self.bd.map_points_to_image(bottom, metadata)[0]
+        # Letterboxed content spans the full screenshot height.
+        np.testing.assert_allclose(correct_top, [320.0, 0.0], atol=0.5)
+        np.testing.assert_allclose(correct_bottom, [320.0, 720.0], atol=0.5)
+        self.assertAlmostEqual(correct_bottom[1] - correct_top[1], 720.0, places=1)
+        # The naive mapping is what the letterbox-free code produced.
+        naive_top = (top * np.array([width, height]))[0]
+        naive_bottom = (bottom * np.array([width, height]))[0]
+        self.assertGreater(abs(naive_top[1] - correct_top[1]), 100.0)
+        self.assertLess(naive_bottom[1] - naive_top[1], 500.0)
+
+    def test_snap_points_rounds_and_clamps(self):
+        points = np.array([[10.4, 20.6], [-3.2, 999.9]])
+        snapped = self.bd.snap_points_to_pixels(points, (100, 200))
+        np.testing.assert_array_equal(snapped, [[10.0, 21.0], [0.0, 199.0]])
+        np.testing.assert_array_equal(snapped, np.rint(snapped))
+
+    def test_snap_points_without_bounds(self):
+        points = np.array([[10.4, 20.6], [-3.2, 999.9]])
+        snapped = self.bd.snap_points_to_pixels(points)
+        np.testing.assert_array_equal(snapped, [[10.0, 21.0], [-3.0, 1000.0]])
+
+    def test_detection_reports_integer_geometry(self):
+        """`detect_board_with_model` snaps its lattice to whole pixels."""
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed")
+
+        class FakeModel:
+            def __init__(self, heatmaps):
+                self._heatmaps = torch.from_numpy(heatmaps)
+
+            def parameters(self):
+                return iter(())
+
+            def __call__(self, _tensor):
+                return self._heatmaps[None, ...]
+
+        truth = self._true_pixels(640, 480)
+        size = self.bd.KEYPOINT_INPUT_SIZE
+        scale = min(size / 640, size / 480)
+        offset_y = (size - int(round(480 * scale))) // 2
+        normalised = np.stack(
+            [
+                truth[:, 0] * scale / size,
+                (truth[:, 1] * scale + offset_y) / size,
+            ],
+            axis=1,
+        )
+        heatmaps = self.bd.gaussian_heatmaps(normalised)
+        model = FakeModel(heatmaps)
+
+        detection = self.bd.detect_board_with_model(self.image, model)
+        self.assertIsNotNone(detection)
+        points = np.asarray(detection["points"])
+        np.testing.assert_array_equal(points, np.rint(points))
+        self.assertEqual(len(detection["corners"]), 4)
+        for corner in detection["corners"]:
+            self.assertEqual(float(corner[0]), round(float(corner[0])))
+            self.assertEqual(float(corner[1]), round(float(corner[1])))
+        # The continuous fit is still available for callers that want it.
+        continuous = np.asarray(detection["continuous_points"])
+        self.assertFalse(np.array_equal(continuous, points))
+        error = np.linalg.norm(points - truth, axis=1).mean()
+        self.assertLess(error, 1.0)
