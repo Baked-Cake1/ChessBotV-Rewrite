@@ -2254,6 +2254,26 @@ class ZoomView:
             self.oy + point[1] / self.zoom,
         )
 
+    def screen_to_pixel(self, point, image_size=None):
+        """Screen position -> the exact integer pixel under the cursor.
+
+        ``screen_to_image`` is right for rectangles and free-floating maths,
+        but a keypoint is a *pixel*, not a position: truncating
+        ``ox + x / zoom`` can land one pixel left of/above the pixel the
+        user is actually pointing at, which is exactly the "slightly
+        inaccurate" click. Rounding instead of truncating, then clamping to
+        the image, puts every click on the pixel that was drawn there.
+        """
+        fx = self.ox + point[0] / self.zoom
+        fy = self.oy + point[1] / self.zoom
+        px = int(round(fx))
+        py = int(round(fy))
+        if image_size is not None:
+            width, height = int(image_size[0]), int(image_size[1])
+            px = int(np.clip(px, 0, max(0, width - 1)))
+            py = int(np.clip(py, 0, max(0, height - 1)))
+        return px, py
+
     def image_to_screen(self, x, y=None):
         if y is None:
             x, y = x
@@ -3378,8 +3398,14 @@ def label_board_keypoints(image, title="Click the four corners of the board"):
         )
         if homography is None:
             return None
-        return BOARD_DETECTION.apply_homography(
+        projected = BOARD_DETECTION.apply_homography(
             homography, np.asarray(BOARD_DETECTION.IDEAL_LATTICE)
+        )
+        # Snap the interpolated grid so the overlay markers sit exactly on
+        # the pixels that get saved; otherwise a point drawn at, say,
+        # (300.6, 210.4) is stored as a fraction the trainer has to guess at.
+        return BOARD_DETECTION.snap_points_to_pixels(
+            projected, (img_w, img_h)
         )
 
     def nearest_point(position, radius=14):
@@ -3445,7 +3471,9 @@ def label_board_keypoints(image, title="Click the four corners of the board"):
                         continue
                     if event.key in (pygame.K_RETURN, pygame.K_SPACE):
                         if state["points"] is not None:
-                            return np.asarray(state["points"], dtype=np.float64)
+                            return BOARD_DETECTION.snap_points_to_pixels(
+                                state["points"], (img_w, img_h)
+                            )
                         state["status"] = "Click all four corners first."
                         continue
                     _view_key_event(view, event)
@@ -3455,11 +3483,10 @@ def label_board_keypoints(image, title="Click the four corners of the board"):
                     if index is not None:
                         state["dragging"] = index
                     elif len(state["corners"]) < 4:
-                        ix, iy = view.screen_to_image(event.pos)
-                        state["corners"].append(
-                            (float(np.clip(ix, 0, img_w - 1)),
-                             float(np.clip(iy, 0, img_h - 1)))
+                        ix, iy = view.screen_to_pixel(
+                            event.pos, (img_w, img_h)
                         )
+                        state["corners"].append((float(ix), float(iy)))
                         labels = (
                             "top-left", "top-right", "bottom-right", "bottom-left"
                         )
@@ -3474,11 +3501,8 @@ def label_board_keypoints(image, title="Click the four corners of the board"):
                                 "Enter = save"
                             )
                 elif event.type == pygame.MOUSEMOTION and state["dragging"] is not None:
-                    ix, iy = view.screen_to_image(event.pos)
-                    state["points"][state["dragging"]] = (
-                        float(np.clip(ix, 0, img_w - 1)),
-                        float(np.clip(iy, 0, img_h - 1)),
-                    )
+                    ix, iy = view.screen_to_pixel(event.pos, (img_w, img_h))
+                    state["points"][state["dragging"]] = (float(ix), float(iy))
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     state["dragging"] = None
                 else:
