@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+import board_detection as BOARD_DETECTION
 try:
     import pygame
 except ImportError:  # The non-GUI dataset helpers remain importable.
@@ -3228,6 +3229,16 @@ def main(argv=None):
         index += 1
         print(f"\nScreenshot: {image_path}")
 
+        # Board detection is the other half of the same model, so the
+        # screenshot is offered as geometry training data before the square
+        # review. Answering "no" keeps the old square-only workflow.
+        try:
+            offer_board_detection_labelling(
+                image_path, dataset_dir=dataset_dir
+            )
+        except Exception as exc:
+            print(f"Board-detection labelling failed: {exc}")
+
         try:
             records = process_image(
                 image_path, duplicate_index=duplicate_index,
@@ -3253,6 +3264,11 @@ def main(argv=None):
         completed = True
         if _ask_yes_no("\nCreate the new CNN model now with cnn_trainer.py? [y/N]: "):
             if run_cnn_trainer(records, dataset_dir, model_name):
+                # The square model exists; offer its board-detection half too.
+                try:
+                    offer_board_detection_training(dataset_dir, model_name)
+                except Exception as exc:
+                    print(f"Board-detection training failed: {exc}")
                 break
             print("The model was not created; you can add another screenshot.")
 
@@ -3268,6 +3284,344 @@ def main(argv=None):
 
     _close_gui()
     return completed
+
+
+# --------------------------------------------------------------------------
+# Board-detection model (second vision system: keypoints instead of squares)
+# --------------------------------------------------------------------------
+# The square classifier answers "what piece is this?"; this second model
+# answers "where is the board and what is its geometry?". It predicts a 9x9
+# lattice of 81 intersections as heatmaps, the lattice fit turns those into a
+# single homography, and the GUI can use that instead of the OpenCV corner
+# search. Screenshots labelled here are stored beside the model's square
+# dataset, so one model name owns both halves of its vision:
+
+def board_detection_dataset_dir(dataset_dir=DATASET_DIR):
+    """Folder holding the labelled screenshots + keypoints for a model."""
+    return BOARD_DETECTION.board_sample_dir(dataset_dir)
+
+
+def board_detection_checkpoint_path(model_name):
+    """``models/<model>_board.pth`` for the chosen model name."""
+    return BOARD_DETECTION.board_model_path(
+        model_output_path(sanitise_model_name(model_name))
+    )
+
+
+def board_detection_sample_count(dataset_dir=DATASET_DIR):
+    """How many fully labelled board-detection screenshots a model has."""
+    return len(BOARD_DETECTION.collect_board_samples(dataset_dir))
+
+
+def board_detection_is_trained(model_name):
+    """Whether ``models/<model>_board.pth`` exists."""
+    try:
+        return board_detection_checkpoint_path(model_name).is_file()
+    except Exception:
+        return False
+
+
+def _board_sample_folder(dataset_dir=DATASET_DIR):
+    folder = (
+        board_detection_dataset_dir(dataset_dir)
+        / BOARD_DETECTION.BOARD_DETECTION_SAMPLE_DIRNAME
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _unique_sample_path(folder, stem):
+    """Non-overwriting sample path so re-labelling keeps the old label."""
+    candidate = Path(folder) / f"{stem}.png"
+    counter = 2
+    while candidate.exists():
+        candidate = Path(folder) / f"{stem}_{counter}.png"
+        counter += 1
+    return candidate
+
+
+def label_board_keypoints(image, title="Click the four corners of the board"):
+    """Interactive 9x9 keypoint labelling on a zoomable Pygame window.
+
+    One click marks the four outer corners, and the 7x7 interior
+    intersections are interpolated from them as a starting point. Because
+    those interior points follow the projected grid, they are usually a
+    pixel or two off on a perspective board, so every point stays draggable:
+    left-drag moves the nearest keypoint, and ``R`` snaps the whole lattice
+    back to a fresh four-corner interpolation.
+
+    Returns the 81 ``(x, y)`` image-pixel positions, or ``None`` when the
+    window is closed/Escaped.
+    """
+    _require_pygame()
+    rgb = _as_rgb_array(image)
+    img_h, img_w = rgb.shape[:2]
+    screen = _open_window((VIEW_W, VIEW_H), title)
+    view = ZoomView(title, rgb)
+    clock = pygame.time.Clock()
+
+    state = {
+        "corners": [],          # clicked corner positions, in click order
+        "points": None,         # (81, 2) float array once all corners are set
+        "dragging": None,       # index currently being dragged
+        "status": "Click the top-left corner of the board.",
+    }
+
+    def interpolate(points_quad):
+        """Project the ideal 9x9 lattice through the four clicked corners."""
+        quad = np.asarray(points_quad, dtype=np.float64).reshape(4, 2)
+        homography = BOARD_DETECTION._solve_homography(
+            np.asarray(
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+            ),
+            quad,
+        )
+        if homography is None:
+            return None
+        return BOARD_DETECTION.apply_homography(
+            homography, np.asarray(BOARD_DETECTION.IDEAL_LATTICE)
+        )
+
+    def nearest_point(position, radius=14):
+        """Closest keypoint to a screen position, or ``None``."""
+        if state["points"] is None:
+            return None
+        best_index = None
+        best_distance = None
+        for index, point in enumerate(state["points"]):
+            sx, sy = view.image_to_screen(point)
+            distance = math.hypot(sx - position[0], sy - position[1])
+            if distance <= radius and (
+                best_distance is None or distance < best_distance
+            ):
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def draw_overlay(target, view_ref):
+        points = state["points"]
+        if points is not None:
+            for row in range(9):
+                for col in range(9):
+                    index = row * 9 + col
+                    if col + 1 < 9:
+                        a = view_ref.image_to_screen(points[index])
+                        b = view_ref.image_to_screen(points[index + 1])
+                        pygame.draw.line(target, (90, 170, 255), a, b, 1)
+                    if row + 1 < 9:
+                        a = view_ref.image_to_screen(points[index])
+                        b = view_ref.image_to_screen(points[index + 9])
+                        pygame.draw.line(target, (90, 170, 255), a, b, 1)
+            for index, point in enumerate(points):
+                centre = view_ref.image_to_screen(point)
+                corner = index in (0, 8, 72, 80)
+                pygame.draw.circle(
+                    target, (60, 220, 120) if corner else (255, 210, 90),
+                    centre, 5 if corner else 3,
+                )
+            # Highlight the one that would be dragged.
+            hovered = nearest_point(view_ref.mouse)
+            if hovered is not None:
+                centre = view_ref.image_to_screen(points[hovered])
+                pygame.draw.circle(target, (255, 255, 255), centre, 8, 1)
+        for order, corner in enumerate(state["corners"]):
+            centre = view_ref.image_to_screen(corner)
+            pygame.draw.circle(target, (255, 120, 80), centre, 7, 2)
+            _draw_text(target, str(order + 1), (centre[0] + 9, centre[1] - 7),
+                       size=16)
+
+    try:
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        return None
+                    if event.key == pygame.K_r:
+                        state["corners"] = []
+                        state["points"] = None
+                        state["status"] = "Click the top-left corner of the board."
+                        continue
+                    if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                        if state["points"] is not None:
+                            return np.asarray(state["points"], dtype=np.float64)
+                        state["status"] = "Click all four corners first."
+                        continue
+                    _view_key_event(view, event)
+                    continue
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    index = nearest_point(event.pos)
+                    if index is not None:
+                        state["dragging"] = index
+                    elif len(state["corners"]) < 4:
+                        ix, iy = view.screen_to_image(event.pos)
+                        state["corners"].append(
+                            (float(np.clip(ix, 0, img_w - 1)),
+                             float(np.clip(iy, 0, img_h - 1)))
+                        )
+                        labels = (
+                            "top-left", "top-right", "bottom-right", "bottom-left"
+                        )
+                        if len(state["corners"]) < 4:
+                            state["status"] = (
+                                f"Now click the {labels[len(state['corners'])]} corner."
+                            )
+                        else:
+                            state["points"] = interpolate(state["corners"])
+                            state["status"] = (
+                                "Drag any point to correct it · R = restart · "
+                                "Enter = save"
+                            )
+                elif event.type == pygame.MOUSEMOTION and state["dragging"] is not None:
+                    ix, iy = view.screen_to_image(event.pos)
+                    state["points"][state["dragging"]] = (
+                        float(np.clip(ix, 0, img_w - 1)),
+                        float(np.clip(iy, 0, img_h - 1)),
+                    )
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    state["dragging"] = None
+                else:
+                    view.handle_event(event)
+
+            view.mouse = pygame.mouse.get_pos()
+            hud = [
+                "Board keypoints: click the 4 corners, then drag any point to fit",
+                state["status"],
+            ]
+            view.render(screen, hud_lines=hud, overlay=draw_overlay)
+            pygame.display.flip()
+            clock.tick(60)
+    finally:
+        screen = None
+        _close_gui()
+
+
+def label_one_board_sample(image_path, dataset_dir=DATASET_DIR):
+    """Create board-detection training data from one screenshot.
+
+    The screenshot is copied into ``<dataset>/board_detection/samples/``
+    (so the label always travels with its pixels) and the 81 clicked
+    keypoints are written beside it as JSON. Returns the sample path or
+    ``None`` when the user cancels.
+    """
+    image_path = Path(image_path)
+    try:
+        image = load_screenshot(image_path)
+    except FileNotFoundError as exc:
+        print(f"Could not open {image_path.name}: {exc}")
+        return None
+    print(
+        "\nBoard detection: click the four outer corners of the chessboard, "
+        "\nthen drag any of the 81 grid intersections that need correcting."
+    )
+    points = label_board_keypoints(image)
+    if points is None:
+        print("Board keypoint labelling cancelled.")
+        return None
+    folder = _board_sample_folder(dataset_dir)
+    sample_path = _unique_sample_path(folder, image_path.stem)
+    Image.fromarray(_as_rgb_array(image)).save(sample_path, format="PNG")
+    BOARD_DETECTION.save_keypoint_label(
+        sample_path,
+        points,
+        class_meta={"source_screenshot": image_path.name},
+    )
+    print(
+        f"Saved board sample {sample_path.name} "
+        f"({board_detection_sample_count(dataset_dir)} total)."
+    )
+    return sample_path
+
+
+def offer_board_detection_labelling(image_path, dataset_dir=DATASET_DIR):
+    """Ask whether to add this screenshot as board-detection training data.
+
+    The prompt appears once per screenshot, before the square review, so the
+    same screenshot can teach both halves of the model without being loaded
+    twice. A model that already has a trained board detection checkpoint is
+    not asked again on every run: the question only repeats when the run is
+    explicitly adding more samples.
+    """
+    if not _ask_yes_no(
+        "\nAlso add this screenshot to the BOARD DETECTION training set? "
+        "[y/N]: "
+    ):
+        return None
+    return label_one_board_sample(image_path, dataset_dir)
+
+
+def run_board_detection_trainer(dataset_dir=DATASET_DIR, model_name=None):
+    """Train ``models/<model>_board.pth`` from the model's labelled samples."""
+    dataset_dir = Path(dataset_dir)
+    if not model_name:
+        model_name = dataset_dir.name or DEFAULT_MODEL_NAME
+    model_name = sanitise_model_name(model_name)
+    samples = BOARD_DETECTION.collect_board_samples(dataset_dir)
+    if not samples:
+        print("\nNo labelled board-detection samples yet, so there is")
+        print("nothing to train. Add a screenshot and mark its corners first.")
+        return False
+    if not CNN_TRAINER_PATH.is_file():
+        print(f"Could not find CNN trainer: {CNN_TRAINER_PATH}")
+        return False
+    output_path = board_detection_checkpoint_path(model_name)
+    command = [
+        sys.executable,
+        str(CNN_TRAINER_PATH),
+        "--model",
+        model_name,
+        "--model-type",
+        "board",
+        "--dataset-dir",
+        str(dataset_dir),
+        "--output",
+        str(output_path),
+        "--ui",
+        "--start",
+    ]
+    print(
+        f"\nStarting board-detection training on {len(samples)} sample(s), "
+        f"exporting to {output_path}..."
+    )
+    print("Command:", " ".join(command))
+    completed = subprocess.run(command, cwd=str(BASE_DIR), check=False)
+    if completed.returncode != 0:
+        print(f"Board-detection trainer exited with code {completed.returncode}.")
+        return False
+    print("Board-detection trainer finished successfully.")
+    return True
+
+
+def offer_board_detection_training(dataset_dir=DATASET_DIR, model_name=None):
+    """Offer to train the board-detection half after the square model exists."""
+    dataset_dir = Path(dataset_dir)
+    if not model_name:
+        model_name = dataset_dir.name or DEFAULT_MODEL_NAME
+    model_name = sanitise_model_name(model_name)
+    count = board_detection_sample_count(dataset_dir)
+    if not count:
+        return False
+    trained = board_detection_is_trained(model_name)
+    target = board_detection_checkpoint_path(model_name)
+    if trained:
+        prompt = (
+            f"\nRe-train the board-detection model from its {count} sample(s)? "
+            f"[y/N]: "
+        )
+    else:
+        prompt = (
+            f"\nTrain the board-detection model now from its {count} "
+            f"sample(s)? [y/N]: "
+        )
+    if not _ask_yes_no(prompt):
+        if not trained:
+            print(
+                "Skipped. Run `python cnn_trainer.py --model-type board` "
+                f"(or board-vision with board samples) to build {target.name}."
+            )
+        return False
+    return run_board_detection_trainer(dataset_dir, model_name)
 
 
 if __name__ == "__main__":
